@@ -85,6 +85,7 @@
   "companion.suggestion.combat_reason.block_value": "このカードで先に防御を積んでおくと、このターンをより安全に進められます。",
   "companion.suggestion.combat_reason.generic": "現在の HP、エナジー、手札、敵意図により合っています。",
   "companion.suggestion.reward_preferred": "戦略設定に合う報酬を優先しましょう: {preferred}。",
+  "companion.suggestion.reward_default": "今のデッキの弱点を補えるカードを優先するニャ。",
   "companion.suggestion.reward_named": "今の報酬では {card_name} に注目するとよさそうです。",
   "companion.suggestion.selection_named": "今処理できるカードの中では、まず {card_name} に注目できます。",
   "companion.suggestion.map_named": "今進めるルートの中では、まず {node_type} を検討できます。",

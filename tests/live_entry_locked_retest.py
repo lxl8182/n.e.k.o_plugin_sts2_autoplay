@@ -10,7 +10,21 @@ from typing import Any
 from plugin.plugins.sts2_autoplay.tests.live_entry_smoke import LiveEntryPlugin
 from plugin.sdk.shared.models.result import Err, Ok
 
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
+
+def _resolve_neko_root() -> Path:
+    """NEKO 根目录（提供 config/ 与 plugin/sdk）。见 tests/live_entry_smoke.py 的同名实现。"""
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "plugin" / "sdk").is_dir() and (parent / "config" / "__init__.py").is_file():
+            return parent
+    for entry in sys.path:
+        candidate = Path(entry or ".")
+        if (candidate / "plugin" / "sdk").is_dir() and (candidate / "config" / "__init__.py").is_file():
+            return candidate
+    parents = Path(__file__).resolve().parents
+    return parents[4] if len(parents) > 4 else parents[1]
+
+
+PROJECT_ROOT = _resolve_neko_root()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 

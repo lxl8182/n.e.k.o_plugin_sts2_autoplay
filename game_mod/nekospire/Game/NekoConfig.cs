@@ -25,7 +25,21 @@ namespace NekoComm.Game
         // Danmaku (catgirl commentary) is decoupled from llm_enabled (which gates the autoplay LLM decisions
         // for MAP/reward/event/deck). Turn this off to suppress commentary while keeping decision-LLM on.
         // The catgirl (co-op autoplay client) process also skips danmaku automatically.
+        // Scope: this mod's OWN standalone LLM danmaku driver (NekoDanmakuDriver) only.
         public bool danmaku_enabled { get; set; } = true;
+        // Runtime gate for POST /danmaku — the path the N.E.K.O plugin pushes catgirl commentary through.
+        // Independent of danmaku_enabled on purpose: the plugin hardwrites danmaku_enabled=false on every
+        // connect (to silence this mod's own driver), so reusing that key as the overlay switch would make
+        // the plugin turn its own danmaku off. Set false to stop rendering pushes from any local caller.
+        public bool danmaku_push_enabled { get; set; } = true;
+        // Co-op map votes: when true the catgirl follows a vote the other player already cast instead of
+        // racing to vote its own preferred node; it only votes on its own after vote_wait_seconds.
+        public bool coop_map_follow_player { get; set; } = true;
+        public int coop_map_vote_wait_seconds { get; set; } = 20;
+        // When the main menu shows a resumable run (Continue enabled), the catgirl refuses to click
+        // Continue / start a new room on its own. Both game processes share user://, so resuming the run in
+        // the catgirl process makes the co-op save unreachable for the host.
+        public bool coop_yield_to_saved_run { get; set; } = true;
         public string llm_base_url { get; set; } = "https://api.openai.com/v1";
         public string llm_api_key { get; set; } = "";
         public string llm_model { get; set; } = "";

@@ -85,6 +85,7 @@
   "companion.suggestion.combat_reason.block_value": "Эта карта помогает сначала нарастить защиту и делает ход безопаснее.",
   "companion.suggestion.combat_reason.generic": "Она лучше подходит под текущее HP, энергию, руку и намерения врага.",
   "companion.suggestion.reward_preferred": "Предпочитайте награды, совпадающие со стратегическим предпочтением: {preferred}.",
+  "companion.suggestion.reward_default": "Лучше выбрать награду, закрывающую слабые места колоды.",
   "companion.suggestion.reward_named": "Среди текущих наград стоит в первую очередь обратить внимание на: {card_name}.",
   "companion.suggestion.selection_named": "Среди карт, с которыми можно поработать сейчас, в первую очередь можно посмотреть на: {card_name}.",
   "companion.suggestion.map_named": "Среди доступных сейчас маршрутов можно в первую очередь рассмотреть: {node_type}.",

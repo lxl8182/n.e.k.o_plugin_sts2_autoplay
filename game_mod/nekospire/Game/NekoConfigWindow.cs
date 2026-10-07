@@ -19,6 +19,8 @@ namespace NekoComm.Game
         private LineEdit? _model;
         private CheckButton? _llmEnabled;
         private CheckButton? _danmakuEnabled;
+        private CheckButton? _danmakuPushEnabled;
+        private CheckButton? _mapFollowPlayer;
 
         public static async Task OpenAsync()
         {
@@ -94,6 +96,16 @@ namespace NekoComm.Game
             NekoUi.ApplyFont(_danmakuEnabled, 18);
             fields.AddChild(_danmakuEnabled);
 
+            // The overlay gate for POST /danmaku (what the N.E.K.O plugin pushes). Separate from the checkbox
+            // above so the mod can be silenced without also muting the plugin's commentary, and vice versa.
+            _danmakuPushEnabled = new CheckButton { Text = "允许游戏内弹幕渲染（关掉=屏幕不再出现任何弹幕，含 N.E.K.O 插件推的）", ButtonPressed = cfg.danmaku_push_enabled };
+            NekoUi.ApplyFont(_danmakuPushEnabled, 18);
+            fields.AddChild(_danmakuPushEnabled);
+
+            _mapFollowPlayer = new CheckButton { Text = "co-op 地图跟随玩家投票（别人先投就跟着投，不抢路线）", ButtonPressed = cfg.coop_map_follow_player };
+            NekoUi.ApplyFont(_mapFollowPlayer, 18);
+            fields.AddChild(_mapFollowPlayer);
+
             // One-click host-side co-op start (replaces the old coop_enabled checkbox): enable coop so the
             // catgirl autoplay activates, then open an ENet multiplayer room. Requires being at the main menu.
             var hostCoop = new Button { Text = "开始 co-op 房间", CustomMinimumSize = new Vector2(0, 44), SizeFlagsHorizontal = Control.SizeFlags.ExpandFill };
@@ -145,12 +157,21 @@ namespace NekoComm.Game
             if (_baseUrl == null || _apiKey == null || _model == null || _llmEnabled == null || _danmakuEnabled == null)
                 return;
             var cfg = NekoConfig.Current;
+            var pushWasEnabled = cfg.danmaku_push_enabled;
             cfg.llm_base_url = _baseUrl.Text.Trim();
             cfg.llm_api_key = _apiKey.Text.Trim();
             cfg.llm_model = _model.Text.Trim();
             cfg.llm_enabled = _llmEnabled.ButtonPressed;
             cfg.danmaku_enabled = _danmakuEnabled.ButtonPressed;
+            if (_danmakuPushEnabled != null)
+                cfg.danmaku_push_enabled = _danmakuPushEnabled.ButtonPressed;
+            if (_mapFollowPlayer != null)
+                cfg.coop_map_follow_player = _mapFollowPlayer.ButtonPressed;
             cfg.Save();
+            // Gating alone leaves the lines already scrolling on screen for ~20s; clear them so unchecking
+            // "允许游戏内弹幕渲染" visibly takes effect immediately.
+            if (pushWasEnabled && !cfg.danmaku_push_enabled)
+                _ = DanmakuService.ClearAsync();
             Close();
         }
 

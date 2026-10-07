@@ -132,7 +132,13 @@ class STS2SummaryContextBuilder:
             rest = payload.get("rest") if isinstance(payload.get("rest"), dict) else {}
             options = rest.get("options") if isinstance(rest.get("options"), list) else []
             signals["rest_option_count"] = len(options)
-            signals["rest_option_types"] = [str(option.get("type") or option.get("name") or "?") for option in options if isinstance(option, dict)]
+            # mod 的 RestOptionPayload 发的是 option_id / title / description（**不是** type/name）——
+            # 老代码读 type/name，于是 rest_option_types 一直是空的，planner 也就无法按类型挑。
+            signals["rest_option_types"] = [
+                str(option.get("option_id") or option.get("type") or option.get("name") or "?")
+                for option in options
+                if isinstance(option, dict)
+            ]
         if state_name == "event":
             event = payload.get("event") if isinstance(payload.get("event"), dict) else {}
             options = event.get("options") if isinstance(event.get("options"), list) else []
@@ -184,10 +190,27 @@ class STS2SummaryContextBuilder:
     def _build_map_context(self, snapshot: dict[str, Any], raw_state: dict[str, Any]) -> dict[str, Any]:
         run = raw_state.get("run") if isinstance(raw_state.get("run"), dict) else {}
         game_map = raw_state.get("map") if isinstance(raw_state.get("map"), dict) else {}
+        # mod 的 /state 同时给 nodes[]（全图，带 is_available）与 available_nodes[]（可投节点，带真实 index
+        # 与投票信息）。choose_map_node 的 option_index 是 available_nodes 的位置索引，所以优先用
+        # available_nodes：它才有 index / vote_count / has_local_vote，跟随玩家投票必须靠它。
+        available_nodes = game_map.get("available_nodes") if isinstance(game_map.get("available_nodes"), list) else []
         travelable_nodes = [
             node for node in (game_map.get("nodes") if isinstance(game_map.get("nodes"), list) else [])
             if isinstance(node, dict) and bool(node.get("is_available"))
         ]
+        if available_nodes:
+            travelable_nodes = [node for node in available_nodes if isinstance(node, dict)]
+        local_vote = game_map.get("local_vote") if isinstance(game_map.get("local_vote"), dict) else None
+        player_votes = game_map.get("player_votes") if isinstance(game_map.get("player_votes"), list) else []
+        other_vote_index = self._other_player_vote_index(available_nodes or travelable_nodes, local_vote, player_votes)
+        multiplayer = raw_state.get("multiplayer") if isinstance(raw_state.get("multiplayer"), dict) else {}
+        session = raw_state.get("session") if isinstance(raw_state.get("session"), dict) else {}
+        # 只有多人局才有"等玩家先投票"这回事：单机地图必须立刻自己选，否则每次选节点都白等一轮。
+        is_multiplayer = (
+            bool(multiplayer.get("is_multiplayer"))
+            or str(session.get("mode") or "").strip().lower() == "multiplayer"
+            or len(player_votes) > 1
+        )
         return {
             "floor": run.get("floor"),
             "current_hp": run.get("current_hp"),
@@ -195,11 +218,52 @@ class STS2SummaryContextBuilder:
             "gold": run.get("gold"),
             "current_node": game_map.get("current_node"),
             "travelable_nodes": travelable_nodes,
+            "available_nodes": available_nodes,
             "travelable_node_types": [str(node.get("type") or node.get("node_type") or "?") for node in travelable_nodes if isinstance(node, dict)],
             "travelable_node_indices": [self._safe_int(node.get("index"), default=index) for index, node in enumerate(travelable_nodes) if isinstance(node, dict)],
+            # 跟随玩家：co-op 里两人必须投同一节点，谁先投谁定路线。other_player_vote_index 是那个人已投
+            # 节点在本列表里的位置索引（没人投为 None），planner 据此"跟随"而不是抢路线。
+            "local_vote": local_vote,
+            "player_votes": player_votes,
+            "other_player_vote_index": other_vote_index,
+            "has_other_player_vote": other_vote_index is not None,
+            "is_multiplayer": is_multiplayer,
             "future_nodes": game_map.get("future_nodes") if isinstance(game_map.get("future_nodes"), list) else [],
             "available_actions": self._available_action_names(snapshot),
         }
+
+    def _other_player_vote_index(
+        self,
+        nodes: list[Any],
+        local_vote: Any,
+        player_votes: list[Any],
+    ) -> int | None:
+        """返回"别的玩家已投节点"在本节点列表里的位置索引（没人投 / 只有自己投 -> None）。
+
+        与 mod 的 NekoAutoplayDriver.FindOtherPlayerVoteIndex 同语义：优先用 player_votes 里的明确
+        记录，退回节点自带的 vote_count/has_local_vote 计数。
+        """
+        if not isinstance(nodes, list) or not nodes:
+            return None
+        if isinstance(player_votes, list):
+            for vote in player_votes:
+                if not isinstance(vote, dict) or bool(vote.get("is_local")):
+                    continue
+                coord = vote.get("coord") if isinstance(vote.get("coord"), dict) else None
+                if not coord:
+                    continue
+                for index, node in enumerate(nodes):
+                    if not isinstance(node, dict):
+                        continue
+                    if self._safe_int(node.get("row")) == self._safe_int(coord.get("row")) and self._safe_int(node.get("col")) == self._safe_int(coord.get("col")):
+                        return index
+        for index, node in enumerate(nodes):
+            if not isinstance(node, dict):
+                continue
+            vote_count = self._safe_int(node.get("vote_count"), default=0) or 0
+            if vote_count > 0 and not bool(node.get("has_local_vote")):
+                return index
+        return None
 
     def _build_combat_context(self, snapshot: dict[str, Any], raw_state: dict[str, Any]) -> dict[str, Any]:
         combat = raw_state.get("combat") if isinstance(raw_state.get("combat"), dict) else {}
@@ -231,6 +295,7 @@ class STS2SummaryContextBuilder:
             "potions": raw_state.get("potions") if isinstance(raw_state.get("potions"), list) else [],
             "selection": selection,
             "selection_cards": selection_cards,
+            **self._selection_counts(selection),
             "available_actions": self._available_action_names(snapshot),
         }
 
@@ -301,8 +366,31 @@ class STS2SummaryContextBuilder:
             "selection": selection,
             "selection_cards": selection_cards,
             "selection_card_names": [str(card.get("name") or card.get("card_id") or "?") for card in selection_cards if isinstance(card, dict)],
+            **self._selection_counts(selection),
             "reward": reward,
             "available_actions": self._available_action_names(snapshot),
+        }
+
+    def _selection_counts(self, selection: Any) -> dict[str, Any]:
+        """多选界面元数据：min/max/已选数/能否确认。
+
+        mod 只对战斗内手牌选择填这些字段（BuildSelectionPayload 从 combat-hand 元数据取值），牌库/网格
+        选择屏全是 0——所以 planner 不能只靠它判断"还需再选几张"，但能用它区分"可确认"与"还没选够"。
+        """
+        if not isinstance(selection, dict):
+            return {
+                "selection_kind": "",
+                "selection_min_select": 0,
+                "selection_max_select": 0,
+                "selection_selected_count": 0,
+                "selection_can_confirm": False,
+            }
+        return {
+            "selection_kind": str(selection.get("kind") or ""),
+            "selection_min_select": self._safe_int(selection.get("min_select"), default=0) or 0,
+            "selection_max_select": self._safe_int(selection.get("max_select"), default=0) or 0,
+            "selection_selected_count": self._safe_int(selection.get("selected_count"), default=0) or 0,
+            "selection_can_confirm": bool(selection.get("can_confirm")),
         }
 
     def _infer_archetype_tags(self, deck: dict[str, Any]) -> list[str]:

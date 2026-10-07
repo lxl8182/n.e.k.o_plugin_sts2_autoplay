@@ -1,8 +1,170 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .heuristic_planner import STS2HeuristicPlanner
+
+# 地图节点在 mod 侧是**引擎枚举**（`RestSite` / `Monster` / `SecondBoss`）。以前这个枚举被直接
+# 塞进台词，实测线上念出的是「可以优先考虑：RestSite」—— 直播里这就是穿帮。这里给它一套人话。
+# 键与 `heuristic_planner._MAP_NODE_TYPE_ALIASES` 的**取值**对齐（权重键 = 显示键的规范化形式），
+# 由 `tests/test_companion_text_leaks.py` 盯着两边不脱节。
+_MAP_NODE_TYPE_LABELS: dict[str, str] = {
+    "monster": "普通敌人",
+    "elite": "精英",
+    "shop": "商店",
+    "rest": "营地",
+    "treasure": "宝箱",
+    "question": "未知房间",
+    "event": "事件",
+    "boss": "Boss",
+    "ancient": "远古",
+}
+_MAP_NODE_TYPE_ALIASES: dict[str, str] = {
+    "monster": "monster",
+    "enemy": "monster",
+    "fight": "monster",
+    "elite": "elite",
+    "shop": "shop",
+    "merchant": "shop",
+    "restsite": "rest",
+    "rest": "rest",
+    "campfire": "rest",
+    "treasure": "treasure",
+    "chest": "treasure",
+    "unknown": "question",
+    "question": "question",
+    "event": "event",
+    "boss": "boss",
+    "secondboss": "boss",
+    "ancient": "ancient",
+}
+
+# 纯 ASCII 的 snake_case / kebab-case = 内部 id（`end_turn`、`GUILDING_STAR`、`play_card`）。
+_RAW_ID_RE = re.compile(r"^[A-Za-z0-9]+(?:[_\-\s][A-Za-z0-9]+)*$")
+
+# 模板句尾自带标点，名字自带标点就会叠成「下去！。」或「药水的未来？，建议…」。
+_TRAILING_PUNCT = "。．.，,、；;：:！!？?~～…"
+
+
+def _trim_trailing_punct(text: Any) -> str:
+    """剥掉名字末尾的标点，交给模板去收句（`下去！` + `。` = 「下去！」）。"""
+    return str(text or "").strip().rstrip(_TRAILING_PUNCT).strip()
+
+
+def _has_cjk(text: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+
+def _normalize_node_type(raw: Any) -> str:
+    key = str(raw or "").strip().lower()
+    for char in ("_", "-", " "):
+        key = key.replace(char, "")
+    return _MAP_NODE_TYPE_ALIASES.get(key, key)
+
+
+def _display_node_type(raw: Any) -> str:
+    """把节点枚举翻成人话；认不出来就退化成去掉下划线的可读写法（至少不是枚举名）。"""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if _has_cjk(text):
+        return text
+    label = _MAP_NODE_TYPE_LABELS.get(_normalize_node_type(text), "")
+    return label or _display_name(text)
+
+
+def _display_name(raw: Any) -> str:
+    """卡牌/遗物名：中文原样保留，纯 id 退化成 `guiding star` 这种可读写法（别念 GUILDING_STAR）。
+
+    CamelCase 也要拆（`SomeNewNode` -> `Some New Node`）：引擎将来加了新枚举，至少不会原样穿帮。
+    """
+    text = str(raw or "").strip()
+    if not text or _has_cjk(text):
+        return text
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text.replace("_", " ").replace("-", " "))
+    # 全大写的 id（`GUILDING_STAR`）拆完还是在大喊，一并降下来：`guiding star`。
+    if not any(char.islower() for char in spaced):
+        spaced = spaced.lower()
+    return " ".join(spaced.split())
+
+
+def _clean_preference(raw: Any) -> str:
+    """策略偏好串**只有在是说给人听的时候**才能念。
+
+    实测线上出现过 `偏好这类选择：end_turn` —— 前半句是脚手架、后半句是动作 id，
+    念出来就是穿帮。判据：取最后一段，若是纯 ASCII 内部 id 或整条不含中文，就整条作废，
+    让调用方退到"念具体牌名"或默认短句。
+    """
+    text = str(raw or "").strip()
+    if not text or not _has_cjk(text):
+        return ""
+    tail = re.split(r"[：:]", text)[-1].strip()
+    if tail and not _has_cjk(tail) and _RAW_ID_RE.match(tail):
+        return ""
+    return tail if _has_cjk(tail) else text
+
+
+# 敌人这一手要干什么。mod 给的是 `intents[].intent_type`（结构化）+ `enemy.intent`（招式 id）。
+_INTENT_TYPE_LABELS: dict[str, str] = {
+    "attack": "攻击",
+    "deathblow": "致命一击",
+    "defend": "防御",
+    "block": "防御",
+    "buff": "强化",
+    "debuff": "弱化",
+    "statuscard": "塞牌",
+    "sleep": "睡眠",
+    "stun": "眩晕",
+    "escape": "逃跑",
+}
+# "还没决定 / 没数据"的哨兵值 —— 这些**什么都不说**，别念 `UNSET_MOVE` 给观众听。
+_INTENT_UNKNOWN_KEYS = frozenset({"", "unset", "unsetmove", "none", "null", "unknown", "unknownmove"})
+
+
+def _normalize_token(raw: Any) -> str:
+    token = str(raw or "").strip().lower()
+    for char in ("_", "-", " "):
+        token = token.replace(char, "")
+    return token
+
+
+def _enemy_intent_label(enemy: Any, raw_enemy: Any = None) -> str:
+    """敌人意图的说人话版本（线上实测念过 `敌:树叶史莱姆（中）/STICKY_SHOT`）。
+
+    优先用 `raw_state` 里的结构化 `intents[]`（`intent_type` + 伤害）—— 那是 mod 的权威来源，
+    能给出「攻击 9」这种玩家真看得懂的信息；拿不到才退到招式 id 的可读化写法；
+    `UNSET_MOVE` 这类哨兵值直接不念。
+    """
+    structured = raw_enemy if isinstance(raw_enemy, dict) else enemy
+    intents = structured.get("intents") if isinstance(structured, dict) and isinstance(structured.get("intents"), list) else []
+    # 有结构化数据就以它为准：它说"不知道"就**不猜**，别再退回招式 id 硬编一句。
+    if intents:
+        for item in intents:
+            if not isinstance(item, dict):
+                continue
+            key = _normalize_token(item.get("intent_type"))
+            # `Unknown` 也是"还没定"——说"意图不明"等于没说，不如只留敌人名字。
+            if not key or key in _INTENT_UNKNOWN_KEYS:
+                continue
+            label = _INTENT_TYPE_LABELS.get(key, "")
+            if not label:
+                continue
+            total = item.get("total_damage")
+            if isinstance(total, (int, float)) and not isinstance(total, bool) and float(total) > 0:
+                hits = item.get("hits")
+                if isinstance(hits, (int, float)) and not isinstance(hits, bool) and int(hits) > 1:
+                    return f"{label} {int(total)}x{int(hits)}"
+                return f"{label} {int(total)}"
+            return label
+        return ""
+    if not isinstance(enemy, dict):
+        return ""
+    raw = str(enemy.get("intent_type") or enemy.get("intent") or enemy.get("move_id") or "").strip()
+    key = _normalize_token(raw)
+    if key in _INTENT_UNKNOWN_KEYS:
+        return ""
+    return _INTENT_TYPE_LABELS.get(key, "") or _display_name(raw)
 
 
 class STS2CompanionEvaluator:
@@ -238,16 +400,19 @@ class STS2CompanionEvaluator:
             reward_cards = payload.get("reward_cards") if isinstance(payload.get("reward_cards"), list) else []
             reward_card_names = payload.get("reward_card_names") if isinstance(payload.get("reward_card_names"), list) else []
             preferred = directives.get("prefer") if isinstance(directives.get("prefer"), list) else []
+            # 策略偏好先过一遍"能不能念"的闸：念不出来就退到下面的具体牌名（线上实测过
+            # `偏好这类选择：end_turn` 这种漏 id 的串）。
+            preferred_text = _clean_preference(preferred[0]) if preferred else ""
             preferred_index = self._preferred_reward_index(payload, directives)
-            if preferred:
-                base = self.t("companion.suggestion.reward_preferred", default="建议优先贴合策略偏好的奖励：{preferred}。", preferred=preferred[0])
+            if preferred_text:
+                base = self.t("companion.suggestion.reward_preferred", default="建议优先贴合策略偏好的奖励：{preferred}。", preferred=preferred_text)
             elif preferred_index is not None and 0 <= preferred_index < len(reward_cards):
                 reward_card = reward_cards[preferred_index] if isinstance(reward_cards[preferred_index], dict) else {}
-                reward_name = str(reward_card.get("name") or reward_card.get("card_id") or "")
+                reward_name = _trim_trailing_punct(_display_name(reward_card.get("name") or reward_card.get("card_id") or ""))
                 if reward_name:
                     base = self.t("companion.suggestion.reward_named", default="当前奖励里可以重点看：{card_name}。", card_name=reward_name)
                 elif preferred_index < len(reward_card_names):
-                    base = self.t("companion.suggestion.reward_named", default="当前奖励里可以重点看：{card_name}。", card_name=reward_card_names[preferred_index])
+                    base = self.t("companion.suggestion.reward_named", default="当前奖励里可以重点看：{card_name}。", card_name=_trim_trailing_punct(_display_name(reward_card_names[preferred_index])))
                 else:
                     base = self.t("companion.suggestion.reward_default", default="建议优先选择能补当前构筑短板的奖励。")
             else:
@@ -259,11 +424,11 @@ class STS2CompanionEvaluator:
             preferred_index = self._preferred_selection_index(payload, directives)
             if preferred_index is not None and 0 <= preferred_index < len(selection_cards):
                 selection_card = selection_cards[preferred_index] if isinstance(selection_cards[preferred_index], dict) else {}
-                card_name = str(selection_card.get("name") or selection_card.get("card_id") or "")
+                card_name = _trim_trailing_punct(_display_name(selection_card.get("name") or selection_card.get("card_id") or ""))
                 if card_name:
                     base = self.t("companion.suggestion.selection_named", default="当前可处理的卡里，可以优先看：{card_name}。", card_name=card_name)
                 elif preferred_index < len(selection_card_names):
-                    base = self.t("companion.suggestion.selection_named", default="当前可处理的卡里，可以优先看：{card_name}。", card_name=selection_card_names[preferred_index])
+                    base = self.t("companion.suggestion.selection_named", default="当前可处理的卡里，可以优先看：{card_name}。", card_name=_trim_trailing_punct(_display_name(selection_card_names[preferred_index])))
                 else:
                     base = self.t("companion.suggestion.selection", default="建议优先精简低价值卡，保持牌组质量。")
             else:
@@ -281,15 +446,16 @@ class STS2CompanionEvaluator:
                     None,
                 )
                 node_type = str(preferred_node.get("type") or preferred_node.get("node_type") or "") if isinstance(preferred_node, dict) else ""
-                if node_type:
-                    base = self.t("companion.suggestion.map_named", default="当前可走路线里，可以优先考虑：{node_type}。", node_type=node_type)
+                node_label = _display_node_type(node_type)
+                if node_label:
+                    base = self.t("companion.suggestion.map_named", default="当前可走路线里，可以优先考虑：{node_type}。", node_type=node_label)
                 else:
                     base = self.t("companion.suggestion.map", default="建议优先选择更稳的成长路线，不要无意义贪战。")
             else:
                 base = self.t("companion.suggestion.map", default="建议优先选择更稳的成长路线，不要无意义贪战。")
             return self._post_action_wrap(base, trigger)
         if summary_kind == "event":
-            event_name = str(payload.get("event_name") or payload.get("event_id") or "")
+            event_name = _trim_trailing_punct(payload.get("event_name") or payload.get("event_id") or "")
             if event_name:
                 base = self.t("companion.suggestion.event_named", default="当前事件 {event_name}，建议优先看代价可控且长期收益更高的选项。", event_name=event_name)
             else:

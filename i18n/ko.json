@@ -85,6 +85,7 @@
   "companion.suggestion.combat_reason.block_value": "이 카드로 먼저 방어를 쌓아 두면 이번 턴을 더 안전하게 넘길 수 있습니다.",
   "companion.suggestion.combat_reason.generic": "현재 HP, 에너지, 손패, 적 의도와 더 잘 맞는 선택입니다.",
   "companion.suggestion.reward_preferred": "전략 선호도에 맞는 보상을 우선하세요: {preferred}.",
+  "companion.suggestion.reward_default": "지금 덱의 약점을 메워 줄 카드를 우선 고르는 게 좋아요.",
   "companion.suggestion.reward_named": "현재 보상 중에서는 {card_name} 쪽을 먼저 눈여겨볼 만합니다.",
   "companion.suggestion.selection_named": "지금 처리할 수 있는 카드 중에서는 {card_name} 쪽을 먼저 볼 수 있습니다.",
   "companion.suggestion.map_named": "지금 갈 수 있는 경로 중에서는 {node_type} 쪽을 먼저 고려해볼 수 있습니다.",

@@ -30,17 +30,11 @@ namespace NekoComm.Game
             {
                 if (_started)
                     return;
-                // Danmaku (catgirl commentary) is decoupled from the autoplay decision-LLM (llm_enabled).
-                // The catgirl (co-op autoplay client) process runs headless and must not generate
-                // commentary, so it is suppressed here regardless of llm_enabled. danmaku_enabled is the
-                // explicit global toggle.
-                if (!NekoConfig.Current.danmaku_enabled || NekoAutoplayDriver.IsCatgirlProcess())
-                {
-                    _started = true;   // marked started so the event loop never spins up
-                    return;
-                }
                 _started = true;
             }
+            // Always subscribe and gate inside OnEventAsync instead of latching the decision here: the old
+            // boot-time-only check meant a /config write (or the in-game settings window) could never turn
+            // this driver on/off after startup — the flag was read exactly once, so "关不掉弹幕" stuck.
             _ = Task.Run(EventLoopAsync);
         }
 
@@ -74,6 +68,12 @@ namespace NekoComm.Game
             if (!IsInteresting(type))
                 return;
             var cfg = NekoConfig.Current;
+            // Re-read the gates on every event so a runtime toggle takes effect without a restart:
+            //  - danmaku_enabled       : the mod's own LLM commentary on/off (in-game settings window, /config)
+            //  - danmaku_push_enabled  : the shared overlay gate; a disabled overlay must not burn LLM calls
+            //  - IsCatgirlProcess()    : the headless catgirl client never generates commentary
+            if (!cfg.danmaku_enabled || !cfg.danmaku_push_enabled || NekoAutoplayDriver.IsCatgirlProcess())
+                return;
             if (!cfg.llm_enabled || string.IsNullOrWhiteSpace(cfg.llm_model) || string.IsNullOrWhiteSpace(cfg.llm_base_url))
                 return;
 

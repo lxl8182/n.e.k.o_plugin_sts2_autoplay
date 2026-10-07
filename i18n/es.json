@@ -85,6 +85,7 @@
   "companion.suggestion.combat_reason.block_value": "Esta carta ayuda a levantar antes la defensa y hace este turno más seguro.",
   "companion.suggestion.combat_reason.generic": "Encaja mejor con el HP, la energía, la mano y la intención enemiga actuales.",
   "companion.suggestion.reward_preferred": "Prefiere recompensas que coincidan con la preferencia estratégica: {preferred}.",
+  "companion.suggestion.reward_default": "Mejor prioriza la recompensa que cubra los puntos débiles del mazo.",
   "companion.suggestion.reward_named": "Entre las recompensas actuales, merece la pena fijarse en: {card_name}.",
   "companion.suggestion.selection_named": "Entre las cartas que puedes gestionar ahora, merece la pena fijarse primero en: {card_name}.",
   "companion.suggestion.map_named": "Entre las rutas disponibles ahora, puedes considerar primero: {node_type}.",

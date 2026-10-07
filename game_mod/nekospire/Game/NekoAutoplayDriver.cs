@@ -43,6 +43,8 @@ namespace NekoComm.Game
         // card instead of waiting — a genuinely broken solver must not stall the catgirl forever, but a
         // transient "not my Play phase yet" refusal should just wait for the right window.
         private const int CombatSolverFallbackThreshold = 8;
+        // How many capstone buttons to try before giving up and waiting (index 0 may be a Back/Close button).
+        private const int MaxCapstoneSweep = 8;
 
         private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = false };
 
@@ -54,6 +56,26 @@ namespace NekoComm.Game
         private double _lastActionAt;
         private double _cooldownUntil;
         private int _combatSolverFails;
+
+        // Map-vote follow-player state. Keyed on the map identity so a new map (or a new room) restarts the
+        // "give the human first refusal" countdown instead of inheriting a stale one.
+        private string _mapWaitKey = "";
+        private double _mapWaitStartedAt;
+
+        // Card-selection memo. A multi-card selection (e.g. "choose 2 cards") cannot be driven by always
+        // picking option 0: re-picking an already-picked card is a no-op/toggle, so selected_count never
+        // reaches min_select and the loop spins forever. Remember the card-id signature we picked against so
+        // each tick advances to a different card.
+        private string _selectionSignature = "";
+        private int _selectionLastPick = -1;
+        private int _selectionPicked;
+
+        // Same "never re-press the same option" cursor for the other multi-step choosers (bundle / capstone),
+        // where the pick action stays available after it has been applied.
+        private string _bundleSignature = "";
+        private bool _bundleChosen;
+        private string _capstoneSignature = "";
+        private int _capstoneLastOption = -1;
 
         public void Start()
         {
@@ -135,6 +157,16 @@ namespace NekoComm.Game
 
             if (_runEnded)
                 return;
+            // Release the per-run latches once we are demonstrably back inside a run. Both used to latch for
+            // the whole process lifetime: after one GAME_OVER the catgirl refused to act again (line above),
+            // and after one visit to the main menu _openedMultiplayerMenu stayed true so the multiplayer
+            // submenu could never be reopened — the catgirl just sat at the main menu forever. Resuming a
+            // saved run lands on MAP/COMBAT/... , so this is also what lets the catgirl follow a rejoin.
+            if (state.screen is not ("MAIN_MENU" or "GAME_OVER" or "UNKNOWN"))
+            {
+                _runEnded = false;
+                _openedMultiplayerMenu = false;
+            }
             // Runtime guard: if a lobby/run already tells us we're the host, never self-drive (mis-wired setup).
             if (state.multiplayer_lobby?.is_host == true ||
                 string.Equals(state.multiplayer?.net_game_type, "host", StringComparison.OrdinalIgnoreCase))
@@ -242,7 +274,12 @@ namespace NekoComm.Game
                 case "CARD_SELECTION":
                 case "CARD_SELECTION_TRANSFORM":
                 case "CARD_SELECTION_REMOVE":
-                    return await BranchLlmAsync(s, DecideCardSelection);
+                    // Deliberately NOT routed through the LLM. A card chooser is a stateful multi-pick UI:
+                    // the payload's min/max/selected_count/can_confirm are only populated for the in-combat
+                    // hand selection, so no consumer (LLM included) can tell "1 of 2 picked, take a different
+                    // card" from the state alone. Asking the model which index to press is what produced the
+                    // endless index-0 re-pick; DecideCardSelection keeps its own cursor instead.
+                    return DecideCardSelection(s);
                 case "EVENT":
                     return await BranchLlmAsync(s, DecideEvent);
                 case "SHOP":
@@ -256,14 +293,50 @@ namespace NekoComm.Game
                 case "GAME_OVER":
                     return DecideGameOver(s);
                 case "BUNDLE_SELECTION":
+                    // Confirm BEFORE re-choosing: choose_bundle stays in available_actions after it has been
+                    // applied, so testing it first made confirm_bundle unreachable and the catgirl re-picked
+                    // bundle 0 (each pick blocking up to 10s) forever. Same family as the card-selection hang.
+                    if (_bundleChosen && Has(s, "confirm_bundle"))
+                        return Req("confirm_bundle");
                     if (Has(s, "choose_bundle") && s.bundles is { Length: > 0 })
+                    {
+                        var signature = string.Join(",", s.bundles.Select(b => b.index));
+                        if (signature != _bundleSignature)
+                        {
+                            _bundleSignature = signature;
+                            _bundleChosen = false;
+                        }
+                        _bundleChosen = true;
                         return Req("choose_bundle", option: 0);
+                    }
                     if (Has(s, "confirm_bundle"))
                         return Req("confirm_bundle");
+                    if (Has(s, "proceed"))
+                        return Req("proceed");
                     return null;
                 case "CAPSTONE_SELECTION":
+                    // Walk the option list without ever re-pressing the same button: index 0 may be a Back/Close
+                    // button, and re-clicking the same one each tick never leaves the stack. There is no
+                    // capstone payload (GameStatePayload exposes no capstone field), so we bound the sweep by
+                    // the number of available actions instead of the option count.
                     if (Has(s, "choose_capstone_option"))
-                        return Req("choose_capstone_option", option: 0);
+                    {
+                        var signature = $"{s.available_actions.Length}|{string.Join(",", s.available_actions)}";
+                        if (signature != _capstoneSignature)
+                        {
+                            _capstoneSignature = signature;
+                            _capstoneLastOption = -1;
+                        }
+                        var next = _capstoneLastOption + 1;
+                        if (next >= MaxCapstoneSweep)
+                            return null; // swept once; wait for the screen to change instead of looping
+                        _capstoneLastOption = next;
+                        return Req("choose_capstone_option", option: next);
+                    }
+                    if (Has(s, "proceed"))
+                        return Req("proceed");
+                    if (Has(s, "dismiss_modal"))
+                        return Req("dismiss_modal");
                     return null;
                 case "CARDS_VIEW":
                     if (Has(s, "close_cards_view"))
@@ -285,6 +358,40 @@ namespace NekoComm.Game
                 return null;
             }
 
+            // Re-arm the one-shot open_multiplayer_menu latch when we are demonstrably back at the bare main
+            // menu (openable again, no submenu to close). Without this the latch stayed true for the whole
+            // process, so a catgirl that once opened the submenu and then got unwound (player pressed Esc,
+            // join failed) could never reopen it and went permanently idle.
+            if (!Has(s, "join_multiplayer_direct") && !Has(s, "close_main_menu_submenu")
+                && Has(s, "open_multiplayer_menu"))
+                _openedMultiplayerMenu = false;
+
+            // A resumable save exists (main menu shows an enabled Continue). This process must NOT touch it:
+            // both game processes share user://, so clicking Continue/New Run here resumes or restarts the
+            // run locally and the co-op save becomes unreachable for the host — that is exactly the
+            // "和 AI 组队中途退出后回不到存档" report. Stay off the save and only keep the ability to rejoin
+            // the host's room; the human (or the plugin's sts2_continue_run) owns the Continue button.
+            if (Has(s, "continue_run") && NekoConfig.Current.coop_yield_to_saved_run)
+            {
+                // A submenu left open also hides the Continue button (CanContinueRun requires
+                // SubmenusOpen == false), so clean it up even while we are yielding.
+                if (Has(s, "close_main_menu_submenu"))
+                    return Req("close_main_menu_submenu");
+                if (Has(s, "join_multiplayer_direct"))
+                {
+                    GD.Print($"{LogPrefix} MAIN_MENU -> resumable save present; rejoining host room");
+                    return Req("join_multiplayer_direct");
+                }
+                if (Has(s, "open_multiplayer_menu") && !_openedMultiplayerMenu)
+                {
+                    _openedMultiplayerMenu = true;
+                    GD.Print($"{LogPrefix} MAIN_MENU -> resumable save present; opening multiplayer menu to rejoin (never clicking Continue)");
+                    return Req("open_multiplayer_menu");
+                }
+                GD.Print($"{LogPrefix} MAIN_MENU -> resumable save present; yielding to the player (no continue_run / no new room)");
+                return null;
+            }
+
             // Otherwise use the game's own multiplayer UI (production), NOT the debug "multiplayer test" scene —
             // that debug path crashes a second game instance with the third-party mods loaded.
             // open_multiplayer_menu pushes NMultiplayerSubmenu (which still resolves to the MAIN_MENU screen),
@@ -300,6 +407,10 @@ namespace NekoComm.Game
                 GD.Print($"{LogPrefix} multiplayer submenu -> join_multiplayer_direct (host 127.0.0.1:33771)");
                 return Req("join_multiplayer_direct");
             }
+            // Stuck inside a submenu that offers neither: pop back to the bare main menu so the latch above
+            // can re-arm on the next tick.
+            if (Has(s, "close_main_menu_submenu"))
+                return Req("close_main_menu_submenu");
             return null;
         }
 
@@ -334,10 +445,106 @@ namespace NekoComm.Game
         private ActionRequest? DecideMap(GameStatePayload s)
         {
             // In co-op both players must vote the same node; both client and host apply the same row/col sort
-            // over available_nodes, so positional index 0 is the same node on both sides.
-            if (Has(s, "choose_map_node") && s.map is { available_nodes.Length: > 0 })
-                return Req("choose_map_node", option: 0);
-            return null;
+            // over available_nodes, so a positional index means the same node on both sides.
+            if (!Has(s, "choose_map_node") || s.map is not { available_nodes.Length: > 0 } map)
+                return null;
+
+            // Follow the player instead of racing them for the route. The human votes first, we mirror it; if
+            // they re-vote we switch to match them. Only after coop_map_vote_wait_seconds with nobody voting
+            // does the catgirl fall back to its own preference, so autoplay can never stall a co-op run.
+            // The waiting half only applies to a multiplayer run: with no teammate to wait for, waiting would
+            // just slow every single map node down for nothing.
+            if (NekoConfig.Current.coop_map_follow_player)
+            {
+                var follow = FindOtherPlayerVoteIndex(map);
+                if (follow >= 0)
+                {
+                    var target = map.available_nodes[follow];
+                    if (map.local_vote == null || map.local_vote.row != target.row || map.local_vote.col != target.col)
+                    {
+                        GD.Print($"{LogPrefix} MAP -> following the player's vote [{follow}:{target.node_type}@{target.row},{target.col}]");
+                        return Req("choose_map_node", option: follow);
+                    }
+                    // Already voting with the player: wait for the room to resolve this node.
+                    _mapWaitStartedAt = 0;
+                    return null;
+                }
+
+                if (!IsMultiplayerRun(s))
+                {
+                    _mapWaitStartedAt = 0;
+                    return Req("choose_map_node", option: 0);
+                }
+
+                var waitKey = $"{map.map_generation_count}|{map.available_nodes.Length}|{map.current_node?.row},{map.current_node?.col}";
+                if (waitKey != _mapWaitKey)
+                {
+                    _mapWaitKey = waitKey;
+                    _mapWaitStartedAt = 0;
+                }
+
+                if (map.local_vote != null)
+                    return null; // our own vote is in; re-voting would only fight the room
+
+                var waitSeconds = NekoConfig.Current.coop_map_vote_wait_seconds;
+                if (waitSeconds > 0)
+                {
+                    if (_mapWaitStartedAt <= 0)
+                    {
+                        _mapWaitStartedAt = Now();
+                        GD.Print($"{LogPrefix} MAP -> waiting up to {waitSeconds}s for the player to pick the route first");
+                        return null;
+                    }
+                    if (Now() - _mapWaitStartedAt < waitSeconds)
+                        return null;
+                    GD.Print($"{LogPrefix} MAP -> no player vote after {waitSeconds}s; falling back to our own node");
+                }
+            }
+
+            _mapWaitStartedAt = 0;
+            return Req("choose_map_node", option: 0);
+        }
+
+        /// <summary>
+        /// True when this run actually has other players. Gates the "wait for the human to vote first" branch:
+        /// with no teammate there is nobody to wait for, so waiting would only slow every node down.
+        /// </summary>
+        private static bool IsMultiplayerRun(GameStatePayload s) =>
+            s.multiplayer?.is_multiplayer == true
+            || s.multiplayer is { player_count: > 1 }
+            || s.run is { players.Length: > 1 }
+            || s.map is { player_votes.Length: > 1 }
+            || s.multiplayer_lobby != null;
+
+        /// <summary>
+        /// Positional index (into available_nodes) of a node another player has already voted for, or -1.
+        /// Prefers the explicit per-player vote list and falls back to the per-node vote counters, so a
+        /// partial payload still yields "the player voted here".
+        /// </summary>
+        private static int FindOtherPlayerVoteIndex(MapPayload map)
+        {
+            if (map.player_votes is { Length: > 0 })
+            {
+                foreach (var vote in map.player_votes)
+                {
+                    if (vote.is_local || vote.coord == null)
+                        continue;
+                    for (var i = 0; i < map.available_nodes.Length; i++)
+                    {
+                        var node = map.available_nodes[i];
+                        if (node.row == vote.coord.row && node.col == vote.coord.col)
+                            return i;
+                    }
+                }
+            }
+
+            for (var i = 0; i < map.available_nodes.Length; i++)
+            {
+                var node = map.available_nodes[i];
+                if (!node.has_local_vote && node.vote_count > 0)
+                    return i;
+            }
+            return -1;
         }
 
         private async Task<ActionRequest?> DecideCombatAsync(GameStatePayload s)
@@ -446,6 +653,13 @@ namespace NekoComm.Game
 
         private ActionRequest? DecideReward(GameStatePayload s)
         {
+            // Take a card first when the screen IS the card chooser. resolve_rewards is advertised on
+            // NCardRewardSelectionScreen too (CanCollectRewardsAndProceed covers it), and checking it first
+            // meant every card reward was silently drained away without ever picking a card.
+            if (Has(s, "choose_reward_card") && s.reward is { card_options.Length: > 0 })
+                return Req("choose_reward_card", option: 0);
+            // Then let the mod's stateful reward drain run: it claims what is claimable and advances the flow
+            // (unlike hand-rolled claim_reward(index) loops, which stall once every reward is already claimed).
             if (Has(s, "resolve_rewards"))
                 return Req("resolve_rewards");
             if (Has(s, "collect_rewards_and_proceed"))
@@ -463,8 +677,26 @@ namespace NekoComm.Game
 
         private ActionRequest? DecideCardSelection(GameStatePayload s)
         {
-            if (Has(s, "select_deck_card"))
-                return Req("select_deck_card", option: 0);
+            var sel = s.selection;
+
+            // 1) Confirm when the game itself advertises it. This covers in-combat hand selections
+            //    (requires_confirmation + can_confirm) and is always preferable to another pick.
+            if (Has(s, "confirm_selection") && sel?.can_confirm != false)
+                return Req("confirm_selection");
+
+            // 2) Take a card. Never blindly reuse the same index: on a screen that needs 2+ cards the
+            //    previously picked index is already selected, so re-pressing it is a no-op (or a deselect),
+            //    max_select is never reached and the screen never advances — the "选两张卡卡住" report.
+            if (Has(s, "select_deck_card") && sel is { cards.Length: > 0 })
+            {
+                var index = NextSelectionIndex(sel);
+                if (index >= 0)
+                    return Req("select_deck_card", option: index);
+                // Every candidate for this screen has been tried. Fall through to the escape hatches instead
+                // of spinning on the same card forever.
+                GD.PrintErr($"{LogPrefix} card selection exhausted ({sel.kind}, {sel.cards.Length} cards); waiting for the screen to advance");
+            }
+
             if (Has(s, "confirm_selection"))
                 return Req("confirm_selection");
             if (Has(s, "proceed"))
@@ -472,6 +704,55 @@ namespace NekoComm.Game
             if (Has(s, "close_cards_view"))
                 return Req("close_cards_view");
             return null;
+        }
+
+        /// <summary>
+        /// Pick the next card to press for the current selection screen, advancing a local cursor instead of
+        /// re-pressing option 0.
+        ///
+        /// The payload's selected_count/max_select/can_confirm are only filled in for the in-combat hand
+        /// selection (GameStateService.BuildSelectionPayload derives them from combat-hand metadata), and
+        /// SelectionCardPayload has no per-card "already picked" flag — so for deck/grid choosers the only
+        /// reliable information is what we did ourselves on this very screen. Two signals combine:
+        ///   - when the payload IS authoritative (max_select > 0), trust selected_count and take that index;
+        ///   - otherwise advance our own cursor, moving past the index we pressed last time whenever the
+        ///     pick did not register (selected_count unchanged), which also covers the deselect-toggle case.
+        /// The cursor resets whenever the candidate slate changes (screen/prompt/card ids), i.e. a new
+        /// selection, so a fresh screen always starts from its first card.
+        /// </summary>
+        private int NextSelectionIndex(SelectionPayload sel)
+        {
+            var count = sel.cards.Length;
+            if (count <= 0)
+                return -1;
+
+            var signature = $"{sel.kind}|{sel.prompt}|{count}|" +
+                string.Join(",", sel.cards.Select(card => card.card_id + (card.upgraded ? "+" : "")));
+            if (signature != _selectionSignature)
+            {
+                _selectionSignature = signature;
+                _selectionLastPick = -1;
+                _selectionPicked = 0;
+            }
+
+            // The game says the selection is complete and confirmable: do not pick anything else.
+            if (sel.can_confirm || (sel.max_select > 0 && sel.max_select == sel.selected_count))
+                return -1;
+
+            // max_select > 0 means the payload is authoritative (in-combat hand selection) and the next
+            // distinct card sits at the current selected_count offset. Otherwise (deck/grid choosers, whose
+            // counts are not populated) advance one card per tick from our own cursor — moving on even when a
+            // press did not change the screen keeps us out of the re-press-the-same-card loop.
+            var index = sel.max_select > 0
+                ? sel.selected_count
+                : (_selectionLastPick < 0 ? 0 : _selectionLastPick + 1);
+
+            if (index < 0 || index >= count)
+                return -1;
+
+            _selectionLastPick = index;
+            _selectionPicked++;
+            return index;
         }
 
         private ActionRequest? DecideEvent(GameStatePayload s)
@@ -567,6 +848,27 @@ namespace NekoComm.Game
 
         private enum LlmDecision { Action, Wait, Fallback }
 
+        /// <summary>
+        /// Screens where a deterministic answer beats asking the model (see BranchLlmAsync).
+        /// </summary>
+        private static bool ShouldBypassLlm(GameStatePayload s)
+        {
+            // A co-op party member already picked the node: mirror the player instead of choosing our own.
+            if (s.screen == "MAP"
+                && NekoConfig.Current.coop_map_follow_player
+                && s.map is { available_nodes.Length: > 0 } map
+                && FindOtherPlayerVoteIndex(map) >= 0)
+                return true;
+
+            // Card choosers: the payload has no per-card picked state and confirm_selection is only advertised
+            // for in-combat hand selections, so the model cannot drive a multi-pick screen — and a repeated
+            // index is exactly what hangs it.
+            if (s.screen is "CARD_SELECTION" or "CARD_SELECTION_TRANSFORM" or "CARD_SELECTION_REMOVE")
+                return true;
+
+            return false;
+        }
+
         private static bool LlmReady()
         {
             var cfg = NekoConfig.Current;
@@ -580,6 +882,14 @@ namespace NekoComm.Game
             Func<GameStatePayload, ActionRequest?> heuristic)
         {
             if (!LlmReady())
+                return heuristic(s);
+
+            // Some screens have an answer that must beat the LLM:
+            //  - a co-op map vote the other player already cast (follow the player, never out-vote them);
+            //  - a card selection whose payload carries no per-card pick state, so the model could only guess
+            //    an index and would re-pick the same card (the "选两张卡卡住" loop).
+            // Ask the heuristic directly in those cases instead of spending an LLM round-trip.
+            if (ShouldBypassLlm(s))
                 return heuristic(s);
 
             LlmDecision kind;

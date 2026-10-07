@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import threading
 from concurrent.futures import Future
 from time import time
@@ -38,14 +37,12 @@ class STS2LoopRunner:
         # recomputed on every tick while the combat position is unchanged. See _combat_plan_signature.
         self._solver_plan_sig: Any = None
         self._solver_plan_cached: dict[str, Any] | None = None
+        # 计划复用/重算的日志去重键（避免每 tick 刷屏）。
+        self._plan_log_key = ""
         # 最近一次 SSE 事件类型（combat_started / player_action_window_opened 等）。随
         # /events/stream 更新，供 catgirl 战斗 prompt 判断"该不该带 line"：仅轮到玩家行动的
         # player_action_window_opened 才带，其余战斗事件只报基础（怪物血/我方血/层级）。
         self._current_event_type: str = ""
-        # Cache the event-room LLM advice against the event-state signature (see _event_plan_signature)
-        # so the LLM is not re-consulted every tick while the event options are unchanged.
-        self._event_llm_sig: Any = None
-        self._event_llm_cached: dict[int, float] | None = None
         # Scene-change event streaming (mod GET /events/stream): drive a refresh on a real change
         # instead of polling /state on a timer. See _event_loop / _RELEVANT_EVENT_TYPES.
         self._event_task: asyncio.Task[Any] | Future[Any] | None = None
@@ -92,15 +89,24 @@ class STS2LoopRunner:
         in_combat_decision = classification.get("state_name") == "combat" and mode_info.get("allows_planner")
         step_index = self._service._state.solver_step_index if isinstance(self._service._state.solver_step_index, int) else 0
         if in_combat_decision:
+            # ── 计划快照语义（玩家口径）──────────────────────────────────────────────
+            # "算一次、做成快照、直接按快照执行；每次行动后用当前局面和快照对比，
+            #   一致就继续，不一致就重新算。"
+            #
+            # mod 的 /solver/plan **每次调用都会重跑一遍 CombatSolver 搜索**（Short 预算是 8 秒），
+            # 所以能不重算就别重算。复用快照的唯一条件是：**快照里下一步在当前局面下仍然可执行**。
+            # 单看"签名没变"不够 —— 抽牌/弃牌会让手牌漂移，步进下标就会指到别的牌上。
             sig = _combat_plan_signature(snapshot)
-            if sig == self._solver_plan_sig and self._solver_plan_cached:
-                solver_plan = self._solver_plan_cached
-                # 当前回合的步骤已含最后一个 end_turn 且被取完 -> 视为进入新回合，触发重查。
-                steps = _current_turn_steps(solver_plan)
-                if steps is None or step_index >= len(steps):
-                    solver_plan = None
-            else:
-                solver_plan = None
+            cached, reason = _reusable_plan(
+                self._solver_plan_cached,
+                self._solver_plan_sig,
+                sig,
+                step_index,
+                snapshot,
+            )
+            if cached is not None:
+                solver_plan = cached
+                self._log_plan_reuse(step_index, len(_current_turn_steps(cached) or []))
             if solver_plan is None:
                 try:
                     fetched = await client.get_combat_plan()
@@ -112,6 +118,7 @@ class STS2LoopRunner:
                     self._solver_plan_sig = sig
                     self._solver_plan_cached = fetched
                     self._service._state.solver_step_index = 0
+                    self._log_plan_refresh(reason or "首次取计划")
                 else:
                     solver_plan = None
         else:
@@ -130,50 +137,6 @@ class STS2LoopRunner:
                 if isinstance(step0, dict) and step0.get("choice_card_id"):
                     pending_choice = str(step0.get("choice_card_id"))
             self._service._state.pending_card_choice_id = pending_choice
-        # Event-room LLM advice (per-option scores) for heuristic fusion. plan() is sync and the LLM
-        # is async, so fetch here (async tick) and inject into the contexts it reads. Cache by
-        # event-state signature so the LLM is not re-consulted while the event options are unchanged.
-        event_llm_scores = None
-        event_llm_weight = float(getattr(self._service, "_event_llm_weight", 0.5) or 0.5)
-        in_event_decision = (
-            bool(getattr(self._service, "_event_llm_enabled", True))
-            and classification.get("state_name") == "event"
-            and mode_info.get("allows_planner")
-        )
-        if in_event_decision:
-            esig = _event_plan_signature(summary_context)
-            if esig == self._event_llm_sig:
-                event_llm_scores = self._event_llm_cached
-            else:
-                try:
-                    payload = summary_context.get("payload") if isinstance(summary_context.get("payload"), dict) else {}
-                    event_options = payload.get("event_options") if isinstance(payload.get("event_options"), list) else []
-                    player = snapshot_summary.get("player") if isinstance(snapshot_summary.get("player"), dict) else {}
-                    run_context = {
-                        "character_name": player.get("character_name"),
-                        "current_hp": player.get("current_hp") if player.get("current_hp") is not None else payload.get("current_hp"),
-                        "max_hp": player.get("max_hp") if player.get("max_hp") is not None else payload.get("max_hp"),
-                        "gold": payload.get("gold"),
-                        "deck": payload.get("deck"),
-                        "relics": payload.get("relics"),
-                    }
-                    fetched = await self._service._event_advice.score_event_options(
-                        options=event_options,
-                        run_context=run_context,
-                        strategy_context=strategy_context,
-                    )
-                except Exception:
-                    fetched = None
-                if fetched:
-                    event_llm_scores = fetched
-                    self._event_llm_sig = esig
-                    self._event_llm_cached = fetched
-                else:
-                    event_llm_scores = None
-        else:
-            # Not in an event decision phase: drop the cache so re-entering an event refetches.
-            self._event_llm_sig = None
-            self._event_llm_cached = None
         candidate_actions = self._service._candidate_generator.generate(
             {
                 "snapshot": {**snapshot, "action_registry": action_registry},
@@ -181,8 +144,6 @@ class STS2LoopRunner:
                 "summary_context": summary_context,
                 "strategy_context": strategy_context,
                 "solver_plan": solver_plan,
-                "event_llm_scores": event_llm_scores,
-                "event_llm_weight": event_llm_weight,
             },
             mode="program",
         )
@@ -239,8 +200,6 @@ class STS2LoopRunner:
             "strategy_context": strategy_context,
             "mode": mode_info,
             "solver_plan": solver_plan,
-            "event_llm_scores": event_llm_scores,
-            "event_llm_weight": event_llm_weight,
             "pending_card_choice_id": self._service._state.pending_card_choice_id,
             "solver_step_index": self._service._state.solver_step_index,
         }
@@ -485,10 +444,39 @@ class STS2LoopRunner:
             try:
                 await self._service.run_autoplay_step()
             except Exception as exc:
+                # 出错**不停车**：记一次错误后退避重试。autoplay_state 只表达玩家意图，
+                # 任何错误都不该把它从 running 改掉（否则这个循环会永久空转，见 service._mark_loop_error）。
                 self._service._mark_loop_error(exc)
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(self._service._autoplay_retry_backoff())
                 continue
             await asyncio.sleep(self._service._cfg_action_interval())
+
+    def _log_plan_reuse(self, step_index: int, total: int) -> None:
+        """按快照继续执行时留痕（同一步只记一次）—— 用来核对"到底省了多少次求解"。"""
+        key = f"reuse:{step_index}/{total}"
+        if key == self._plan_log_key:
+            return
+        self._plan_log_key = key
+        try:
+            self._service.logger.info("[sts2_plan] 复用快照 step=%s/%s（局面与快照一致）", step_index + 1, total)
+        except Exception:
+            pass
+
+    def _log_plan_refresh(self, reason: str) -> None:
+        """重新向 mod 取计划时留痕（含原因）—— 原因是"局面不一致"还是"回合变了"要看得出来。"""
+        try:
+            self._service.logger.info("[sts2_plan] 重新计算计划（原因：%s）", reason)
+        except Exception:
+            pass
+
+    def invalidate_combat_plan_cache(self) -> None:
+        """丢弃整回合缓存的 /solver/plan（下一次 tick 重新向 mod 取）。
+
+        场景：动作被 mod 拒收（多半是缓存计划指向的敌人已经死了）。不丢的话下一轮还会拿同一个
+        过期下标去撞同一堵墙。
+        """
+        self._solver_plan_sig = None
+        self._solver_plan_cached = None
 
     def _create_task(self, coro: Any, *, name: str) -> asyncio.Task[Any] | Future[Any] | None:
         try:
@@ -527,32 +515,17 @@ class STS2LoopRunner:
         self._stop_owner_loop()
 
 
-def _event_plan_signature(summary_context: dict[str, Any]) -> str:
-    """Stable fingerprint of the event-room state an LLM advice call depends on.
-
-    Reuse the cached event_llm_scores while the event options + player resources are unchanged, so a
-    repeated tick does not re-consult the LLM for the same event position.
-    """
-    payload = summary_context.get("payload") if isinstance(summary_context.get("payload"), dict) else {}
-    frozen = json.dumps(
-        {
-            "event_options": payload.get("event_options"),
-            "current_hp": payload.get("current_hp"),
-            "max_hp": payload.get("max_hp"),
-            "gold": payload.get("gold"),
-        },
-        sort_keys=True,
-        default=str,
-    )
-    return hashlib.sha256(frozen.encode("utf-8")).hexdigest()
-
-
 def _combat_plan_signature(snapshot: dict[str, Any]) -> str:
-    """Turn-stable fingerprint for WHOLE-TURN caching: 只按 回合(run_id+turn) 键。
+    """Turn-stable fingerprint for WHOLE-TURN caching: 按 回合(run_id+turn) **与存活敌人集合** 键。
 
     GET /solver/plan 每次调用都会重跑 CombatSolver 搜索；插件现在"回合开始取一次、整回合复用"
-    （见 solver_step_index），所以签名在回合内不变，进入新回合才变化从而重查。
+    （见 solver_step_index），所以签名在回合内尽量不变，进入新回合才变化从而重查。
     注意：不能把整局战斗状态放进签名——那每出一张牌就变，起不到缓存作用。
+
+    **但存活敌人集合必须进签名**：计划里的 target_index 是**绝对下标**。回合内死掉一只敌人后
+    （史莱姆成群出现，这是常态），旧计划的下标就可能越界，于是 mod 以
+    ``invalid_target: target_index is out of range`` 拒收。敌人集合变化就让缓存失效、按现场重算。
+    HP 刻意排除在外：血量每出一张牌都变，放进去等于取消缓存。
     """
     raw = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
     run = raw.get("run") if isinstance(raw.get("run"), dict) else {}
@@ -561,7 +534,21 @@ def _combat_plan_signature(snapshot: dict[str, Any]) -> str:
     if turn is None:
         combat = raw.get("combat") if isinstance(raw.get("combat"), dict) else {}
         turn = combat.get("turn")
-    return hashlib.sha256(f"{run_id}|turn:{turn}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{run_id}|turn:{turn}|{_alive_enemy_key(raw)}".encode("utf-8")).hexdigest()
+
+
+def _alive_enemy_key(raw_state: dict[str, Any]) -> str:
+    """存活敌人的 (下标, 身份) 清单——只有"谁还活着"变了才算局面换了目标空间。"""
+    combat = raw_state.get("combat") if isinstance(raw_state.get("combat"), dict) else {}
+    enemies = combat.get("enemies") if isinstance(combat.get("enemies"), list) else []
+    parts: list[str] = []
+    for enemy in enemies:
+        if not isinstance(enemy, dict):
+            continue
+        if enemy.get("is_alive") is False:
+            continue
+        parts.append(f"{enemy.get('index')}:{enemy.get('enemy_id') or enemy.get('move_id') or ''}")
+    return ",".join(sorted(parts))
 
 
 def _current_turn_steps(solver_plan: dict[str, Any]) -> list[dict[str, Any]] | None:
@@ -570,6 +557,107 @@ def _current_turn_steps(solver_plan: dict[str, Any]) -> list[dict[str, Any]] | N
         return None
     steps = line[0].get("steps") if isinstance(line[0].get("steps"), list) else None
     return steps if isinstance(steps, list) else None
+
+
+def _reusable_plan(
+    cached: dict[str, Any] | None,
+    cached_sig: Any,
+    sig: Any,
+    step_index: int,
+    snapshot: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    """计划快照能不能继续按它执行？返回 (可复用的计划 或 None, 不能复用时的原因)。
+
+    抽成纯函数是为了可测：这是"算一次 → 按快照执行 → 局面不一致就重算"这条口径的**全部判据**。
+    """
+    if not cached or cached_sig != sig:
+        return None, "回合或敌人组合变了"
+    steps = _current_turn_steps(cached)
+    if steps is None:
+        return None, "快照里没有可执行步骤"
+    if step_index >= len(steps):
+        return None, "快照步骤已用尽"
+    ok, why = _plan_step_is_executable(steps[step_index], snapshot)
+    if not ok:
+        return None, why
+    return cached, ""
+
+
+def _plan_step_is_executable(step: dict[str, Any], snapshot: dict[str, Any]) -> tuple[bool, str]:
+    """快照里的这一步，在**当前局面**下还能照做吗？
+
+    这就是玩家要的"每次行动后用当前局面和快照对比"：
+    一致 -> 继续按快照走；不一致 -> 丢掉快照重新算。
+
+    为什么不能只看"回合签名没变"：抽牌/弃牌/消耗会让**手牌位置漂移**，步进下标会指到别的牌上；
+    敌人死了会让目标失效。这些都不会改变回合号，但足以让快照里的下一步变成非法动作。
+
+    判据（保守：拿不准就说"能执行"，让原有的动作层兜底）：
+
+    - `play_card`：优先按 `card_id` 找当前手牌里**可打出**的那张（位置会漂，id 不会）；
+      只有 `card_index` 时校验下标在范围内且可打出；牌需要目标时校验 `target_index` 仍在
+      `valid_target_indices` 里。
+    - `use_potion`：该药水仍在且 `can_use`。
+    - `end_turn`：`end_turn` 仍在可用动作里（否则说明时序还没轮到我们）。
+    - 其它步骤（选牌等）：交给下层的选牌界面逻辑，不在这里判。
+    """
+    if not isinstance(step, dict):
+        return True, ""
+    kind = str(step.get("kind") or step.get("action") or "").strip().lower()
+    raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+    combat = raw_state.get("combat") if isinstance(raw_state.get("combat"), dict) else {}
+    if kind == "play_card":
+        hand = [card for card in (combat.get("hand") if isinstance(combat.get("hand"), list) else []) if isinstance(card, dict)]
+        card_id = str(step.get("card_id") or "")
+        target = step.get("target_index")
+        if card_id:
+            card = next(
+                (item for item in hand if str(item.get("card_id") or "") == card_id and bool(item.get("playable", True))),
+                None,
+            )
+            if card is None:
+                return False, f"手牌里已没有可打出的 {card_id}"
+        else:
+            index = step.get("card_index")
+            if isinstance(index, int) and not isinstance(index, bool):
+                if not (0 <= index < len(hand)):
+                    return False, f"手牌下标 {index} 越界（现在 {len(hand)} 张）"
+                if not bool(hand[index].get("playable", True)):
+                    return False, f"手牌[{index}] 当前不可打出"
+                card = hand[index]
+            else:
+                card = None
+        if card is not None and target is not None:
+            valid = card.get("valid_target_indices")
+            if isinstance(valid, list) and valid:
+                try:
+                    if int(target) not in {int(item) for item in valid}:
+                        return False, f"目标 {target} 已失效"
+                except (TypeError, ValueError):
+                    pass
+        return True, ""
+    if kind == "use_potion":
+        potion_id = str(step.get("card_id") or step.get("potion_id") or "")
+        if not potion_id:
+            return True, ""
+        run = raw_state.get("run") if isinstance(raw_state.get("run"), dict) else {}
+        potions = run.get("potions") if isinstance(run.get("potions"), list) else []
+        usable = any(
+            isinstance(potion, dict)
+            and str(potion.get("potion_id") or "") == potion_id
+            and bool(potion.get("can_use"))
+            for potion in potions
+        )
+        return (True, "") if usable else (False, f"药水 {potion_id} 当前不可用")
+    if kind == "end_turn":
+        actions = snapshot.get("available_actions") if isinstance(snapshot.get("available_actions"), list) else []
+        available = {
+            str(action.get("type") or action.get("name") or "")
+            for action in actions
+            if isinstance(action, dict)
+        }
+        return (True, "") if "end_turn" in available else (False, "现在不能结束回合")
+    return True, ""
 
 
 __all__ = ["STS2LoopRunner"]

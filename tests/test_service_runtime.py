@@ -68,7 +68,11 @@ def test_resolve_base_url_falls_back_to_plugin_config(monkeypatch: pytest.Monkey
 async def test_execute_planned_operation_uses_autoplay_step(monkeypatch: pytest.MonkeyPatch) -> None:
     service = STS2AutoplayService(DummyLogger(), lambda payload: None)
 
-    async def fake_run_autoplay_step() -> dict[str, Any]:
+    seen: dict[str, Any] = {}
+
+    async def fake_run_autoplay_step(*, force: bool = False) -> dict[str, Any]:
+        # 显式授权路径必须带 force=True：它是"我点头了"，要越过听安排档位的停手闸门。
+        seen["force"] = force
         return {"status": "ok", "summary": "single-step", "message": "single-step"}
 
     monkeypatch.setattr(service, "run_autoplay_step", fake_run_autoplay_step)
@@ -77,6 +81,7 @@ async def test_execute_planned_operation_uses_autoplay_step(monkeypatch: pytest.
 
     assert result["status"] == "ok"
     assert result["summary"] == "single-step"
+    assert seen["force"] is True
 
 
 @pytest.mark.unit

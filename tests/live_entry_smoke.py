@@ -11,7 +11,28 @@ from plugin.plugins.sts2_autoplay import STS2AutoplayPlugin
 from plugin.sdk.shared.constants import EVENT_META_ATTR
 from plugin.sdk.shared.models.result import Err, Ok
 
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
+_PACKAGE_ROOT = Path(__file__).resolve().parents[1]  # 本插件包目录（即本仓库根）
+
+
+def _resolve_neko_root() -> Path:
+    """NEKO 根目录（提供 config/ 与 plugin/sdk）。
+
+    规范布局里本仓库位于 <NEKO>/plugin/plugins/sts2_autoplay，于是 <NEKO> 是 parents[4]。
+    但开发时仓库也可能在别处（靠 PYTHONPATH 垫片接入 plugin.sdk），那时不存在这样的祖先目录，
+    所以在 sys.path 里找回同时含 plugin/sdk 与 config/__init__.py 的那一项。
+    """
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "plugin" / "sdk").is_dir() and (parent / "config" / "__init__.py").is_file():
+            return parent
+    for entry in sys.path:
+        candidate = Path(entry or ".")
+        if (candidate / "plugin" / "sdk").is_dir() and (candidate / "config" / "__init__.py").is_file():
+            return candidate
+    parents = Path(__file__).resolve().parents
+    return parents[4] if len(parents) > 4 else parents[1]
+
+
+PROJECT_ROOT = _resolve_neko_root()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -79,7 +100,7 @@ class DummyCtx:
         self.logger = DummyLogger()
         self.bus = None
         self.metadata = {}
-        self.config_path = str((PROJECT_ROOT / "plugin/plugins/sts2_autoplay/plugin.toml").resolve())
+        self.config_path = str((_PACKAGE_ROOT / "plugin.toml").resolve())
         self.message_queue = None
 
     async def finish(self, **kwargs: Any) -> Any:
@@ -138,6 +159,11 @@ SPECIAL_ARGS: dict[str, list[dict[str, Any]]] = {
     "sts2_set_standby": [{"standby": True}, {"standby": False}],
     "sts2_enable_companion_mode": [{}],
     "sts2_disable_companion_mode": [{}],
+    "sts2_set_danmaku": [{"enabled": True}, {"enabled": False}],
+    "sts2_set_route": [{"mode": "safe"}, {"mode": "mirror"}, {"mode": "pick", "pick": "中间"}],
+    "sts2_set_control_mode": [{"mode": "advise"}],
+    "sts2_set_play_style": [{"style": "serious"}, {"style": "silly"}],
+    "sts2_set_instance": [{"instance": "host"}, {"instance": "catgirl"}],
 }
 
 

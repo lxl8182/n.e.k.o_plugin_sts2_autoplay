@@ -67,12 +67,14 @@ def test_live_entry_smoke_collects_all_plugin_entries() -> None:
     entries = collect_entries()
     entry_ids = {entry_id for entry_id, _ in entries}
 
-    assert len(entries) == 14
+    assert len(entries) == 22
     assert entry_ids == {
         "sts2_health_check",
         "sts2_read_state",
         "sts2_get_status",
         "sts2_set_standby",
+        "sts2_set_host_digest",
+        "sts2_set_run_reflection",
         "sts2_start_autoplay",
         "sts2_pause_autoplay",
         "sts2_resume_autoplay",
@@ -83,4 +85,15 @@ def test_live_entry_smoke_collects_all_plugin_entries() -> None:
         "sts2_get_planned_operation",
         "sts2_execute_planned_operation",
         "sts2_apply_user_override",
+        # 弹幕总开关（关掉插件侧的 /danmaku 推送并清屏）与"回到存档"补救入口。
+        "sts2_set_danmaku",
+        "sts2_continue_run",
+        # 对话式地图协作：定路线 / 跟自己 / 按指定位置投票。
+        "sts2_set_route",
+        # 控制档位：自己玩 / 听安排 / 停手。
+        "sts2_set_control_mode",
+        # 游玩模式：认真 / 捣蛋 / 笨蛋。
+        "sts2_set_play_style",
+        # 活动实例：插件对着主机还是 coop 里的猫娘。
+        "sts2_set_instance",
     }

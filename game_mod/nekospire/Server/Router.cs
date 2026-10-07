@@ -170,9 +170,27 @@ internal static class Router
             }
 
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/danmaku/clear")
+            {
+                // Wipe the overlay. Paired with POST /config {danmaku_push_enabled:false} so "turn danmaku
+                // off" also stops the lines already scrolling (up to ~20s otherwise), which otherwise reads
+                // as "关不掉".
+                var status = await DanmakuService.ClearAsync();
+                await WriteJsonAsync(response, 200, new
+                {
+                    ok = true,
+                    request_id = requestId,
+                    data = new { status }
+                });
+                statusCode = 200;
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/danmaku")
             {
                 // In-game catgirl danmaku: render the pushed text as a scrolling overlay on the game thread.
+                // DanmakuService.PushAsync owns the danmaku_push_enabled gate.
                 var danmaku = await JsonHelper.DeserializeAsync<DanmakuRequest>(request.InputStream, cancellationToken);
                 var status = await DanmakuService.PushAsync(danmaku?.text ?? "", danmaku?.style, danmaku?.placement, danmaku?.avatar);
                 await WriteJsonAsync(response, 200, new
@@ -214,6 +232,10 @@ internal static class Router
                         coop_enabled = cfg.coop_enabled,
                         llm_enabled = cfg.llm_enabled,
                         danmaku_enabled = cfg.danmaku_enabled,
+                        danmaku_push_enabled = cfg.danmaku_push_enabled,
+                        coop_map_follow_player = cfg.coop_map_follow_player,
+                        coop_map_vote_wait_seconds = cfg.coop_map_vote_wait_seconds,
+                        coop_yield_to_saved_run = cfg.coop_yield_to_saved_run,
                         llm_base_url = cfg.llm_base_url,
                         llm_model = cfg.llm_model,
                         llm_max_tokens = cfg.llm_max_tokens,
@@ -235,15 +257,23 @@ internal static class Router
                     throw new ApiException(400, "invalid_request", "Request body must be a JSON object.");
 
                 var cfg = NekoConfig.Current;
+                var pushWasEnabled = cfg.danmaku_push_enabled;
                 cfg.llm_enabled = cfgWrite.llm_enabled ?? cfg.llm_enabled;
                 cfg.danmaku_enabled = cfgWrite.danmaku_enabled ?? cfg.danmaku_enabled;
+                cfg.danmaku_push_enabled = cfgWrite.danmaku_push_enabled ?? cfg.danmaku_push_enabled;
                 cfg.coop_enabled = cfgWrite.coop_enabled ?? cfg.coop_enabled;
                 cfg.coop_client_port = cfgWrite.coop_client_port ?? cfg.coop_client_port;
+                cfg.coop_map_follow_player = cfgWrite.coop_map_follow_player ?? cfg.coop_map_follow_player;
+                cfg.coop_map_vote_wait_seconds = cfgWrite.coop_map_vote_wait_seconds ?? cfg.coop_map_vote_wait_seconds;
                 cfg.llm_base_url = cfgWrite.llm_base_url ?? cfg.llm_base_url;
                 cfg.llm_model = cfgWrite.llm_model ?? cfg.llm_model;
                 cfg.llm_api_key = cfgWrite.llm_api_key ?? cfg.llm_api_key;
                 cfg.llm_max_tokens = cfgWrite.llm_max_tokens ?? cfg.llm_max_tokens;
                 cfg.Save();
+                // Turning the push gate off should also clear what is already on screen: a line takes up to
+                // ~20s to scroll out, so gating alone still looks like "关不掉".
+                if (pushWasEnabled && !cfg.danmaku_push_enabled)
+                    await DanmakuService.ClearAsync();
 
                 await WriteJsonAsync(response, 200, new
                 {
@@ -253,6 +283,7 @@ internal static class Router
                     {
                         status = "updated",
                         llm_enabled = cfg.llm_enabled,
+                        danmaku_push_enabled = cfg.danmaku_push_enabled,
                         llm_model = cfg.llm_model,
                         llm_base_url = cfg.llm_base_url,
                     }
@@ -416,8 +447,11 @@ internal static class Router
 internal sealed record ConfigWriteRequest(
     bool? llm_enabled,
     bool? danmaku_enabled,
+    bool? danmaku_push_enabled,
     bool? coop_enabled,
     int? coop_client_port,
+    bool? coop_map_follow_player,
+    int? coop_map_vote_wait_seconds,
     string? llm_base_url,
     string? llm_model,
     string? llm_api_key,

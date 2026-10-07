@@ -60,6 +60,13 @@ internal static class GameStateService
     private static readonly FieldInfo? StartRunLobbyMaxPlayersField =
         typeof(StartRunLobby).GetField("_maxPlayers", BindingFlags.Instance | BindingFlags.NonPublic);
 
+    // 最近一次"界面节点认不出来"的类型全名（没有就是空串）。
+    // 暴露到 /state 的 `unknown_screen_type`：下次遇到新界面，看一眼就知道该把哪个类型加进
+    // ResolveScreen 的 switch，而不是只能对着 UNKNOWN 干瞪眼（2026-10-07 那次就是这么卡死的）。
+    private static string _lastUnknownScreenType = "";
+
+    public static string LastUnknownScreenType => _lastUnknownScreenType;
+
     public static GameStatePayload BuildStatePayload()
     {
         var currentScreen = ActiveScreenContext.Instance.GetCurrentScreen();
@@ -84,12 +91,14 @@ internal static class GameStateService
         var bundles = BuildBundlePayload(currentScreen);
         var modal = BuildModalPayload(currentScreen);
         var gameOver = BuildGameOverPayload(currentScreen, runState);
+        var mainMenu = BuildMainMenuPayload(currentScreen, runState);
 
         return new GameStatePayload
         {
             state_version = StateVersion,
             run_id = runState?.Rng.StringSeed ?? "run_unknown",
             screen = screen,
+            unknown_screen_type = LastUnknownScreenType,
             session = session,
             in_combat = CombatManager.Instance.IsInProgress,
             turn = combatState?.RoundNumber,
@@ -110,6 +119,7 @@ internal static class GameStateService
             bundles = bundles,
             modal = modal,
             game_over = gameOver,
+            main_menu = mainMenu,
             agent_view = BuildAgentViewPayload(
                 screen,
                 session,
@@ -716,12 +726,54 @@ internal static class GameStateService
         }
 
         var screen = ResolveNonModalScreen(currentScreen);
-        if (screen == "UNKNOWN" && currentScreen != null)
+        if (screen != "UNKNOWN")
+        {
+            _lastUnknownScreenType = "";
+            return screen;
+        }
+
+        _lastUnknownScreenType = currentScreen?.GetType().FullName ?? "";
+        // 认不出的界面**不能就此摆烂**：只报 UNKNOWN 的话，可用动作会退化成只剩 `save_and_quit`，
+        // 插件既推不动也读不懂，整局就永久卡住（2026-10-07 实测：水晶球事件的"占卜"子界面把
+        // 第 22 层卡了 2 小时 40 分，`step_count` 冻在 2395）。
+        // 静态房间按"当前房间类型"兜底 —— 事件/营地/商店/宝箱这些界面的动作是可重试的，猜错代价小；
+        // **战斗与地图不猜**：那里猜错会真的乱出牌、乱走格子，宁可继续 UNKNOWN。
+        var fallback = ResolveScreenFromStaticRoom();
+        if (fallback != null)
+        {
+            Log.Warn($"[NekoComm] Unhandled screen type {_lastUnknownScreenType}, falling back to {fallback}");
+            return fallback;
+        }
+
+        if (currentScreen != null)
         {
             Log.Warn($"[NekoComm] Unhandled screen type: {currentScreen.GetType().FullName}");
         }
 
         return screen;
+    }
+
+    /// <summary>
+    /// 界面节点认不出时，用**当前房间类型**兜底出一个可用屏幕。只覆盖静态房间（见调用处说明）。
+    /// </summary>
+    private static string? ResolveScreenFromStaticRoom()
+    {
+        try
+        {
+            var room = RunManager.Instance.DebugOnlyGetState()?.CurrentRoom;
+            return room switch
+            {
+                EventRoom => "EVENT",
+                RestSiteRoom => "REST",
+                MerchantRoom => "SHOP",
+                TreasureRoom => "CHEST",
+                _ => null
+            };
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     public static bool CanEndTurn(IScreenContext? currentScreen, CombatState? combatState, bool requireButtonReady = true)
@@ -4087,6 +4139,27 @@ internal static class GameStateService
         }).ToArray();
     }
 
+    /// <summary>
+    /// Main-menu diagnostics: is a run resumable, is a submenu hiding it, is a new co-op room even allowed.
+    /// Only populated on MAIN_MENU; null everywhere else. See MainMenuPayload for why this is exposed.
+    /// </summary>
+    private static MainMenuPayload? BuildMainMenuPayload(IScreenContext? currentScreen, RunState? runState)
+    {
+        if (currentScreen is not NMainMenu mainMenu || !mainMenu.IsVisibleInTree())
+            return null;
+
+        var submenuOpen = mainMenu.SubmenuStack?.SubmenusOpen == true;
+        return new MainMenuPayload
+        {
+            has_resumable_run = CanContinueRun(currentScreen),
+            can_abandon = CanAbandonRun(currentScreen),
+            submenu_open = submenuOpen,
+            can_open_multiplayer_menu = CanOpenMultiplayerMenu(currentScreen),
+            save_and_quit_available = CanSaveAndQuit(currentScreen, runState),
+            is_multiplayer_run = RunManager.Instance.NetService.Type.IsMultiplayer(),
+        };
+    }
+
     private static ModalPayload? BuildModalPayload(IScreenContext? currentScreen)
     {
         var modal = GetOpenModal();
@@ -5649,6 +5722,12 @@ internal sealed class GameStatePayload
 
     public string screen { get; init; } = "UNKNOWN";
 
+    /// <summary>
+    /// `screen` 是 UNKNOWN 时，这里是那个认不出的界面节点类型全名（否则空串）。
+    /// 让消费者能把"到底是哪个界面"报回来，而不是只知道"有个界面我不认识"。
+    /// </summary>
+    public string unknown_screen_type { get; init; } = "";
+
     public SessionPayload session { get; init; } = new();
 
     public bool in_combat { get; init; }
@@ -5689,7 +5768,32 @@ internal sealed class GameStatePayload
 
     public GameOverPayload? game_over { get; init; }
 
+    /// <summary>
+    /// Main-menu diagnostics. Only populated when screen == "MAIN_MENU". "Is there a save?" was previously
+    /// only inferable from whether continue_run showed up in available_actions, which is itself gated on the
+    /// button being visible+enabled AND no submenu being open — so a caller could not tell "no save" from
+    /// "save exists but the button is hidden". Exposure here makes that diagnosable (and is what the plugin
+    /// reports when the user asks why they cannot get back into their run).
+    /// </summary>
+    public MainMenuPayload? main_menu { get; init; }
+
     public object? agent_view { get; init; }
+}
+
+internal sealed class MainMenuPayload
+{
+    public bool has_resumable_run { get; init; }
+
+    public bool can_abandon { get; init; }
+
+    public bool submenu_open { get; init; }
+
+    public bool can_open_multiplayer_menu { get; init; }
+
+    /// <summary>Always false in a multiplayer run: CanSaveAndQuit refuses it, so there is no save-and-quit path.</summary>
+    public bool save_and_quit_available { get; init; }
+
+    public bool is_multiplayer_run { get; init; }
 }
 
 internal sealed class SessionPayload

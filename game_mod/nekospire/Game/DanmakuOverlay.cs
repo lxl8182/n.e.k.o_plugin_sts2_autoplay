@@ -63,7 +63,7 @@ namespace NekoComm.Game
         public void Add(string text, string style, string placement, string? avatarBase64)
         {
             var control = _control;
-            if (control == null || _active.Count >= MaxActive)
+            if (control == null || !GodotObject.IsInstanceValid(control) || _active.Count >= MaxActive)
                 return;
 
             var clean = Clean(text);
@@ -165,6 +165,28 @@ namespace NekoComm.Game
             container.Position = new Vector2(_viewportWidth + 60f, y);
             control.AddChild(container);
             _active.Add((container, SpeedPxPerSecond));
+        }
+
+        /// <summary>
+        /// Drop every line currently on screen and detach the overlay. Must run on the game thread.
+        /// Freeing the CanvasLayer ends ScrollLoopAsync (its loop condition checks _layer validity), so the
+        /// owner (DanmakuService) must also drop its reference and let a later push re-create the overlay.
+        /// </summary>
+        public void Dispose()
+        {
+            foreach (var (node, _) in _active)
+            {
+                if (GodotObject.IsInstanceValid(node))
+                    node.QueueFree();
+            }
+            _active.Clear();
+            _avatarCache.Clear();
+
+            var layer = _layer;
+            _layer = null;
+            _control = null;
+            if (layer != null && GodotObject.IsInstanceValid(layer))
+                layer.QueueFree();
         }
 
         private async Task ScrollLoopAsync(SceneTree tree)

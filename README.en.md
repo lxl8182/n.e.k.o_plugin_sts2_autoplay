@@ -9,6 +9,8 @@ This plugin handles **decision & expression**: it gives the Slay-the-Spire-2 cat
 - **Status**: `sts2_health_check`, `sts2_get_status`, `sts2_read_state`
 - **Autoplay**: `sts2_start_autoplay`, `sts2_pause_autoplay`, `sts2_resume_autoplay`, `sts2_stop_autoplay`, `sts2_set_standby`
 - **Companion**: `sts2_enable_companion_mode`, `sts2_disable_companion_mode`
+- **Danmaku**: `sts2_set_danmaku` (`enabled=true/false`) — the real master switch; turning it off also tells the mod to stop rendering and clears the overlay
+- **Save**: `sts2_continue_run` — clicks Continue on the main menu to get back into the saved run
 - **Co-op**: `sts2_open_coop_room`
 - **Strategy**: `sts2_apply_user_override`
 - **Planning**: `sts2_get_planned_operation`, `sts2_execute_planned_operation`
@@ -22,14 +24,19 @@ This plugin handles **decision & expression**: it gives the Slay-the-Spire-2 cat
 | `transport_client.py` | Mod HTTP client (`/state`, `/action`, `/solver/plan`, `/danmaku`, SSE) |
 | `neko_interface.py` | NEKO SDK interface (read-only / control tool entry points) |
 | `heuristic_planner.py` / `companion_evaluator.py` | Decision: situation evaluation, play/card/route heuristics + commentary trigger |
-| `catgirl_llm.py` | LLM generation: `CatgirlCommentGenerator` (danmaku / commentary), `EventAdviceGenerator` (event-rank scores) |
+| `catgirl_llm.py` | LLM generation: `CatgirlCommentGenerator` (danmaku / commentary **text**). Text only — no decisions |
+| `play_style.py` | Play styles (serious / mischievous / silly): constants, aliases, and the pure "pick one from an ordered candidate list" function |
 | `catgirl_memory.py` | Cross-run memory accumulation (see next section) |
 | `strategy_repository.py` / `strategy_parser.py` | Strategy loading: `strategies/` parsing + `strategy_directives` assembly |
 | `dispatcher.py` | NEKO output boundary for status feedback / companion notifications |
 
 ## Decision & Expression
 
-- **Decision**: map / reward / deck / event use heuristics + (event-room) LLM-score fusion; combat card plays are decided authoritatively by `/solver/plan`, falling back to heuristics.
+- **Decision**: map / reward / deck / event are decided entirely by **heuristics** — the plugin makes no LLM-driven decisions (the event-room LLM-score fusion was removed in 2026-10); combat card plays are decided authoritatively by `/solver/plan`, falling back to heuristics.
+- **Multi-card selection**: on a chooser that wants 2+ cards, both the plugin and the catgirl driver advance to the next card they have **not** pressed yet on this screen (the pressed `option_index` set is remembered and reset when the screen's candidate set changes), and prefer `confirm_selection` when the game says it can confirm. Both used to send `option_index=0` forever, so the second card was never picked, `max_select` was never reached and the screen hung.
+- **Other out-of-combat choosers**: `bundle_selection` (choose then confirm), `capstone_selection` (sweep options, never re-press the same button — index 0 may be Back), `cards_view` (close), `modal` (dismiss before confirm), `game_over` (back to main menu) are all covered now instead of falling into `unknown` and stalling silently.
+- **Rewards**: the card-reward chooser now takes a card first (`resolve_rewards` used to be checked first, silently draining every card reward).
+- **Known gap**: the out-of-combat **relic** chooser (`NChooseARelicSelection`, e.g. Jewelry Box) has no mod action at all and still needs a manual pick.
 - **Expression**: catgirl commentary + in-game danmaku.
 - **Preference capture**: `sts2_apply_user_override` turns the user's natural-language guidance into structured preferences / overrides.
 - **Cross-run memory**: see next section.
@@ -43,6 +50,124 @@ When a run ends (death / clear — the `state_machine` classifies it as `screen_
 - Catgirl commentary goes through the plugin's `_maybe_emit_catgirl_llm` → `_push_catgirl` → `POST /danmaku` (text + avatar) for in-game rendering; commentary no longer goes through the NEKO host `push_message`.
 - In combat the LLM prompt is trimmed to "monster HP + our HP + current floor"; only when SSE `event_type == player_action_window_opened` (it's the player's turn) is the current-turn play line appended (`_build_combat_prompt`, reusing `loop_runner._solver_plan_cached`; on a signature hit it doesn't re-run `/solver/plan`).
 - Danmaku responds only to three combat events: `combat_started` / `available_actions_changed` / `combat_turn_changed`, of which only `combat_turn_changed` (turn advance) carries the line.
+
+### How to actually turn danmaku off (since v0.3.1)
+
+`catgirl_llm_enabled=false` is **not** the danmaku switch — it only downgrades LLM commentary to heuristic text, and danmaku keeps being pushed. Use one of these instead:
+
+| Way | Effect |
+|---|---|
+| `sts2_set_danmaku(enabled=false)` | Plugin-side master switch: `_push_catgirl` returns immediately (no generation, no avatar fetch, no push) and it also sends `POST /config {danmaku_push_enabled:false}` + `POST /danmaku/clear` |
+| `plugin.toml [sts2] danmaku_enabled = false` | Same, applied at plugin startup |
+| Uncheck "allow in-game danmaku rendering" in the in-game Mod settings | Turns off the mod-side `danmaku_push_enabled`: nothing any local caller pushes is rendered, and the overlay is cleared |
+
+Three separate switches: `danmaku_enabled` (plugin pushes), `danmaku_push_enabled` (mod overlay rendering, funnelled through `DanmakuService.PushAsync`), `catgirl_llm_enabled` (LLM vs heuristic commentary text). Autoplay and state reads are unaffected by all three.
+
+## Map votes & saves (co-op behaviour)
+
+**First, the two run modes behave differently:**
+
+| Mode | How it is detected | Map behaviour |
+|---|---|---|
+| **Plugin-controlled** (NEKO attached) | the mod received a request carrying `X-Neko-External-Control: 1` within the **30s lease** | follows `coop_map_policy` (below) |
+| **Mod standalone** (NEKO absent) | lease expired (at most 30s after the plugin exits/crashes) | **plays on its own, never blocks**: mirrors a teammate's vote if there is one, otherwise waits `coop_map_vote_wait_seconds` and then picks |
+
+The plugin attaches that header to every request (including the SSE stream) and polls `/state` every 3s idle / 1s active, so the header doubles as a heartbeat: if the plugin dies the mod falls back to standalone by itself and **never gets stuck**. `/state` echoes `external_control: {attached, client_id, seconds_since_contact, lease_seconds}` for diagnosis.
+
+**`coop_map_policy` (mod) / `map_policy` (plugin) under plugin control:**
+
+- **`wait` (default)** — hold completely: in a multiplayer run the catgirl neither votes nor auto-follows, leaving the route entirely to the player until the player speaks to it. That is the "stop stealing the route" behaviour. Single-player maps still self-pick, otherwise every node would idle a turn for nothing.
+- **`follow`** — mirror the teammate's vote once they vote; when nobody voted, wait `map_vote_wait_seconds` (default 20s) and then self-pick.
+- **`auto`** — no waiting, pick immediately.
+
+**Talking to the catgirl about it (`sts2_set_route`, also an `llm_tool`):**
+
+| You say | mode | Behaviour |
+|---|---|---|
+| "decide the route" / "you pick" / "pick a safe one" | `safe` | scores a conservative node itself and votes |
+| "I picked, take this one" / "same as me" | `mirror` | votes your current vote |
+| "take the middle" / "the third one" / "leftmost" | `pick` | votes the position you named |
+| "no no I picked wrong, you take the middle" | `pick` | **call it again to change the vote** |
+
+Note: `safe` is a **heuristic** conservative score (avoid elites, prefer rests below 60% HP), **not** a real battle-loss forecast; and changing a vote only works before the map advances. Legacy configs that only set `map_follow_player` are still understood (`true`→follow, `false`→auto).
+
+- **Back to the save**: when the main menu has a resumable run, the plugin's main-menu decision now **prefers `continue_run`** (it used to prefer `open_character_select`, which started a new run ahead of the save), and the catgirl process **never touches the save** (both processes share `user://`, so whoever clicks Continue consumes it) — it only keeps the ability to rejoin a room. `sts2_continue_run` is the explicit recovery entry point, and `continue_run` now pops any open main-menu submenu first (an open submenu hides the Continue button, which previously just returned 409).
+- **Guard**: with a resumable save present, `start_coop_session` / `start_multiplayer_host` return `409 active_run_present` instead of silently starting a new run (`POST /config {coop_yield_to_saved_run:false}` disables this guard).
+- **Known limitation**: the game appears to have no join-in-progress. Even if the host resumes the co-op save, the AI teammate may not get back into that run — a game-side capability boundary, not something the plugin can work around.
+
+## Control modes (play on your own / listen / stop)
+
+Switch with `sts2_set_control_mode`; the catgirl also calls it itself when you say so:
+
+| Mode | You say | Behaviour |
+|---|---|---|
+| `program` (**default**) | "play on your own", "just play" | decides and executes as usual — identical to today |
+| `advise` | "listen to me", "hold off", "wait for me" | **computes but does not act**: outside combat it waits for your go on every decision screen |
+| `standby` | "stop", "standby" | stops entirely, not even planning |
+
+**Switching is silent.** A mode change does not make the catgirl speak (the push uses `ai_behavior="blind"` — it is not even fed to the LLM, only kept as an internal record for the panel and for diagnosis), and the `llm_tool` returns a terse machine result (`{"ok": true, "style": ...}`) — a sentence there would just get parroted back. So she will **not** announce "ok, I'm on mischief mode now"; she just carries on, and only answers if you ask which mode she is in.
+
+She may also **switch on her own judgement** without being told: your tone is enough ("why are you so dumb today" -> mischief or silly; "play properly" -> serious; "I'll call this one" -> listen). The tool descriptions explicitly authorise that.
+
+`advise` is driven by the entry pair that already exists:
+
+- "what do you plan to do" -> `sts2_get_planned_operation` speaks the plan
+- "go with that" / "play it" -> `sts2_execute_planned_operation` takes one step (this is **explicit authorisation** and bypasses the hold)
+- "play on your own" -> `sts2_start_autoplay`, i.e. back to `program`
+
+**The hold has hard boundaries — each one would deadlock the game:**
+
+- **Never holds in combat** — the player cannot play the catgirl's cards, so holding would stall the turn forever. `advise` therefore only covers the "slow" decisions: map, rewards, card picks, relics, chests, events, shop, rest, bundles, capstones.
+- **Never holds on the main menu / lobby / character select** — that is how the catgirl joins the room (menu -> connect -> pick character -> ready); holding there means it never gets into the run at all. The same is true for `standby`.
+- **Never holds on an unrecognised screen** — better to miss an instruction than to deadlock the mod.
+
+Exception: `standby` really does stop everything, so it **includes combat** — the turn stops until you speak. That is the intended semantics of that mode, not a bug.
+
+**The mode is pushed to the mod** (`POST /config {coop_control_mode: auto|advise|hold}`), because the mod has its own autoplay driver: stopping only the plugin is not stopping anything. Mapping: `program→auto`, `advise→advise`, `standby→hold`. Like the map policy, this sync only matters while the **plugin is attached** (see the lease above); with no plugin the mod always runs itself.
+
+## Play style (serious / mischievous / silly)
+
+A different axis from the control mode: the control mode decides **who calls the shots**, the play style decides **how seriously it plays**.
+
+| Style | You say | Behaviour |
+|---|---|---|
+| `serious` (**default**) | "play it straight", "play properly", "I want to win" | **byte-identical** to before this feature |
+| `mischievous` | "mischief", "just for fun", "don't be so serious" | 20% chance to swap the best move for the **runner-up** legal one |
+| `silly` | "silly", "you idiot", "just play anything" | 60% chance to swap the best move for the **worst** legal one |
+
+Switch at runtime with `sts2_set_play_style(style=...)`; config key `play_style` (plugin `plugin.toml` / `config.example.toml`).
+
+**Three hard guarantees:**
+
+1. **`serious` has zero impact** — under serious the perturbation layer returns the planner's result verbatim and does not even compute the candidate ranking, so the default style cannot regress.
+2. **Always legal** — candidates come only from that screen's **legal index set** (unplayable cards and unaffordable shop items are excluded), and the swapped operation still has to pass `action_engine` validation; if no legal alternative exists the perturbation is abandoned and the best move is kept. It never emits an illegal action.
+3. **Every decision screen is covered** — combat plays, map, rewards, card picks (all variants), events, shop, rest, chests, bundles and capstones. Events / map / rewards / card-removal are ranked with each screen's **existing scorer**; the remaining screens degrade to "best + the other legal indices".
+
+Exception: **a step the player explicitly authorised is never perturbed.** `sts2_execute_planned_operation` ("go with that") is explicit authorisation, so it does exactly what you said even in silly mode.
+
+## Which process the plugin is driving (host / catgirl)
+
+This is the easiest thing to get backwards in co-op: **the port does not distinguish a mode, it distinguishes a game process.**
+
+| Port | Who |
+|---|---|
+| **18080** (`HttpServer.DefaultPort`, overridable with `STS2_API_PORT`) | the only instance in a solo run; **in co-op it is the host (the human's)** |
+| **18081** (`NekoConfig.coop_client_port`) | the **catgirl process** the mod launches with `STS2_API_PORT=18081` |
+
+So the plugin has an "active instance", inspectable and overridable with `sts2_set_instance`:
+
+| Value | Meaning |
+|---|---|
+| `host` | the configured `base_url` (default 18080). **Opening a room must go here** — only the host can launch the catgirl process |
+| `catgirl` | the catgirl process. When the plugin drives play, it reads state and sends actions here |
+
+**It is automatic by default**: after `sts2_open_coop_room(host=True)` succeeds, the plugin reads `coop_client_port` from the host's `GET /config`, derives the catgirl address, **polls while it cold-starts** (up to 45s), and switches over once it is up.
+
+On switching it pushes `coop_control_mode="hold"` to that instance so its **own mod driver stands down on every screen except the join flow** — otherwise the two drivers race for the same action. Joining (menu -> lobby -> character select -> ready) is **still done by the mod**, which is the part the plugin cannot reach. If the plugin dies, the lease lapses and the mod resumes playing on its own.
+
+**It falls back**: while the active instance is the catgirl, three consecutive read failures switch the plugin back to the host, so it never sticks on a dead address.
+
+Note `coop_client_port` in `GET /config` is a read-only field that only exists from **mod 0.1.4** onwards. With an older mod the plugin **does not guess a port**; it stays on the host instance and says so — solo runs are unaffected.
 
 ## Data flow
 
@@ -81,7 +206,7 @@ This Mod (NekoSpire) is the catgirl companion bridge for StS2: it embeds the **C
 
 **Co-op & independent-player driving (`NekoAutoplayDriver`)**: the catgirl as an independent player = two processes, each with its own Mod-driven local player. Combat uses the next step of `/solver/plan`; map / reward / card / event screens ask the LLM first, falling back to per-screen heuristics when the LLM is unavailable or returns an illegal action. Every candidate is gated by the game's own `available_actions` — it never issues an illegal action. Non-client / non-co-op processes stay quiet; the host is undisturbed.
 
-**In-game danmaku overlay (`POST /danmaku`)**: the catgirl commentary renders directly in-game (built-in Godot nodes + `ProcessFrame` signal, not `_Process`), with configurable font size and avatar; danmaku is decoupled from the decision LLM, with its own `danmaku_enabled` toggle.
+**In-game danmaku overlay (`POST /danmaku`)**: the catgirl commentary renders directly in-game (built-in Godot nodes + `ProcessFrame` signal, not `_Process`), with configurable font size and avatar; danmaku is decoupled from the decision LLM, with its own `danmaku_enabled` toggle. Every producer funnels through `DanmakuService.PushAsync`, which is runtime-gated by `danmaku_push_enabled` (so anything a local caller pushes is controllable too), and `POST /danmaku/clear` clears the screen.
 
 **HTTP state bridge (`/state`, `/events/stream`)**: exports a complete snapshot on demand; screen transitions + combat state changes are pushed in real time over SSE, driven by actual game transitions rather than pure polling.
 
@@ -138,11 +263,13 @@ scripts\Start-NekoCoop.ps1 -SkipHostLaunch -ClientAutoplays           # host alr
 | `/coop/state` | co-op read view (per-player action phase + hand + shared enemies) |
 | `/action` / `/actions/available` | execute action / available actions |
 | `/config` / `/config/open` | config read/write (the plugin turns off the Mod's LLM/danmaku after connecting) |
-| `/danmaku` | in-game danmaku POST |
+| `/danmaku` | in-game danmaku POST (gated by `danmaku_push_enabled`) |
+| `/danmaku/clear` | clear on-screen danmaku and detach the overlay |
 | `/events/stream` | SSE scene-event stream |
 | `/solver/plan` | combat solver decision (authoritative source) |
 
 - **Combat solver** (`Solver/`): embeds the **vendored CombatSolver 0.28 engine**, card-effect inference via **RitsuLib**, private members via **GameRef reflection** (Krafs.Publicizer removed). `Game/Sim/` is an independently reimplemented deterministic simulator, used only as a fallback.
+  - Upstream is now at **0.50.1** (84 releases of fixes and new capability). The vendoring boundary, adaptation rules and re-sync procedure are documented in [`game_mod/nekospire/Solver/VENDORING.md`](game_mod/nekospire/Solver/VENDORING.md), with a version-gap assessment in [`VENDORING-GAP-REPORT.md`](game_mod/nekospire/Solver/VENDORING-GAP-REPORT.md); run `game_mod\scripts\sync-vendor.ps1` for a read-only report.
 
 ## Bug reporting
 
@@ -166,7 +293,15 @@ This Mod vendors and adapts the combat-solver core of the following third-party 
   - **`Krafs.Publicizer` is not used** (pure `GameRef` reflection is sufficient to build & run).
 - **[Random Foreseer](https://github.com/hotwords123/StS2.RandomForeseer)** (author: **hotwords123**) — [Workshop page](https://steamcommunity.com/sharedfiles/filedetails/?id=3747531952). Combat Solver's combat-simulation engine core (combat state, piles, RNG, fork, history, mirror) derives partly from this, reworked under hotwords123's written permission. This Mod vendors the engine source only and does **not** load/distribute the Random Foreseer assembly as a runtime dependency.
 
-> Third-party source follows the **original authors' licensing boundaries**: Combat Solver does not ship a unified repository license; Random Foreseer-derived code is governed by Combat Solver's `THIRD_PARTY_NOTICES.md`. The above is not automatically covered by this repository's AGPL-3.0-only.
+> **Licensing boundary**: Combat Solver is released upstream under the **MIT License**, with the notices
+> `Copyright (c) 2026 Torch1230 and contributors` and
+> `Copyright (c) 2026 hotwords123 (portions derived from Random Foreseer)`.
+> MIT permits use, modification, redistribution and sublicensing **provided the copyright notice and the
+> licence text are retained**. This repository embeds a subset of that search/simulation core (with
+> reflection adaptation and Godot decoupling); the boundary and sync mechanism live in
+> [`game_mod/nekospire/Solver/VENDORING.md`](game_mod/nekospire/Solver/VENDORING.md).
+> The above is not automatically covered by this repository's AGPL-3.0-only; those portions follow the
+> original authors' MIT terms.
 
 This Mod's MCP module reference:
 

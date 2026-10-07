@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from .planner_interface import PlannedOperation
+
+logger = logging.getLogger(__name__)
 
 
 class STS2ActionEngine:
     def __init__(self, i18n: Any = None) -> None:
         self._i18n = i18n
+        # 最近一次 _normalize_kwargs 是否修正过越界目标（诊断用，见 _repair_combat_target）。
+        self._last_target_repair: dict[str, Any] = {}
 
     def t(self, key: str, *, default: str = "", **params: Any) -> str:
         if self._i18n is not None:
@@ -28,7 +33,7 @@ class STS2ActionEngine:
             return None
 
         kwargs = planned.get("kwargs") if isinstance(planned.get("kwargs"), dict) else {}
-        normalized_kwargs = self._normalize_kwargs(action, kwargs)
+        normalized_kwargs = self._normalize_kwargs(action, kwargs, snapshot)
         return {
             "action_id": action.get("id") or "",
             "action_type": action_type,
@@ -39,6 +44,7 @@ class STS2ActionEngine:
             "reason": planned.get("reason") or "",
             "candidate_actions": list(planned.get("candidate_actions") or []),
             "action": action,
+            "target_repair": dict(self._last_target_repair),
         }
 
     def validate_with_feedback(self, snapshot: dict[str, Any], operation: dict[str, Any] | PlannedOperation | None) -> tuple[dict[str, Any] | None, str]:
@@ -53,7 +59,7 @@ class STS2ActionEngine:
         if action is None:
             return None, f"illegal action: {action_type}"
         kwargs = planned.get("kwargs") if isinstance(planned.get("kwargs"), dict) else {}
-        normalized_kwargs = self._normalize_kwargs(action, kwargs)
+        normalized_kwargs = self._normalize_kwargs(action, kwargs, snapshot)
         validated = {
             "action_id": action.get("id") or "",
             "action_type": action_type,
@@ -64,6 +70,7 @@ class STS2ActionEngine:
             "reason": planned.get("reason") or "",
             "candidate_actions": list(planned.get("candidate_actions") or []),
             "action": action,
+            "target_repair": dict(self._last_target_repair),
         }
         return validated, ""
 
@@ -109,7 +116,8 @@ class STS2ActionEngine:
                 return action
         return None
 
-    def _normalize_kwargs(self, action: dict[str, Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_kwargs(self, action: dict[str, Any], kwargs: dict[str, Any], snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+        self._last_target_repair = {}
         raw = action.get("raw") if isinstance(action.get("raw"), dict) else {}
         default_kwargs = action.get("default_kwargs") if isinstance(action.get("default_kwargs"), dict) else {}
         action_type = str(action.get("type") or raw.get("name") or raw.get("action") or "").strip().lower()
@@ -123,17 +131,98 @@ class STS2ActionEngine:
         if action_type == "play_card":
             target_index = normalized.get("target_index") if "target_index" in normalized else raw.get("target_index")
             if target_index is None:
-                fallback_target = self._fallback_target_index(action)
+                fallback_target = self._fallback_target_index(action, snapshot, normalized)
                 if fallback_target is not None:
                     normalized["target_index"] = fallback_target
             elif "target_index" not in normalized:
                 normalized["target_index"] = target_index
+            self._repair_combat_target(action, normalized, snapshot)
         return normalized
 
-    def _fallback_target_index(self, action: dict[str, Any]) -> int | None:
+    def _hand_card(self, snapshot: dict[str, Any] | None, card_index: Any) -> dict[str, Any]:
+        """从**现场**（raw_state.combat.hand）取出即将打出的那张牌。
+
+        目标合法集只有这里最权威：mod 的 /actions/available 对 play_card 只报
+        requires_index，具体某张牌能不能指向某个敌人要看 hand[i].valid_target_indices。
+        """
+        if not isinstance(snapshot, dict):
+            return {}
+        raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        combat = raw_state.get("combat") if isinstance(raw_state.get("combat"), dict) else {}
+        hand = combat.get("hand") if isinstance(combat.get("hand"), list) else []
+        try:
+            wanted = int(card_index)
+        except (TypeError, ValueError):
+            return {}
+        for card in hand:
+            if not isinstance(card, dict):
+                continue
+            try:
+                if int(card.get("index")) == wanted:
+                    return card
+            except (TypeError, ValueError):
+                continue
+        return {}
+
+    def _valid_target_indices(self, action: dict[str, Any], snapshot: dict[str, Any] | None, kwargs: dict[str, Any]) -> list[int]:
+        raw = action.get("raw") if isinstance(action.get("raw"), dict) else {}
+        card = raw.get("card") if isinstance(raw.get("card"), dict) else {}
+        declared = card.get("valid_target_indices") if isinstance(card.get("valid_target_indices"), list) else []
+        if not declared:
+            live = self._hand_card(snapshot, kwargs.get("card_index"))
+            declared = live.get("valid_target_indices") if isinstance(live.get("valid_target_indices"), list) else []
+        indices: list[int] = []
+        for item in declared:
+            try:
+                indices.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        return indices
+
+    def _repair_combat_target(self, action: dict[str, Any], kwargs: dict[str, Any], snapshot: dict[str, Any] | None) -> None:
+        """把越界的 target_index 就地改成现场合法值（最后一次兜底）。
+
+        为什么需要这一层：战斗计划是**整回合缓存**的，而目标索引是**绝对下标**。回合内死掉一只敌人
+        后，缓存里那一步的 target_index 就可能指向已不存在的位置，mod 会以
+        ``invalid_target: target_index is out of range for combat.enemies[]`` 拒收——而一次被拒
+        曾经足以让自动玩永久停工（见 service._mark_loop_error）。与其指望上游永远不发旧下标，
+        不如在**即将上线的那一刻**用现场合法集校正一次。
+        """
+        valid = self._valid_target_indices(action, snapshot, kwargs)
+        if not valid:
+            # 拿不到合法集（旧 mod / 非战斗）就不猜，保持原样。
+            return
+        current = kwargs.get("target_index")
+        if current is None:
+            return
+        try:
+            current_int = int(current)
+        except (TypeError, ValueError):
+            current_int = None
+        if current_int is not None and current_int in valid:
+            return
+        repaired = valid[0]
+        self._last_target_repair = {
+            "card_index": kwargs.get("card_index"),
+            "from": current,
+            "to": repaired,
+            "valid": list(valid),
+        }
+        kwargs["target_index"] = repaired
+        logger.info(
+            "[sts2_target_repair] 越界目标已按现场合法集修正 card_index=%s %s -> %s (valid=%s)",
+            kwargs.get("card_index"),
+            current,
+            repaired,
+            valid,
+        )
+
+    def _fallback_target_index(self, action: dict[str, Any], snapshot: dict[str, Any] | None = None, kwargs: dict[str, Any] | None = None) -> int | None:
         raw = action.get("raw") if isinstance(action.get("raw"), dict) else {}
         card = raw.get("card") if isinstance(raw.get("card"), dict) else {}
         valid_target_indices = card.get("valid_target_indices") if isinstance(card.get("valid_target_indices"), list) else []
+        if not valid_target_indices:
+            valid_target_indices = self._valid_target_indices(action, snapshot, kwargs or {})
         if not valid_target_indices:
             return None
         try:

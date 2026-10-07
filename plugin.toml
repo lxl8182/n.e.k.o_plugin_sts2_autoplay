@@ -30,9 +30,29 @@ neko_desperate_hp_threshold = 0.2
 neko_maximize_enabled = true
 catgirl_llm_enabled = true
 catgirl_llm_min_interval_seconds = 10
-# 事件房决策：LLM 给每个选项打分，与 heuristic 融合后再选（0=纯 heuristic，1=纯 LLM）
-event_llm_enabled = true
-event_llm_weight = 0.5
+# 游戏内弹幕总开关：false = 完全不向 mod 推 POST /danmaku（连 LLM 生成与头像请求都不发生）。
+# 注意与 catgirl_llm_enabled 的区别：catgirl_llm_enabled=false 只是"LLM 点评降级为启发式文本"，
+# 弹幕照旧会推；要真正关掉弹幕必须用 danmaku_enabled=false 或运行时动作 sts2_set_danmaku。
+danmaku_enabled = true
+# 地图投票策略，决定猫娘会不会自己抢路线：
+#   "wait"（默认）= 多人局里彻底等待：不投票、也不自动跟票，路线完全留给玩家，直到玩家通过
+#                   NEKO 说话下令（sts2_set_route）。单机局没有队友可等，仍会自己选。
+#   "follow"      = 队友先投了就跟着投同一个；无人投票时等 map_vote_wait_seconds 再自己选。
+#   "auto"        = 不等，立即按自己的偏好选。
+# 旧的布尔配置 map_follow_player 仍被识别（true -> follow，false -> auto），但建议改用本项。
+map_policy = "wait"
+map_vote_wait_seconds = 20
+# 游玩模式：serious（默认，认真打，与之前逐字相同）/ mischievous（20% 概率换成次优）/
+# silly（60% 概率换成最差）。运行时等价动作：sts2_set_play_style。
+# 注意：插件不做任何 LLM 决策，事件房也早已是纯启发式（原 event_llm_* 配置项已移除）。
+play_style = "serious"
+
+# 「尖塔速报」开关：false = 不把局势悄悄交给本体，本体也就不会主动讲局势。
+# 只影响这一路；游戏内弹幕、自动游玩、历史记录都不受影响。运行时等价动作：sts2_set_host_digest。
+host_digest_enabled = true
+# 「尖塔复盘」开关：false = 局末不生成反思、不推给本体；结构化记录（损血归因/路线图/历史页）照旧。
+# 运行时等价动作：sts2_set_run_reflection。
+run_reflection_enabled = true
 
 [plugin]
 id = "sts2_autoplay"
@@ -40,8 +60,18 @@ name = "尖塔2陪玩"
 description = "陪伴你在杀戮尖塔2（Slay the Spire 2）中游玩：自动出牌、局势点评与猫娘 LLM 实时解说（游戏内弹幕）。"
 short_description = "Slay the Spire 2 companion: autoplay, situation commentary, and live AI catgirl danmaku in-game."
 keywords = ["slay the spire", "杀戮尖塔", "陪玩", "autoplay", "companion", "sts2", "肉鸽", "卡牌"]
-version = "0.3.0"
+version = "0.7.6"
 entry = "plugin.plugins.sts2_autoplay:STS2AutoplayPlugin"
+
+# 默认语区**必须显式指定**。SDK 的 PluginI18n.t() 在不传 locale 时只按 default_locale 查表，
+# 而 default_locale 的默认值是 "en"（plugin/sdk/shared/i18n.py 的 DEFAULT_LOCALE）——
+# 于是**凡是 en.json 里存在的键，无论玩家用什么语言都说英文**；只有 en 里没有的键才会退回
+# 代码里写的中文 default（所以同一屏里会半中半英）。实测：奖励屏弹幕直接念出
+# "Prefer rewards that patch the weaknesses of the current deck."
+# 插件侧没有"取运行时语区"的接口（SDK context 不暴露 locale），所以这里把默认语区钉成简体中文。
+[plugin.i18n]
+default_locale = "zh-CN"
+locales_dir = "i18n"
 
 [plugin.ui]
 enabled = true
@@ -61,6 +91,23 @@ id = "quickstart"
 title = "快速开始"
 entry = "README.md"
 permissions = ["state:read"]
+
+# 自动游玩历史：每局的选择、损血归因与结束状态。
+# 数据由插件在每次局末（以及启动时）写成 static/autoplay_history.json，页面 fetch 同目录下的它。
+#
+# 注意：**真正的入口做在 static/index.html 里**（一张跳转卡片）。宿主打开的就是
+# `/plugin/{id}/ui/`（= index.html），而它并不消费这里额外的 [[plugin.ui.panel]]
+# ——plugin server 里没有任何 panels 处理逻辑。这条声明留着是给会用清单的消费者看的，
+# 别以为加了面板玩家的界面上就会冒出入口。index.html 要保持干净（只放跳转、不内联取数），
+# 页面一变重就会出现刷新延迟。
+[[plugin.ui.panel]]
+id = "history"
+title = "自动游玩历史"
+entry = "static/history.html"
+context = "sts2_autoplay"
+permissions = [
+    "state:read",
+]
 
 [plugin.sdk]
 recommended = ">=0.1.0,<0.2.0"

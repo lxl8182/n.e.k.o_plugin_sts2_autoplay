@@ -678,6 +678,12 @@ internal static class GameActionService
 
     private static async Task<ActionResponsePayload> ExecuteContinueRunAsync()
     {
+        // Pop any open main-menu submenu first: CanContinueRun requires SubmenuStack.SubmenusOpen == false, so
+        // a leftover submenu (the mods/config submenu, or one the player opened) used to make the Continue
+        // button unreachable and this action 409 — which is one of the ways a player "could not get back to
+        // the save". start_coop_session already did this; continue_run did not.
+        await CloseMainMenuSubmenusAsync();
+
         var currentScreen = ActiveScreenContext.Instance.GetCurrentScreen();
         var screen = GameStateService.ResolveScreen(currentScreen);
 
@@ -700,12 +706,15 @@ internal static class GameActionService
         continueButton.ForceClick();
         var stable = await WaitForMainMenuExitAsync(mainMenu, TimeSpan.FromSeconds(15));
 
+        var landingScreen = GameStateService.ResolveScreen(ActiveScreenContext.Instance.GetCurrentScreen());
         return new ActionResponsePayload
         {
             action = "continue_run",
             status = stable ? "completed" : "pending",
             stable = stable,
-            message = stable ? "Action completed." : "Action queued but state is still transitioning.",
+            // Report the landing screen: callers need to tell "resumed the save into MAP/COMBAT" apart from
+            // "the button was clicked but we are still on the main menu".
+            message = stable ? $"Action completed (screen={landingScreen})." : "Action queued but state is still transitioning.",
             state = GameStateService.BuildStatePayload()
         };
     }
@@ -3342,6 +3351,33 @@ internal static class GameActionService
         };
     }
 
+    /// <summary>
+    /// Refuse to open a NEW co-op room while a resumable save is sitting on the main menu.
+    ///
+    /// "开始 co-op 房间" used to silently start a brand-new run even when the main menu was showing an
+    /// enabled Continue button, which is how a co-op save became unreachable ("和 AI 组队中途退出后回不到
+    /// 存档里"). Failing loudly with an actionable code beats quietly bypassing the player's save; set
+    /// NekoConfig.coop_yield_to_saved_run = false (POST /config) to opt out and force a new room.
+    /// </summary>
+    private static void GuardAgainstSavedRun(string action)
+    {
+        if (!NekoConfig.Current.coop_yield_to_saved_run)
+            return;
+        var currentScreen = ActiveScreenContext.Instance.GetCurrentScreen();
+        if (!GameStateService.CanContinueRun(currentScreen))
+            return;
+
+        throw new ApiException(409, "active_run_present",
+            "There is a saved run on the main menu. Continue it (continue_run) or abandon it (abandon_run) before starting a new co-op room.",
+            new
+            {
+                action,
+                screen = GameStateService.ResolveScreen(currentScreen),
+                resumable = true,
+                hint = "continue_run resumes the save; POST /config {coop_yield_to_saved_run:false} disables this guard."
+            });
+    }
+
     private static async Task<ActionResponsePayload> ExecuteOpenMultiplayerMenuAsync()
     {
         var currentScreen = ActiveScreenContext.Instance.GetCurrentScreen();
@@ -3388,6 +3424,9 @@ internal static class GameActionService
                 action = "start_multiplayer_host",
                 screen
             }, retryable: true);
+
+        // Never start a fresh host room over a resumable save (see GuardAgainstSavedRun).
+        GuardAgainstSavedRun("start_multiplayer_host");
 
         // R2 same-machine direct connect: force a plain ENet host on 33771 (bypass the Steam-host
         // decision) so the catgirl client can connect directly to 127.0.0.1:33771.
@@ -3440,6 +3479,9 @@ internal static class GameActionService
         cfg.Save();
 
         await CloseMainMenuSubmenusAsync();
+
+        // Refuse to bypass a resumable save by opening a fresh room + catgirl process (see GuardAgainstSavedRun).
+        GuardAgainstSavedRun("start_coop_session");
 
         var openResult = await ExecuteOpenMultiplayerMenuAsync();
         var hostResult = await ExecuteStartMultiplayerHostAsync();

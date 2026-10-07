@@ -96,8 +96,19 @@ class CatgirlMemoryStore:
             self._log(f"catgirl_memory save failed: {self._path}")
 
     def add_run(self, run_id: str, *, character: str, outcome: str, floor: int, act: int,
-                decision_memory: list[dict[str, Any]], llm: Any = None) -> dict[str, Any]:
-        """总结一局并追加到记忆（幂等：同 run_id 的旧记录先移除再添新，避免终端屏重复触发累积）。"""
+                decision_memory: list[dict[str, Any]], llm: Any = None,
+                hp_report: dict[str, Any] | None = None,
+                route: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """总结一局并追加到记忆（幂等：同 run_id 的旧记录先移除再添新，避免终端屏重复触发累积）。
+
+        ``llm`` 参数保留但**这里不再使用**：本方法必须是同步、确定、立刻落盘的（terminal 屏会反复
+        出现，记录不能等模型）。自然语言的**反思**改由 service 事后异步生成，再经
+        ``attach_reflection`` 贴回同一条记录。
+
+        旧代码在这里同步调用 ``llm.generate(...)`` —— 那是个 ``async`` 方法，拿到的是协程，
+        随后 ``.splitlines()`` 直接抛错被 ``except`` 吞掉；而且还有 ``self._engine == "llm"`` 这道
+        默认关闭的闸门。**那条 LLM 总结路径从来没有生效过**，一直是纯启发式。
+        """
         run = {
             "run_id": str(run_id or ""),
             "character": str(character or ""),
@@ -107,11 +118,25 @@ class CatgirlMemoryStore:
             "act": int(act or 0),
             "lessons": [],
             "preferences": [],
+            "hp": dict(hp_report or {}),
+            "reflection": "",
+            # 逐房间的路线图：每个房间掉了多少血、拿到什么（供历史页展示与复盘参考）。
+            "route": [dict(item) for item in (route or []) if isinstance(item, dict)],
+            # 本局的关键决策（截断保留），供历史页展示 + 局末复盘当上下文。
+            "decisions": [
+                {
+                    "screen": str(item.get("screen") or ""),
+                    "action_type": str(item.get("action_type") or ""),
+                    "reason": str(item.get("decision_reason") or item.get("reason") or "")[:80],
+                    "step_count": item.get("step_count"),
+                }
+                for item in (decision_memory or [])[-60:]
+                if isinstance(item, dict)
+            ],
         }
         summary = self.summarize_run(
             decision_memory=decision_memory,
             run_meta=run,
-            llm=llm if self._engine == "llm" else None,
         )
         run["lessons"] = summary.get("lessons", [])
         run["preferences"] = summary.get("preferences", [])
@@ -140,6 +165,29 @@ class CatgirlMemoryStore:
                 lessons = self._dedup(lessons + llm_out.get("lessons", []))
                 preferences = self._dedup(preferences + llm_out.get("preferences", []))
         return {"lessons": lessons, "preferences": preferences}
+
+    def attach_reflection(self, run_id: str, reflection: str, *, as_lesson: bool = True) -> dict[str, Any] | None:
+        """把异步生成的反思贴回那一局，并顺带作为一条"教训"参与下一局策略。
+
+        为什么也塞进 lessons：`summarize_recent` 是把最近几局的 lessons 聚合起来注入
+        `strategy_directives` 的 —— 反思只有进这条路，才会真的影响下一局的选牌/路线/战斗决策。
+        返回被更新的记录；找不到对应 run_id 时返回 None。
+        """
+        text = str(reflection or "").strip()
+        if not text:
+            return None
+        for run in self._runs:
+            if str(run.get("run_id") or "") != str(run_id or ""):
+                continue
+            run["reflection"] = text
+            if as_lesson:
+                lessons = run.get("lessons") if isinstance(run.get("lessons"), list) else []
+                if text not in lessons:
+                    lessons.append(text)
+                run["lessons"] = lessons
+            self.save()
+            return dict(run)
+        return None
 
     def summarize_recent(self, limit: int = 5) -> dict[str, list[str]]:
         """聚合最近 N 局的教训/偏好（去重），供注入 strategy_directives。"""

@@ -87,6 +87,7 @@
   "companion.suggestion.combat_reason.block_value": "這張牌能先把防禦墊起來，讓這一回合更安全。",
   "companion.suggestion.combat_reason.generic": "它更符合目前血量、能量、手牌和敵人意圖。",
   "companion.suggestion.reward_preferred": "建議優先貼合策略偏好的獎勵：{preferred}。",
+  "companion.suggestion.reward_default": "建議優先補齊目前牌組短板的獎勵卡。",
   "companion.suggestion.reward_named": "目前獎勵裡可以重點看：{card_name}。",
   "companion.suggestion.selection_named": "目前可處理的卡裡，可以優先看：{card_name}。",
   "companion.suggestion.map_named": "目前可走路線裡，可以優先考慮：{node_type}。",

@@ -52,8 +52,54 @@ class STS2NekoInterface:
             "catgirl_sync": catgirl_sync,
         }
 
+    async def _refresh_if_connected(self) -> bool:
+        """尽力刷新一次快照；连不上 mod 就跳过。
+
+        档位与游玩模式都是**插件本地的偏好**——玩家完全可能先设好再开游戏。若因为
+        游戏没开就连带把整个切换判为失败，NEKO 会得到一个报错，而设置其实早就生效了。
+        所以这里吞掉连接错误，并在返回值里如实说明 refresed 与否。
+        """
+        try:
+            await self._service.refresh_state(trigger_sync=True)
+            return True
+        except Exception as exc:
+            self._service.logger.debug(f"[sts2] refresh after a local setting change skipped (non-fatal): {exc}")
+            return False
+
+    async def set_control_mode(self, mode: str) -> dict[str, Any]:
+        """切换猫娘的控制档位：`program` 自己玩 / `advise` 听安排 / `standby` 停手。
+
+        `advise` 下非战斗决策界面只算不做，等玩家发话（`sts2_execute_planned_operation`
+        就是"我点头了，走一步"）；战斗照常自动打。档位会同步给 mod，让它自己的驱动一起停手。
+        """
+        result = await self._service.set_control_mode(mode)
+        result["refreshed"] = await self._refresh_if_connected()
+        return result
+
+    async def set_instance(self, instance: str = "host") -> dict[str, Any]:
+        """切换插件的"活动实例"：`host`（配置里的 base_url）或 `catgirl`（coop 里的猫娘进程）。
+
+        一般是自动的——`sts2_open_coop_room(host=True)` 成功后会自己切到猫娘。这个入口用于
+        查看/覆盖：例如猫娘进程重启后地址没跟上，或你想强制回到主机侧。
+        """
+        result = await self._service.set_instance(instance)
+        result["refreshed"] = await self._refresh_if_connected()
+        return result
+
+    async def set_play_style(self, style: str) -> dict[str, Any]:
+        """切换游玩模式：`serious` 认真（默认）/ `mischievous` 捣蛋 / `silly` 笨蛋。
+
+        不影响"控制档位"（谁来决定），只决定"决定得多不认真"：捣蛋有 20%、笨蛋有 60% 的概率
+        把最优操作换成次优/最差的**合法**选择。显式授权（`sts2_execute_planned_operation`）不受影响。
+        """
+        result = self._service.set_play_style(style)
+        result["refreshed"] = await self._refresh_if_connected()
+        return result
+
     async def set_standby(self, standby: bool) -> dict[str, Any]:
         mode_info = self._service.set_standby(standby)
+        # standby 也要同步给 mod：只停插件等于没停，mod 有自己的自动玩驱动。
+        sync = await self._service.sync_control_mode_to_mod()
         await self._service.refresh_state(trigger_sync=True)
         mode_label = "standby" if self._service._state.standby else "active"
         message = self.t("neko.standby.changed", default="已切换到 {mode_label} 模式。", mode_label=mode_label)
@@ -63,6 +109,7 @@ class STS2NekoInterface:
             "summary": message,
             "standby": self._service._state.standby,
             "mode": mode_info,
+            "mod_sync": sync,
         }
 
     async def set_companion_mode(self, enabled: bool) -> dict[str, Any]:
@@ -70,6 +117,72 @@ class STS2NekoInterface:
         if enabled:
             await self._service.refresh_state(trigger_sync=True)
         return result
+
+    async def set_danmaku(self, enabled: bool) -> dict[str, Any]:
+        """游戏内弹幕总开关（关掉后插件不再推 /danmaku，自动游玩不受影响）。"""
+        result = self._service.set_danmaku_enabled(enabled)
+        gate = await self._service.sync_danmaku_gate_to_mod()
+        result["mod_gate"] = gate
+        if not enabled:
+            result["message"] = str(result.get("message") or "") + " 已同时通知 mod 停止渲染并清屏。"
+            result["summary"] = result["message"]
+        return result
+
+    async def set_route(self, *, mode: str = "safe", pick: Any = None, index: Any = None) -> dict[str, Any]:
+        """对话式地图协作：定路线 / 跟你一样 / 选第几个。
+
+        猫娘据玩家原话选 mode：
+          - "定个路线"、"你定"、"挑条稳的"        -> safe（按保守权重自己算）
+          - "我选完了，来选这个"、"跟我一样"      -> mirror（投玩家当前那一票）
+          - "你选中间"、"选第三个"、"选最左边"    -> pick（pick=中间/第几个/最左/最右）
+        重复调用即改票，玩家说"不对不对我选错了"时直接再调一次。
+        """
+        payload = await self._service.set_route(mode=mode, pick=pick, index=index)
+        return payload
+
+    async def continue_saved_run(self) -> dict[str, Any]:
+        """回到（继续）当前存档：主菜单上等价于点「继续」。
+
+        真实世界里"和 AI 组队中途退出后回不到存档"最常见的成因是主菜单决策抢在玩家前面开了单人
+        子菜单/新建局（见 heuristic_planner 的 main_menu 分支已改为优先 continue_run）。这个入口
+        给用户一个显式、可诊断的补救动作：不可用时直接报出当前界面与可用动作，而不是静默点错。
+        """
+        client = self._service._require_client()
+        await self._service.refresh_state()
+        snapshot = self._service._state.snapshot if isinstance(self._service._state.snapshot, dict) else {}
+        screen = str(snapshot.get("screen") or "unknown")
+        available = {
+            str(item.get("type"))
+            for item in (snapshot.get("available_actions") or [])
+            if isinstance(item, dict) and item.get("type")
+        }
+        if "continue_run" not in available:
+            message = self.t(
+                "neko.continue_run.unavailable",
+                default="当前界面没有可继续的存档（screen={screen}，可用动作: {actions}）。请确认主菜单上确实显示了「继续」。",
+                screen=screen,
+                actions=", ".join(sorted(available)) or "无",
+            )
+            return {"status": "idle", "message": message, "summary": message, "screen": screen}
+        await client.execute_action("continue_run")
+        await self._service.refresh_state()
+        after = self._service._state.snapshot if isinstance(self._service._state.snapshot, dict) else {}
+        message = self.t(
+            "neko.continue_run.done",
+            default="已回到存档，当前界面 {screen}。",
+            screen=after.get("screen", "unknown"),
+        )
+        return {
+            "status": "ok",
+            "message": message,
+            "summary": message,
+            "screen": after.get("screen", "unknown"),
+            "available_actions": sorted(
+                str(item.get("type"))
+                for item in (after.get("available_actions") or [])
+                if isinstance(item, dict) and item.get("type")
+            ),
+        }
 
     async def extract_and_upsert_preference(self, instruction: str, *, source: str = "user") -> dict[str, Any]:
         snapshot = await self._current_snapshot()

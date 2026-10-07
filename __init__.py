@@ -97,6 +97,19 @@ class STS2AutoplayPlugin(NekoPluginBase):
             object.__setattr__(self, "_dispatcher", dispatcher)
         return dispatcher
 
+    def _push_silent_mode_change(self, entry_id: str, payload: JsonObject) -> None:
+        """模式切换的内部留痕：只记录，不让 NEKO 看见，更不触发它说话。
+
+        `push_status_feedback` 默认 `ai_behavior="respond"`，那会让 AI **立刻开口**一轮
+        （"好，我认真打"）——玩家要的是猫娘**偷偷**换档，不是每次汇报。`visibility=[]` 已经
+        让它不进聊天窗，这里再把 `ai_behavior` 放到 `"blind"`：连喂给 LLM 都不喂。
+        留痕仍然有用——它是插件面板与排障能看到的那份记录。
+        """
+        label = str(
+            payload.get("play_style") or payload.get("style") or payload.get("mode") or entry_id
+        )
+        self._get_dispatcher().push_status_feedback(label, entry_id=entry_id, ai_behavior="blind")
+
     def _push_frontend_notification(
         self,
         *,
@@ -275,6 +288,347 @@ class STS2AutoplayPlugin(NekoPluginBase):
     )
     async def sts2_disable_companion_mode(self, **_: Any):
         return await self._run_entry(lambda: self._service.neko.set_companion_mode(False))
+
+    @plugin_entry(
+        id="sts2_set_danmaku",
+        name=tr("entries.sts2_set_danmaku.name", default="开关游戏内弹幕"),
+        description=tr(
+            "entries.sts2_set_danmaku.description",
+            default="打开/关闭游戏内猫娘弹幕。关闭后插件不再向游戏推弹幕（也不生成点评、不清屏），自动游玩与状态读取不受影响。",
+        ),
+        llm_result_fields=["summary"],
+        input_schema={
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean"},
+            },
+            "required": ["enabled"],
+        },
+        metadata={"agent_auto": False},
+    )
+    async def sts2_set_danmaku(self, enabled: bool = True, **_: Any):
+        return await self._run_entry(lambda: self._service.neko.set_danmaku(enabled))
+
+    @plugin_entry(
+        id="sts2_set_host_digest",
+        name=tr("entries.sts2_set_host_digest.name", default="开关尖塔速报"),
+        description=tr(
+            "entries.sts2_set_host_digest.description",
+            default=(
+                "打开/关闭「尖塔速报」：开着时插件会把局势悄悄交给你（不可见、不进记忆），"
+                "由你自己主动跟观众讲一句。关掉只影响这一路，游戏内弹幕与自动游玩不受影响。"
+            ),
+        ),
+        llm_result_fields=["summary"],
+        input_schema={
+            "type": "object",
+            "properties": {"enabled": {"type": "boolean"}},
+            "required": ["enabled"],
+        },
+        metadata={"agent_auto": False},
+    )
+    async def sts2_set_host_digest(self, enabled: bool = True, **_: Any):
+        async def action() -> JsonObject:
+            payload = self._service.set_host_digest_enabled(bool(enabled))
+            self._push_silent_mode_change("sts2_set_host_digest", payload)
+            return payload
+
+        return await self._run_entry(action)
+
+    @plugin_entry(
+        id="sts2_set_run_reflection",
+        name=tr("entries.sts2_set_run_reflection.name", default="开关尖塔复盘"),
+        description=tr(
+            "entries.sts2_set_run_reflection.description",
+            default=(
+                "打开/关闭「尖塔复盘」：开着时每局结束会生成一次复盘并交给你；关掉后只记数据、不反思，"
+                "损血归因/路线图/历史页照旧可看。"
+            ),
+        ),
+        llm_result_fields=["summary"],
+        input_schema={
+            "type": "object",
+            "properties": {"enabled": {"type": "boolean"}},
+            "required": ["enabled"],
+        },
+        metadata={"agent_auto": False},
+    )
+    async def sts2_set_run_reflection(self, enabled: bool = True, **_: Any):
+        async def action() -> JsonObject:
+            payload = self._service.set_run_reflection_enabled(bool(enabled))
+            self._push_silent_mode_change("sts2_set_run_reflection", payload)
+            return payload
+
+        return await self._run_entry(action)
+
+    @plugin_entry(
+        id="sts2_continue_run",
+        name=tr("entries.sts2_continue_run.name", default="回到存档继续玩"),
+        description=tr(
+            "entries.sts2_continue_run.description",
+            default="在主菜单点「继续」，回到当前存档（co-op 中途退出后回不到存档时用它）。不可用时会报出当前界面与可用动作。",
+        ),
+        llm_result_fields=["summary"],
+        input_schema={"type": "object", "properties": {}},
+        metadata={"agent_auto": False},
+    )
+    async def sts2_continue_run(self, **_: Any):
+        return await self._run_entry(self._service.neko.continue_saved_run, finish=True)
+
+    @llm_tool(
+        name="sts2_set_route",
+        description=tr(
+            "tools.sts2_set_route.description",
+            default=(
+                "在杀戮尖塔的地图选点界面按玩家的意思投票。默认策略下猫娘不会自己抢路线，只有调用本工具才会投。"
+                "按玩家原话选 mode："
+                "玩家让你自己定路线（“定个路线”“你来定”“挑条稳的”“你觉得走哪”）-> mode=safe；"
+                "玩家已经选好、让你跟他一致（“我选完了，来选这个”“跟我一样”“跟上我”）-> mode=mirror；"
+                "玩家指定了具体位置（“你选中间”“选第三个”“选最左边”“选最右边”）-> mode=pick 并把原话放进 pick。"
+                "玩家说“不对不对我选错了，你选中间”时直接用 mode=pick 再调一次即可改票。"
+                "不在选点界面时会返回错误说明，此时不要谎称已投票。"
+            ),
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["safe", "mirror", "pick"],
+                    "description": "safe=自己挑稳妥的；mirror=跟玩家当前那一票；pick=按玩家指定位置。",
+                },
+                "pick": {
+                    "type": "string",
+                    "description": "mode=pick 时玩家说的位置原话，例如“中间”“第三个”“最左边”“最右”。",
+                },
+            },
+            "required": ["mode"],
+        },
+        timeout=20.0,
+    )
+    async def llm_set_route(self, mode: str = "safe", pick: Any = None, **_: Any) -> JsonObject:
+        return await self._service.neko.set_route(mode=mode, pick=pick)
+
+    @plugin_entry(
+        id="sts2_set_route",
+        name=tr("entries.sts2_set_route.name", default="定个路线/按我说的选"),
+        description=tr(
+            "entries.sts2_set_route.description",
+            default=(
+                "在选路线的界面替猫娘投票。mode=safe 让它自己挑一条稳妥的；mode=mirror 跟玩家当前那一票；"
+                "mode=pick 按玩家说的位置（中间/第三个/最左/最右）投。重复调用即改票。"
+            ),
+        ),
+        llm_result_fields=["summary"],
+        input_schema={
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["safe", "mirror", "pick"]},
+                "pick": {"type": "string"},
+                "index": {"type": "integer"},
+            },
+            "required": ["mode"],
+        },
+        metadata={"agent_auto": False},
+    )
+    async def sts2_set_route(self, mode: str = "safe", pick: Any = None, index: Any = None, **_: Any):
+        async def action() -> JsonObject:
+            payload = await self._service.neko.set_route(mode=mode, pick=pick, index=index)
+            self._get_dispatcher().push_status_feedback(
+                str(payload.get("summary") or payload.get("message") or "已处理地图路线指令。"),
+                entry_id="sts2_set_route",
+                ai_behavior="respond",
+            )
+            return payload
+
+        return await self._run_entry(action)
+
+    @llm_tool(
+        name="sts2_set_control_mode",
+        description=tr(
+            "tools.sts2_set_control_mode.description",
+            default=(
+                "切换猫娘在游戏里的控制档位。按玩家原话选 mode："
+                "玩家让你自己玩、不用问了（“你自己玩”“你自己看着办”“随便打”）-> mode=program；"
+                "玩家要自己拿主意、让你听着（“听我安排”“你先别动”“等我说”“这步我来定”）-> mode=advise；"
+                "玩家要你完全停手（“停手”“别动”“待机”）-> mode=standby。"
+                "advise 下你仍然会算，玩家问“你打算怎么走”时要答得出来；"
+                "他说“就这个”时用 sts2_execute_planned_operation 走一步。"
+                "advise 只作用于战斗之外的决策界面（选路/奖励/选卡/事件/商店/休息等），战斗你会照常打。"
+            ),
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["program", "advise", "standby"],
+                    "description": "program=自己玩；advise=听玩家安排，一步步等发话；standby=完全停手。",
+                },
+            },
+            "required": ["mode"],
+        },
+        timeout=20.0,
+    )
+    async def llm_set_control_mode(self, mode: str = "program", **_: Any) -> JsonObject:
+        result = await self._service.neko.set_control_mode(mode)
+        # 工具返回值会原样回给 LLM，所以这里只给机器可读的最小结果。
+        # 若带上"好，我自己玩"这类句子，猫娘多半会把它说出口——那就不是"偷偷换档"了。
+        return {"ok": result.get("status") == "ok", "mode": result.get("mode") or mode}
+
+    @plugin_entry(
+        id="sts2_set_control_mode",
+        name=tr("entries.sts2_set_control_mode.name", default="你自己玩/听我安排"),
+        description=tr(
+            "entries.sts2_set_control_mode.description",
+            default=(
+                "切换控制档位：program 自己玩（默认）；advise 听玩家安排——战斗之外的决策界面只算不做，"
+                "等玩家发话才走一步；standby 完全停手。档位会同步给 mod。"
+            ),
+        ),
+        llm_result_fields=["summary"],
+        input_schema={
+            "type": "object",
+            "properties": {"mode": {"type": "string", "enum": ["program", "advise", "standby"]}},
+            "required": ["mode"],
+        },
+        metadata={"agent_auto": False},
+    )
+    async def sts2_set_control_mode(self, mode: str = "program", **_: Any):
+        async def action() -> JsonObject:
+            payload = await self._service.neko.set_control_mode(mode)
+            self._push_silent_mode_change("sts2_set_control_mode", payload)
+            return payload
+
+        return await self._run_entry(action)
+
+    @llm_tool(
+        name="sts2_set_play_style",
+        description=tr(
+            "tools.sts2_set_play_style.description",
+            default=(
+                "切换猫娘的游玩模式（打得认不认真）。按玩家原话选 style："
+                "玩家要认真打、想通关（“认真打”“好好打”“我要通关”“别乱来”）-> style=serious；"
+                "玩家要你偶尔闹一下（“捣蛋”“闹着玩”“别太认真”“调皮点”）-> style=mischievous；"
+                "玩家要你摆烂（“笨蛋”“你傻啦”“随便打打”“犯傻”）-> style=silly。"
+                "捣蛋有 20%、笨蛋有 60% 的概率把最优操作换成次优/最差的合法选择；"
+                "serious 是默认档，行为与平常完全一致。这是「打得多不认真」，不是「谁来指挥」——"
+                "后者用 sts2_set_control_mode。玩家亲口说「就这个」时执行的那一步不受本模式影响。"
+            ),
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "style": {
+                    "type": "string",
+                    "enum": ["serious", "mischievous", "silly"],
+                    "description": "serious=认真（默认）；mischievous=捣蛋；silly=笨蛋。",
+                },
+            },
+            "required": ["style"],
+        },
+        timeout=20.0,
+    )
+    async def llm_set_play_style(self, style: str = "serious", **_: Any) -> JsonObject:
+        result = await self._service.neko.set_play_style(style)
+        # 同上：只回机器可读的最小结果，别给 LLM 一句可以被复述的话。
+        return {"ok": result.get("status") == "ok", "style": result.get("play_style") or style}
+
+    @llm_tool(
+        name="sts2_set_host_digest",
+        description=tr(
+            "tools.sts2_set_host_digest.description",
+            default=(
+                "开关「尖塔速报」：是否让插件把对局局势悄悄交给你、由你主动跟观众讲一句。"
+                "玩家说「别自己报局势了」「安静点看就行」「不用主动说话」-> enabled=false；"
+                "玩家说「你多讲讲局势」「直播感一点」「主动点」-> enabled=true。"
+                "只影响这一路：游戏内弹幕、自动游玩、历史记录都不受影响。"
+            ),
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean", "description": "true=开着速报；false=不主动报局势。"},
+            },
+            "required": ["enabled"],
+        },
+        timeout=20.0,
+    )
+    async def llm_set_host_digest(self, enabled: bool = True, **_: Any) -> JsonObject:
+        result = self._service.set_host_digest_enabled(bool(enabled))
+        return {"ok": result.get("status") == "ok", "enabled": bool(result.get("enabled"))}
+
+    @llm_tool(
+        name="sts2_set_run_reflection",
+        description=tr(
+            "tools.sts2_set_run_reflection.description",
+            default=(
+                "开关「尖塔复盘」：每局结束时是否生成一次复盘（指出哪几处损血最要命、下次怎么改）。"
+                "玩家说「别复盘了」「打完直接开下一局」「快点重开」-> enabled=false；"
+                "玩家说「打完讲讲问题」「复盘一下」-> enabled=true。"
+                "关掉后只记数据不反思，损血归因/路线图/历史页照旧可看。"
+            ),
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean", "description": "true=局末复盘；false=只记数据。"},
+            },
+            "required": ["enabled"],
+        },
+        timeout=20.0,
+    )
+    async def llm_set_run_reflection(self, enabled: bool = True, **_: Any) -> JsonObject:
+        result = self._service.set_run_reflection_enabled(bool(enabled))
+        return {"ok": result.get("status") == "ok", "enabled": bool(result.get("enabled"))}
+
+    @plugin_entry(
+        id="sts2_set_play_style",
+        name=tr("entries.sts2_set_play_style.name", default="认真打/捣蛋/摆烂"),
+        description=tr(
+            "entries.sts2_set_play_style.description",
+            default=(
+                "切换游玩模式：serious 认真（默认，与平常逐字相同）；mischievous 捣蛋（20% 概率换成次优）；"
+                "silly 笨蛋（60% 概率换成评分最差的合法选择）。只影响自动决策，不影响玩家亲口授权的那一步。"
+            ),
+        ),
+        llm_result_fields=["summary"],
+        input_schema={
+            "type": "object",
+            "properties": {"style": {"type": "string", "enum": ["serious", "mischievous", "silly"]}},
+            "required": ["style"],
+        },
+        metadata={"agent_auto": False},
+    )
+    async def sts2_set_play_style(self, style: str = "serious", **_: Any):
+        async def action() -> JsonObject:
+            payload = await self._service.neko.set_play_style(style)
+            self._push_silent_mode_change("sts2_set_play_style", payload)
+            return payload
+
+        return await self._run_entry(action)
+
+    @plugin_entry(
+        id="sts2_set_instance",
+        name=tr("entries.sts2_set_instance.name", default="对着主机还是猫娘"),
+        description=tr(
+            "entries.sts2_set_instance.description",
+            default=(
+                "切换插件当前驱动的游戏进程：host（配置里的 base_url；单人局就是它，coop 里是主机）"
+                "或 catgirl（coop 里被拉起的猫娘进程，地址由主机的 coop_client_port 推导）。"
+                "一般是自动的——打开 co-op 房间成功后插件会自己切到猫娘；这个入口用于查看与强制覆盖。"
+            ),
+        ),
+        llm_result_fields=["summary"],
+        input_schema={
+            "type": "object",
+            "properties": {"instance": {"type": "string", "enum": ["host", "catgirl"]}},
+            "required": ["instance"],
+        },
+        metadata={"agent_auto": False},
+    )
+    async def sts2_set_instance(self, instance: str = "host", **_: Any):
+        return await self._run_entry(lambda: self._service.neko.set_instance(instance))
 
     @plugin_entry(
         id="sts2_apply_user_override",
