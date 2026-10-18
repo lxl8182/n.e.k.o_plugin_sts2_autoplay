@@ -61,7 +61,7 @@ class STS2Dispatcher:
             "priority": priority,
             "metadata": dict(metadata),
         }
-        host_content = _host_reply_text(content)
+        host_content = str(content or "") if metadata.get("delivery_semantics") == "proactive" else _host_reply_text(content)
         if visibility is not None or ai_behavior is not None:
             kwargs.update(
                 {
@@ -72,7 +72,7 @@ class STS2Dispatcher:
             )
             kwargs["metadata"]["description"] = description
             kwargs["metadata"]["message_type"] = message_type
-            kwargs["metadata"]["delivery_semantics"] = "passive"
+            kwargs["metadata"].setdefault("delivery_semantics", "passive")
         else:
             kwargs.update(
                 {

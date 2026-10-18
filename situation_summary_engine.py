@@ -163,7 +163,11 @@ class STS2SituationSummaryEngine:
             intent = enemy.get("intent") or "unknown"
             enemy_bits.append(self.t("summary.combat.enemy_line", default="{name}({hp}，意图={intent})", name=name, hp=self._hp_text(current_hp, max_hp), intent=intent))
         enemy_text = "；".join(enemy_bits) if enemy_bits else self.t("summary.combat.no_enemy", default="无敌人信息")
-        return self.t("summary.combat", default="当前战斗状态，玩家血量 {hp}，能量 {energy}，护盾 {block}，手牌：{hand_names}，敌人：{enemy_text}。", hp=hp, energy=energy, block=block, hand_names=hand_names, enemy_text=enemy_text)
+        identity = payload.get("local_player_identity") or {}
+        net_type = str(identity.get("net_game_type") or "").lower()
+        owner = {"host": "用户主机", "client": "猫娘客户端"}.get(net_type, "当前受控玩家")
+        prefix = f"本接口手牌属于{owner}（{identity.get('character_name') or identity.get('player_id') or '角色未知'}）。" if identity.get("player_id") else ""
+        return prefix + self.t("summary.combat", default="当前战斗状态，玩家血量 {hp}，能量 {energy}，护盾 {block}，手牌：{hand_names}，敌人：{enemy_text}。", hp=hp, energy=energy, block=block, hand_names=hand_names, enemy_text=enemy_text)
 
     def _summarize_reward(self, payload: dict[str, Any]) -> str:
         hp = self._hp_text(payload.get("current_hp"), payload.get("max_hp"))

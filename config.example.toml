@@ -3,10 +3,15 @@ enabled = true
 auto_start = false
 
 [sts2]
+# 出牌节奏：true = 每个战斗回合都等主人先说一句话再决策出牌（陪玩节奏，互动感强但慢）；
+# false = 不等发言、自己连续打（全自动，默认）。两种节奏下主人中途插话都会被立即采纳为
+# 指引并打断当前计划重算，所以"全自动"不会让你失去指挥权。
+# 运行时切换：工具 sts2_set_wait_for_turn(enabled=...)，或入口 sts2_set_wait_for_turn。
+wait_for_turn_message = false
 # 游戏内弹幕总开关。false = 插件完全不推 POST /danmaku（也不生成 LLM 点评、不拉头像），
 # 自动游玩与状态读取不受影响。运行时等价动作：sts2_set_danmaku(enabled=false)。
 # 不要再指望 catgirl_llm_enabled=false 来关弹幕——那只是把 LLM 点评降级成启发式文本，弹幕照旧。
-danmaku_enabled = true
+danmaku_enabled = false
 
 # 游玩模式：
 #   "serious"（默认）= 认真打，行为与改动前逐字相同；
@@ -23,3 +28,21 @@ play_style = "serious"
 # 旧的布尔配置 map_follow_player 仍被识别（true -> follow，false -> auto）。
 map_policy = "wait"
 map_vote_wait_seconds = 20
+
+# co-op 里猫娘的显示名。真人主机和猫娘跑在同一个 Steam 账号上，联机名牌默认同名、分不清谁是谁。
+# 设了名字后两个窗口里猫娘都显示它、真人仍显示 Steam 名（由 mod 侧 PlayerNamePatch 落实）。
+# 不配本项 = 用本体当前角色名；想完全关掉改名（回落到 Steam 名），去掉下面注释并设为 ""。
+# 运行时等价动作：sts2_set_catgirl_name。
+# coop_catgirl_name = "小铃"
+
+# 真人/主机名牌的显示名。留空（默认）= 用真实 Steam 人格名：mod 的多人测试大厅给名牌造的是
+# "Test Host"/"Test Client N" 这类占位名，从不查 Steam，所以由 PlayerNamePatch 直接读
+# SteamFriends.GetPersonaName() 顶上。仅在 Steam 名字取不到、想固定一个名字时才需要设。
+# 这一项 mod 侧直接读 settings.json，不由插件下发；需要时改
+# %APPDATA%\SlayTheSpire2\NekoSpire\settings.json 的 coop_host_name，或在游戏内配置窗口填。
+# coop_host_name = "猫寻铃"
+
+# 「本体事实闸门」。true（默认）= 插件运行期间本体不把游戏对话抽取为长期 fact：
+# 游戏回合仍留在 recent.json（本体能聊当前这局），只是不再沉淀进 facts.json。
+# 关掉本项恢复旧行为（游戏对话照常进 facts.json）。
+suppress_host_facts = true

@@ -2,14 +2,20 @@
 
 **Location**: repository root (Python package); `plugin.toml` declares the `STS2AutoplayPlugin` entry point.
 
-This plugin handles **decision & expression**: it gives the Slay-the-Spire-2 catgirl companion autoplay (card plays / map movement), situation commentary, a LLM score for event rooms, in-game danmaku, and cross-run memory. It talks to the game through the Mod's HTTP API (`/state`, `/events/stream`, `/action`, `/solver/plan`, `/danmaku`) and does **not** read `strategies/` md itself — that's strategy content, left to `strategy_repository`.
+This plugin coordinates the catgirl companion’s unified conversation, plans, actions, in-game expression, and cross-run experience. The host supplies the active persona and model; the Mod supplies observations, solver output, and execution. It talks to the game through the Mod's HTTP API (`/state`, `/events/stream`, `/action`, `/solver/plan`, `/danmaku`) Unified decisions read the current character overview and relevant scene strategy, alongside conditional corrections and preferences. Legacy run slogans are no longer promoted to strategy directives.
+
+## Current delivery and acceptance (2026-10-15)
+
+N1 process recording, N2 direct questions about the current/previous turn, and N3 conditional experience storage and reuse are implemented. The mechanisms are accepted after 102 relevant Python checks and the history page JavaScript syntax check. Nine runtime files were copied to the installed plugin and verified with SHA256. The host was stopped at the last delivery; normal startup loads the new files.
+
+Ask in the existing chat, for example “why did you skip defense last turn?” No history selection or extra question button is needed. The player validates recent-turn explanations, corrections and subsequent use/edit/revocation, the run-end reflection and report, play/cooperation/latency baselines, and cancellation on the actual upgrade screen. The shared checklist is in [development plan, section 2](../nekospire-companion-plan.md). N4 play improvements and N5 further performance work follow concrete recorded issues.
 
 ## Entry actions (`__init__.py`)
 
 - **Status**: `sts2_health_check`, `sts2_get_status`, `sts2_read_state`
 - **Autoplay**: `sts2_start_autoplay`, `sts2_pause_autoplay`, `sts2_resume_autoplay`, `sts2_stop_autoplay`, `sts2_set_standby`
 - **Companion**: `sts2_enable_companion_mode`, `sts2_disable_companion_mode`
-- **Danmaku**: `sts2_set_danmaku` (`enabled=true/false`) — the real master switch; turning it off also tells the mod to stop rendering and clears the overlay
+- **Danmaku**: off by default; `sts2_set_danmaku` (`enabled=true/false`) — the real master switch; turning it off also tells the mod to stop rendering and clears the overlay
 - **Save**: `sts2_continue_run` — clicks Continue on the main menu to get back into the saved run
 - **Co-op**: `sts2_open_coop_room`
 - **Strategy**: `sts2_apply_user_override`
@@ -26,26 +32,33 @@ This plugin handles **decision & expression**: it gives the Slay-the-Spire-2 cat
 | `heuristic_planner.py` / `companion_evaluator.py` | Decision: situation evaluation, play/card/route heuristics + commentary trigger |
 | `catgirl_llm.py` | LLM generation: `CatgirlCommentGenerator` (danmaku / commentary **text**). Text only — no decisions |
 | `play_style.py` | Play styles (serious / mischievous / silly): constants, aliases, and the pure "pick one from an ordered candidate list" function |
-| `catgirl_memory.py` | Cross-run memory accumulation (see next section) |
-| `strategy_repository.py` / `strategy_parser.py` | Strategy loading: `strategies/` parsing + `strategy_directives` assembly |
+| `catgirl_memory.py` | Run reports, conditional experience, revisions, matching and actual adoption results |
+| `companion_journal.py` | Per-run compact process, two detailed turns, cases and effect statistics |
+| `strategy_repository.py` / `strategy_parser.py` | Compatibility loading of character/scene documents and player overrides; no automatic legacy run-advice injection |
 | `dispatcher.py` | NEKO output boundary for status feedback / companion notifications |
 
 ## Decision & Expression
 
-- **Decision**: map / reward / deck / event are decided entirely by **heuristics** — the plugin makes no LLM-driven decisions (the event-room LLM-score fusion was removed in 2026-10); combat card plays are decided authoritatively by `/solver/plan`, falling back to heuristics.
+- **Decision**: the host agent model chooses actions throughout the run using the catgirl process’s public state, active player requirements, and relevant experience. When an actionable combat needs replanning, one companion solver request supplies a bound prefix; the same model chooses solver/custom. Valid continuation steps execute serially with fresh entity and prerequisite checks. Heuristic adapters remain for compatibility.
 - **Multi-card selection**: on a chooser that wants 2+ cards, both the plugin and the catgirl driver advance to the next card they have **not** pressed yet on this screen (the pressed `option_index` set is remembered and reset when the screen's candidate set changes), and prefer `confirm_selection` when the game says it can confirm. Both used to send `option_index=0` forever, so the second card was never picked, `max_select` was never reached and the screen hung.
 - **Other out-of-combat choosers**: `bundle_selection` (choose then confirm), `capstone_selection` (sweep options, never re-press the same button — index 0 may be Back), `cards_view` (close), `modal` (dismiss before confirm), `game_over` (back to main menu) are all covered now instead of falling into `unknown` and stalling silently.
 - **Rewards**: the card-reward chooser now takes a card first (`resolve_rewards` used to be checked first, silently draining every card reward).
 - **Known gap**: the out-of-combat **relic** chooser (`NChooseARelicSelection`, e.g. Jewelry Box) has no mod action at all and still needs a manual pick.
-- **Expression**: catgirl commentary + in-game danmaku.
+- **Expression**: one model session handles player input and tactical decisions using the full active persona. Tactical speech completes before a fresh dispatch check; ordinary chat and retrospective questions retain valid plans.
 - **Preference capture**: `sts2_apply_user_override` turns the user's natural-language guidance into structured preferences / overrides.
 - **Cross-run memory**: see next section.
 
 ## Catgirl Memory Growth (cross-run lessons → decision)
 
-When a run ends (death / clear — the `state_machine` classifies it as `screen_class=terminal`), the plugin summarizes the run's `recent_decision_memory` into "lessons + preferences", writes them via `CatgirlMemoryStore` in `catgirl_memory.py`, and persists to `<LOCALAPPDATA>/N.E.K.O/sts2_autoplay/catgirl_memory.json`. On the next run, `strategy_repository.build_context()` merges the recent runs' lessons into `strategy_directives.avoid` and preferences into `prefer` (soft constraints), thereby influencing card / route / combat decisions. The summarizer is **heuristic-first with optional LLM** (added only when `service._catgirl_llm.available`; silently falls back to heuristics on failure).
+The journal persists a compact process for the entire run and detailed evidence for the latest two turns. Corrections, exceptional actions and experience use retain source cases. Files live in `run_process/` beside the existing `catgirl_memory.json`; reload restores the same run.
 
-## Danmaku / Commentary
+Direct retrospective questions enter the unified chat and distinguish the original decision reason, actual execution, and present assessment. The run-end model reads room summaries covering the run, up to 12 key turns, three cases, and six recent review exchanges. Reflection text is saved separately from reusable experience.
+
+Structured `learning_updates` save explicit corrections, reusable discussion conclusions and long-term preferences with source evidence, applicability conditions, revision history and active/revoked state. Model-generated advice remains a candidate. Up to three matching experiences enter a decision; actual action and following-turn observations are linked to their use. Existing legacy reports remain readable.
+
+The existing history page adds “经验采用与速度记录”: applicable-turn/read/adoption/completion counts and latency sample counts, medians and P90 values grouped by run, configuration and processing path. Snapshots update on startup, run end, or retrospective/correction updates. `get_status` and `get_history_payload` also expose reports.
+
+## Legacy Danmaku / Commentary adapters
 
 - Catgirl commentary goes through the plugin's `_maybe_emit_catgirl_llm` → `_push_catgirl` → `POST /danmaku` (text + avatar) for in-game rendering; commentary no longer goes through the NEKO host `push_message`.
 - In combat the LLM prompt is trimmed to "monster HP + our HP + current floor"; only when SSE `event_type == player_action_window_opened` (it's the player's turn) is the current-turn play line appended (`_build_combat_prompt`, reusing `loop_runner._solver_plan_cached`; on a signature hit it doesn't re-run `/solver/plan`).
@@ -165,7 +178,7 @@ So the plugin has an "active instance", inspectable and overridable with `sts2_s
 
 On switching it pushes `coop_control_mode="hold"` to that instance so its **own mod driver stands down on every screen except the join flow** — otherwise the two drivers race for the same action. Joining (menu -> lobby -> character select -> ready) is **still done by the mod**, which is the part the plugin cannot reach. If the plugin dies, the lease lapses and the mod resumes playing on its own.
 
-**It falls back**: while the active instance is the catgirl, three consecutive read failures switch the plugin back to the host, so it never sticks on a dead address.
+**Observation failures**: the current companion path backs off while retaining the catgirl-side boundary; it does not switch to the human host to make or execute decisions.
 
 Note `coop_client_port` in `GET /config` is a read-only field that only exists from **mod 0.1.4** onwards. With an older mod the plugin **does not guess a port**; it stays on the host instance and says so — solo runs are unaffected.
 
@@ -175,10 +188,10 @@ Note `coop_client_port` in `GET /config` is a read-only field that only exists f
 Game combat / scene changes
   → Mod (C#) samples state, pushes /events/stream
   → plugin loop_runner consumes
-  → heuristic_planner / companion_evaluator make decisions
-  → (optionally) catgirl_llm generates danmaku / commentary
-  → Mod /action executes → /danmaku renders danmaku
-  → (run end) catgirl_memory summarizes lessons / preferences → persisted → next run injects into strategy_directives
+  → unified persona model answers, chooses a solver/custom plan, and selects actions
+  → entity/prerequisite checks → Mod /action executes → result confirmation
+  → companion_journal persists process, recent-turn evidence, and effect samples
+  → questions/corrections/run-end review → conditional experience → relevant future decisions
 ```
 
 ## Getting Started
@@ -198,7 +211,7 @@ Game combat / scene changes
 
 **Location**: `game_mod/nekospire/`, compiled into `nekospire.dll` loaded with the game. Listens on **18080** by default (the `STS2_API_PORT` env var can change it).
 
-This Mod (NekoSpire) is the catgirl companion bridge for StS2: it embeds the **Combat Solver** combat brain, exposes game state and combat routes to the NEKO plugin over HTTP, and ships in-game danmaku rendering plus the low-level co-op autoplay driver. It only provides **executable** capability (card plays / state sampling, solver decisions, danmaku rendering, local autoplay) and does **not** read `strategies/` md — that's the plugin's content.
+This Mod (NekoSpire) is the catgirl companion bridge for StS2: it embeds the **Combat Solver** combat brain, exposes game state and combat routes to the NEKO plugin over HTTP, and ships in-game danmaku rendering plus the low-level co-op autoplay driver. It only provides **executable** capability (card plays / state sampling, solver decisions, danmaku rendering, local autoplay) and does **not** read strategy documents. The plugin compatibility layer reads character strategies and player overrides.
 
 ## Main features
 

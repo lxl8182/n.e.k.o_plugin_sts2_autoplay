@@ -33,7 +33,15 @@ class STS2ActionEngine:
             return None
 
         kwargs = planned.get("kwargs") if isinstance(planned.get("kwargs"), dict) else {}
-        normalized_kwargs = self._normalize_kwargs(action, kwargs, snapshot)
+        if planned.get("source") == "llm":
+            try:
+                self._validate_llm_kwargs(snapshot, action, kwargs)
+            except ValueError:
+                return None
+            self._last_target_repair = {}
+            normalized_kwargs = dict(kwargs)
+        else:
+            normalized_kwargs = self._normalize_kwargs(action, kwargs, snapshot)
         return {
             "action_id": action.get("id") or "",
             "action_type": action_type,
@@ -51,6 +59,19 @@ class STS2ActionEngine:
         if operation is None:
             return None, "missing operation"
         planned = operation.as_dict() if hasattr(operation, "as_dict") else dict(operation)
+        if planned.get("source") == "llm":
+            validated = self.validate(snapshot, operation)
+            if validated is not None:
+                return validated, ""
+            action = self._find_action(snapshot.get("action_registry") or [], snapshot,
+                                       action_type=str(planned.get("action_type") or ""), action_id=None)
+            if action is None:
+                return None, "动作不在当前合法动作中"
+            try:
+                self._validate_llm_kwargs(snapshot, action, planned.get("kwargs") or {})
+            except ValueError as exc:
+                return None, str(exc)
+            return None, "动作不合法"
         action_type = str(planned.get("action_type") or "").strip()
         if not action_type:
             return None, "missing action_type"
@@ -74,6 +95,72 @@ class STS2ActionEngine:
         }
         return validated, ""
 
+    def _validate_llm_kwargs(self, snapshot: dict[str, Any], action: dict[str, Any], kwargs: dict[str, Any]) -> None:
+        # 模型输出是系统边界。只接受明确的合法参数，不默认选牌、不修复目标。
+        allowed = {"card_index", "option_index", "target_index", "player_index", "command",
+                   "expected_turn", "expected_player_id", "expected_card_entity_id", "expected_enemy_entity_id"}
+        if set(kwargs) - allowed:
+            raise ValueError("含不支持的参数")
+        for key in ("card_index", "option_index", "target_index", "player_index", "expected_turn"):
+            if key in kwargs and (type(kwargs[key]) is not int or kwargs[key] < 0
+                                  and not (key == "option_index" and kwargs[key] == -1 and action.get("type") == "resolve_rewards")):
+                raise ValueError(f"{key} 必须为非负整数")
+        view = snapshot.get("agent_view") or (snapshot.get("raw_state") or {}).get("agent_view") or {}
+        kind = action.get("type")
+        reward = view.get("reward") or {}
+        if kind in {"resolve_rewards", "collect_rewards_and_proceed"} and not (kind == "resolve_rewards" and kwargs.get("option_index") == -1) and (
+                reward.get("pending_card_choice") or any(item.get("claimable") for item in reward.get("rewards") or [])):
+            raise ValueError("奖励尚未逐项处理，无选牌参数的批量动作会由 Mod 默认选牌；领取用当前合法的 claim_reward，选牌或跳牌只用当前选牌页的合法动作；明确跳过卡牌可用 resolve_rewards，kwargs={\"option_index\":-1}。")
+        combat = view.get("combat") or {}
+        if kind == "play_card":
+            card = next((item for item in combat.get("hand") or [] if item.get("i") == kwargs.get("card_index")), None)
+            if not card or not card.get("playable"):
+                raise ValueError(f"card_index={kwargs.get('card_index')} 不在当前可打出的 hand 中")
+            if card.get("target") and kwargs.get("target_index") not in (card.get("targets") or []):
+                raise ValueError(f"该牌 target_index 必须属于 {card.get('targets') or []}")
+        # 无 index 也合法的批量/离场动作：Mod 的 resolve_rewards 处理器明确写了
+        # "absent = auto (first card)"，"collect_rewards_and_proceed" 更是纯离场。但 Mod 的
+        # 动作描述符给 resolve_rewards 标了 requires_index=true（与自身处理器不一致），插件照
+        # 描述符执行就会把"无 index 离开奖励屏"这类合法动作误拒。这里对这两个动作豁免
+        # requires_index；奖励必须逐项处理的闸仍在上面，不放松任何真实选择。
+        index_optional = kind in {"resolve_rewards", "collect_rewards_and_proceed"}
+        if action.get("requires_target") and "target_index" not in kwargs:
+            raise ValueError(f"{kind} 需要 target_index")
+        paths = {
+            "choose_map_node": ("map", "options"), "choose_event_option": ("event", "options"),
+            "choose_rest_option": ("rest", "options"), "choose_reward_card": ("reward", "cards"),
+            "claim_reward": ("reward", "rewards"), "select_deck_card": ("selection", "cards"),
+            "select_character": ("character_select", "characters"), "choose_timeline_epoch": ("timeline", "slots"),
+            "choose_treasure_relic": ("chest", "relics"),
+            "buy_card": ("shop", "cards"), "buy_relic": ("shop", "relics"), "buy_potion": ("shop", "potions"),
+            "use_potion": ("run", "potions"), "discard_potion": ("run", "potions"),
+        }
+        options = ((view.get(paths[kind][0]) or {}).get(paths[kind][1]) or []) if kind in paths else []
+        valid_indices = [item.get("i") for item in options if not item.get("locked") and not item.get("selected")]
+        if action.get("requires_index") and kind != "play_card" and not index_optional \
+                and "option_index" not in kwargs:
+            raise ValueError(f'{kind} 需要 option_index；使用kwargs={{"option_index":当前选项下标}}，可选下标={valid_indices}')
+        if kind in paths:
+            section, field = paths[kind]
+            option = next((item for item in (view.get(section) or {}).get(field) or []
+                           if item.get("i") == kwargs.get("option_index")), None)
+            if not option or option.get("locked"):
+                raise ValueError(f"{kind}的option_index={kwargs.get('option_index')} 不在 {section}.{field} 可选下标中或已锁定；"
+                                 f'使用kwargs={{"option_index":当前选项下标}}，可选下标={valid_indices}')
+            required_flag = {"choose_rest_option": "enabled", "claim_reward": "claimable",
+                             "buy_card": "affordable", "buy_relic": "affordable", "buy_potion": "affordable",
+                             "use_potion": "usable", "discard_potion": "discard",
+                             "choose_timeline_epoch": "actionable"}.get(kind)
+            if required_flag and not option.get(required_flag):
+                raise ValueError(f"该选项 {required_flag}=false，不可执行")
+            if kind in {"buy_card", "buy_relic", "buy_potion"} and option.get("stocked") is False:
+                raise ValueError("商品已售出")
+            targets = option.get("targets") or option.get("valid_target_indices") or []
+            if (option.get("requires_target") or (kind == "use_potion" and targets)) and kwargs.get("target_index") not in targets:
+                raise ValueError(f"target_index 必须属于 {targets}")
+        if kind == "choose_bundle" and kwargs.get("option_index") not in {item.get("i") for item in view.get("bundles") or []}:
+            raise ValueError("option_index 不在 bundles 下标中")
+
     async def execute(self, client: Any, snapshot: dict[str, Any], operation: dict[str, Any] | PlannedOperation | None) -> dict[str, Any]:
         validated = self.validate(snapshot, operation)
         if validated is None:
@@ -85,12 +172,16 @@ class STS2ActionEngine:
                 "executed": False,
             }
         result = await client.execute_action(validated["action_type"], **validated["kwargs"])
+        pending = result.get("status") == "pending"
         message = self.t("action_engine.executed_action", default="已执行动作: {action_type}", action_type=validated["action_type"])
+        if pending:
+            message = "动作已派发，等待现场确认完成。"
         return {
-            "status": "ok",
+            "status": "pending" if pending else "ok",
             "message": message,
             "summary": message,
-            "executed": True,
+            "executed": not pending,
+            "dispatched": True,
             "operation": validated,
             "result": result,
         }

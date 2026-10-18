@@ -79,6 +79,7 @@ internal static class GameDataExportService
                 id = relic.Id.Entry,
                 name = relic.Title.GetFormattedText(),
                 description = GetDynamicFormattedTextProperty(relic, "DynamicDescription", "Description"),
+                related_effects = GameStateService.BuildRelatedEffects(relic),
                 rarity = relic.Rarity.ToString(),
                 pool = relic.Pool.ToString().ToLowerInvariant(),
                 is_melted = relic.IsMelted
@@ -502,6 +503,10 @@ internal static class GameDataExportService
     private static string? GetReflectedFormattedTextProperty(object target, string propertyName)
     {
         var value = GetReflectedProperty(target, propertyName);
+        if (value is LocString locString)
+        {
+            return locString.GetFormattedText();
+        }
         return value == null ? null : TryCoerceText(value);
     }
 

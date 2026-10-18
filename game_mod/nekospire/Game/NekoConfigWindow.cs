@@ -20,7 +20,10 @@ namespace NekoComm.Game
         private CheckButton? _llmEnabled;
         private CheckButton? _danmakuEnabled;
         private CheckButton? _danmakuPushEnabled;
+        private CheckButton? _companionStatusEnabled;
         private CheckButton? _mapFollowPlayer;
+        private Label? _coopStatus;
+        private bool _coopStarting;
 
         public static async Task OpenAsync()
         {
@@ -102,6 +105,10 @@ namespace NekoComm.Game
             NekoUi.ApplyFont(_danmakuPushEnabled, 18);
             fields.AddChild(_danmakuPushEnabled);
 
+            _companionStatusEnabled = new CheckButton { Text = "显示同伴固定状态（独立于滚动弹幕）", ButtonPressed = cfg.companion_status_enabled };
+            NekoUi.ApplyFont(_companionStatusEnabled, 18);
+            fields.AddChild(_companionStatusEnabled);
+
             _mapFollowPlayer = new CheckButton { Text = "co-op 地图跟随玩家投票（别人先投就跟着投，不抢路线）", ButtonPressed = cfg.coop_map_follow_player };
             NekoUi.ApplyFont(_mapFollowPlayer, 18);
             fields.AddChild(_mapFollowPlayer);
@@ -113,6 +120,9 @@ namespace NekoComm.Game
             NekoUi.ApplyUserButtonTexture(hostCoop, "open_settings.png", "res://images/packed/common_ui/settings_tab_selected.png");
             hostCoop.Pressed += OnHostCoopPressed;
             fields.AddChild(hostCoop);
+            _coopStatus = new Label { AutowrapMode = TextServer.AutowrapMode.WordSmart };
+            NekoUi.ApplyFont(_coopStatus, 18);
+            fields.AddChild(_coopStatus);
 
             // Button row flush to the panel's right: right-aligned + fill-width, no right margin.
             var btnRow = new HBoxContainer();
@@ -165,6 +175,8 @@ namespace NekoComm.Game
             cfg.danmaku_enabled = _danmakuEnabled.ButtonPressed;
             if (_danmakuPushEnabled != null)
                 cfg.danmaku_push_enabled = _danmakuPushEnabled.ButtonPressed;
+            if (_companionStatusEnabled != null)
+                cfg.companion_status_enabled = _companionStatusEnabled.ButtonPressed;
             if (_mapFollowPlayer != null)
                 cfg.coop_map_follow_player = _mapFollowPlayer.ButtonPressed;
             cfg.Save();
@@ -177,12 +189,11 @@ namespace NekoComm.Game
 
         private void OnHostCoopPressed()
         {
-            // Host-side: enable coop (so the catgirl autoplay activates when launched as the client) and open
-            // an ENet multiplayer room. The config window overlays the main menu, so open_multiplayer_menu then
-            // start_multiplayer_host work while the player is at the main menu.
-            var cfg = NekoConfig.Current;
-            cfg.coop_enabled = true;
-            cfg.Save();
+            if (_coopStarting)
+                return;
+            _coopStarting = true;
+            if (_coopStatus != null)
+                _coopStatus.Text = "正在创建联机房间…";
             Close();
             _ = StartCoopSessionAsync();
         }
@@ -191,63 +202,66 @@ namespace NekoComm.Game
         {
             try
             {
-                // The config window is opened from the mods submenu; pop back to the actual main menu first so
-                // the multiplayer actions (open_multiplayer_menu -> start_multiplayer_host) are valid (they
-                // require currentScreen to be NMainMenu, not the mods submenu).
-                await CloseMainMenuSubmenusAsync();
-                await GameThread.InvokeAsync(() => GameActionService.ExecuteAsync(new ActionRequest { action = "open_multiplayer_menu" }));
-                await GameThread.InvokeAsync(() => GameActionService.ExecuteAsync(new ActionRequest { action = "start_multiplayer_host" }));
-                GD.Print("[NekoSpire] host co-op room opened; launching catgirl...");
-                LaunchCatgirlProcess();
+                if (NekoAutoplayDriver.IsCatgirlProcess())
+                    throw new InvalidOperationException("请在真人主机窗口创建房间，猫娘窗口会自动加入。");
+                await GameThread.InvokeAsync(() => GameActionService.ExecuteAsync(new ActionRequest { action = "start_coop_session" }));
+                if (_coopStatus != null)
+                    _coopStatus.Text = "房间已创建，请选择角色。";
             }
             catch (Exception ex)
             {
                 GD.PrintErr("[NekoSpire] co-op session start failed: " + ex.Message);
+                if (_coopStatus != null)
+                    _coopStatus.Text = "创建联机房间失败：" + ex.Message;
+                Show();
             }
-        }
-
-        // Pop the main-menu submenu stack back to NMainMenu (only the mods submenu is open when the config
-        // window's co-op button is clicked, but loop defensively for nested submenus).
-        private static async Task CloseMainMenuSubmenusAsync()
-        {
-            for (var i = 0; i < 6; i++)
+            finally
             {
-                var hasClose = await GameThread.InvokeAsync(() =>
-                {
-                    var st = GameStateService.BuildStatePayload();
-                    return st.available_actions.Contains("close_main_menu_submenu");
-                });
-                if (!hasClose)
-                    return;
-                await GameThread.InvokeAsync(() => GameActionService.ExecuteAsync(new ActionRequest { action = "close_main_menu_submenu" }));
-                await Task.Delay(150);
+                _coopStarting = false;
             }
         }
 
         // Internal so the HTTP path can reuse it: GameActionService's start_coop_session action spawns the
         // second game instance through here — there is no other way to reach it from outside the UI.
+        private static System.Diagnostics.Process? _catgirlProcess;
+
         internal static void LaunchCatgirlProcess()
         {
+            if (_catgirlProcess is { HasExited: false })
+            {
+                GD.Print("[NekoSpire] reusing catgirl process for the new room");
+                return;
+            }
+
             try
             {
                 // Same exe as the host game. Catgirl = client on coop_client_port with debug actions on;
                 // no +connect_lobby, so its autoplay uses the ENet path (open_multiplayer_menu + join_multiplayer_direct).
                 var exe = System.Environment.ProcessPath;
-                var startInfo = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = exe ?? "SlayTheSpire2.exe",
-                    WorkingDirectory = exe != null ? System.IO.Path.GetDirectoryName(exe) ?? "" : "",
-                    UseShellExecute = false,
-                };
                 var catgirlPort = NekoConfig.Current.coop_client_port;
-                startInfo.Environment["STS2_API_PORT"] = catgirlPort.ToString();
-                startInfo.Environment["STS2_ENABLE_DEBUG_ACTIONS"] = "1";
-                System.Diagnostics.Process.Start(startInfo);
-                GD.Print($"[NekoSpire] catgirl process launched (port {catgirlPort}, debug on)");
+                var oldPort = System.Environment.GetEnvironmentVariable("STS2_API_PORT");
+                var oldDebug = System.Environment.GetEnvironmentVariable("STS2_ENABLE_DEBUG_ACTIONS");
+                int pid;
+                try
+                {
+                    System.Environment.SetEnvironmentVariable("STS2_API_PORT", catgirlPort.ToString());
+                    System.Environment.SetEnvironmentVariable("STS2_ENABLE_DEBUG_ACTIONS", "1");
+                    // Godot's Windows launcher uses bInheritHandles=false; Process.Start leaked the host socket into the client.
+                    pid = OS.CreateProcess(exe ?? "SlayTheSpire2.exe", Array.Empty<string>());
+                }
+                finally
+                {
+                    System.Environment.SetEnvironmentVariable("STS2_API_PORT", oldPort);
+                    System.Environment.SetEnvironmentVariable("STS2_ENABLE_DEBUG_ACTIONS", oldDebug);
+                }
+                if (pid <= 0)
+                    throw new InvalidOperationException("Could not create the catgirl process.");
+                _catgirlProcess = System.Diagnostics.Process.GetProcessById(pid);
+                GD.Print($"[NekoSpire] catgirl process launched (pid {pid}, port {catgirlPort}, handle inheritance off)");
             }
             catch (Exception ex)
             {
-                GD.PrintErr("[NekoSpire] catgirl launch failed: " + ex.Message);
+                throw new InvalidOperationException("Catgirl launch failed: " + ex.Message, ex);
             }
         }
     }

@@ -48,7 +48,7 @@ internal static class PredictionCoverage
             RelicModel relic when IsVerifiedNativeRelicHook(relic, method) => true,
             Enthralled or Normality when method == "ShouldPlay" => true,
             _ => false,
-        };
+        } || entry.Reason == CombatSolver.Engine.Common.PredictionRiskReason.ModeledPlayerChoice;
         return new PredictionGap(sourceId, method, entry.Reason.ToString(), compensated);
     }
 

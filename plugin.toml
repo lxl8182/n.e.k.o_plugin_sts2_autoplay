@@ -7,6 +7,7 @@ poll_interval_active_seconds = 1
 action_interval_seconds = 1.5
 post_action_delay_seconds = 0.5
 autoplay_on_start = false
+wait_for_turn_message = true
 character_strategy = "defect"
 max_consecutive_errors = 3
 llm_frontend_output_enabled = true
@@ -33,7 +34,7 @@ catgirl_llm_min_interval_seconds = 10
 # 游戏内弹幕总开关：false = 完全不向 mod 推 POST /danmaku（连 LLM 生成与头像请求都不发生）。
 # 注意与 catgirl_llm_enabled 的区别：catgirl_llm_enabled=false 只是"LLM 点评降级为启发式文本"，
 # 弹幕照旧会推；要真正关掉弹幕必须用 danmaku_enabled=false 或运行时动作 sts2_set_danmaku。
-danmaku_enabled = true
+danmaku_enabled = false
 # 地图投票策略，决定猫娘会不会自己抢路线：
 #   "wait"（默认）= 多人局里彻底等待：不投票、也不自动跟票，路线完全留给玩家，直到玩家通过
 #                   NEKO 说话下令（sts2_set_route）。单机局没有队友可等，仍会自己选。
@@ -44,7 +45,7 @@ map_policy = "wait"
 map_vote_wait_seconds = 20
 # 游玩模式：serious（默认，认真打，与之前逐字相同）/ mischievous（20% 概率换成次优）/
 # silly（60% 概率换成最差）。运行时等价动作：sts2_set_play_style。
-# 注意：插件不做任何 LLM 决策，事件房也早已是纯启发式（原 event_llm_* 配置项已移除）。
+# 整局决策使用 N.E.K.O agent 模型与当前角色主人格；只读取本进程 agent_view，不使用求解器。
 play_style = "serious"
 
 # 「尖塔速报」开关：false = 不把局势悄悄交给本体，本体也就不会主动讲局势。
@@ -53,6 +54,14 @@ host_digest_enabled = true
 # 「尖塔复盘」开关：false = 局末不生成反思、不推给本体；结构化记录（损血归因/路线图/历史页）照旧。
 # 运行时等价动作：sts2_set_run_reflection。
 run_reflection_enabled = true
+
+# 「本体事实闸门」：true（默认）= 插件运行期间本体不把游戏对话抽取为长期 fact。
+# 游戏回合仍留在 recent.json（本体能聊当前这局），只是不再沉淀进 facts.json ——
+# 抽出来的全是角色名/选牌/血量这类游戏状态，跟人设无关，只会在之后污染召回。
+# 实现：插件持续向本体数据根写 memory/.fact_suppression.json 心跳，本体在 fact
+# 抽取入口读取；插件停止后心跳停、TTL(90s) 过期自动恢复，不会卡死。
+# 关掉本项等于恢复旧行为（游戏对话照常进 facts.json）。
+suppress_host_facts = true
 
 [plugin]
 id = "sts2_autoplay"

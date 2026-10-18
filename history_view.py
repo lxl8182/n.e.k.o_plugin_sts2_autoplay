@@ -3,7 +3,7 @@
 
 为什么要落一个静态快照：插件 UI 是通过插件服务器按静态文件提供的
 （`GET /plugin/{plugin_id}/ui/<path>`），前端没有"直接读插件内存"的通道。
-所以每次局末把 `catgirl_memory.json` 里的记录投影成一份紧凑 JSON 放进插件自带的
+所以每次局末或复盘纠正后把 `catgirl_memory.json` 里的记录投影成一份紧凑 JSON 放进插件自带的
 `static/` 目录，页面 `fetch` 它即可 —— 权威数据仍在 `catgirl_memory.json`，这份只是视图缓存，
 升级插件被覆盖也无所谓（下次局末会重新生成）。
 """
@@ -23,7 +23,8 @@ _MAX_DECISIONS = 60
 _MAX_ROUTE_ROOMS = 80
 
 
-def build_history_payload(runs: list[dict[str, Any]]) -> dict[str, Any]:
+def build_history_payload(runs: list[dict[str, Any]], *, learning_report: dict | None = None,
+                          current_report: dict | None = None) -> dict[str, Any]:
     """把 catgirl_memory 的 runs 投影成前端 JSON（新的一局在前）。"""
     out: list[dict[str, Any]] = []
     for run in reversed([r for r in (runs or []) if isinstance(r, dict)][-_MAX_RUNS:]):
@@ -97,7 +98,12 @@ def build_history_payload(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "best_floor": max([int(run["floor"] or 0) for run in out], default=0),
         "total_hp_lost": sum(int((run["hp"].get("total_lost") or 0)) for run in out),
     }
-    return {"summary": summary, "runs": out}
+    effects = {run["run_id"]: (run.get("process") or {}).get("effect_report") for run in runs
+               if (run.get("process") or {}).get("effect_report")}
+    if current_report and current_report.get("run_id"):
+        effects[current_report["run_id"]] = current_report
+    return {"summary": summary, "runs": out, "learning": learning_report or {},
+            "effects": list(effects.values())}
 
 
 def static_dir() -> str:
@@ -105,13 +111,14 @@ def static_dir() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 
-def write_history_view(runs: list[dict[str, Any]], *, directory: str | None = None) -> str | None:
+def write_history_view(runs: list[dict[str, Any]], *, directory: str | None = None,
+                       learning_report: dict | None = None, current_report: dict | None = None) -> str | None:
     """把历史快照写进插件 static 目录；返回写入路径（失败返回 None，绝不抛）。"""
     target_dir = directory or static_dir()
     path = os.path.join(target_dir, HISTORY_FILENAME)
     try:
         os.makedirs(target_dir, exist_ok=True)
-        payload = build_history_payload(runs)
+        payload = build_history_payload(runs, learning_report=learning_report, current_report=current_report)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)

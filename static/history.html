@@ -116,6 +116,7 @@ details summary:hover{background:var(--hover);border-color:var(--primary-border)
     <p class="sub">每一局的选择、损血归因与结束状态。数据来自插件落盘的猫娘记忆。</p>
 
     <div class="cards" id="cards"></div>
+    <div id="effects"></div>
     <div class="toolbar">
         <button id="refresh">刷新</button>
         <span class="muted" id="status">加载中…</span>
@@ -206,6 +207,26 @@ function renderRun(run) {
 }
 
 function render(payload) {
+  const learned = ((payload.learning || {}).experiences || []);
+  const kinds = {player_correction:'玩家纠正', preference:'玩家偏好', model_candidate:'待验证分析'};
+  const states = {active:'启用', revoked:'已撤销'};
+  const paths = {model:'重新决策', selected_plan:'续步', action_confirmed:'动作确认', confirmation:'等待确认', input:'输入响应', divination:'占卜'};
+  const outcomes = {ok:'完成', pending:'待确认', reply_or_wait:'回复或等待', stale:'现场变化', unconfirmed:'未确认', idle:'等待'};
+  const experienceRows = learned.map(e => '<tr><td>' + esc(e.text) + '<br><span class="muted">' +
+    esc((kinds[e.kind] || e.kind) + ' · ' + (states[e.status] || e.status) + ' · 第' + e.version + '版') + '</span></td><td>' + esc(e.applicable_turns) +
+    '</td><td>' + esc(e.reads) + '</td><td>' + esc(e.adoptions) + '</td><td>' + esc(e.completed) + '</td></tr>').join('');
+  const timingNames = {first_action_confirmation_ms:'首动作确认', continuation_interval_ms:'续步间隔',
+    input_to_reply_ms:'输入到回复', input_to_requirement_applied_ms:'输入到要求采用', input_to_action_ms:'输入到动作确认',
+    decision_step_ms:'单步处理', refresh_ms:'刷新', input_ms:'读取输入', model_ms:'模型', solver_ms:'求解',
+    speech_ms:'战术语音', dispatch_ms:'动作请求', confirmation_wait_ms:'确认等待', dispatch_and_confirmation_ms:'操作全程'};
+  const timingRows = (payload.effects || []).flatMap(run => (run.latency || []).flatMap(group =>
+    Object.entries(group.timings || {}).map(([name, s]) => '<tr><td>' + esc(run.run_id) + '<br><span class="muted">' +
+      esc('配置' + group.configuration + ' · ' + (paths[group.path] || group.path) + ' · ' + (outcomes[group.outcome] || group.outcome)) + '</span></td><td>' + esc(timingNames[name] || name) + '</td><td>' + esc(s.samples) +
+      '</td><td>' + esc(s.median_ms) + '</td><td>' + esc(s.p90_ms) + '</td></tr>'))).join('');
+  document.getElementById('effects').innerHTML = '<details class="card"><summary>经验采用与速度记录</summary>' +
+    '<p class="muted">采用统计对应实际动作；打法改善结合具体案例。速度按局和模型/配置分组，时间单位毫秒。快照在局末或复盘纠正后更新。</p>' +
+    (experienceRows ? '<div class="table-wrap"><table><thead><tr><th>经验</th><th>匹配回合</th><th>读取</th><th>关联动作</th><th>完成</th></tr></thead><tbody>' + experienceRows + '</tbody></table></div>' : '<p class="muted">尚无结构化经验。</p>') +
+    (timingRows ? '<div class="table-wrap"><table><thead><tr><th>局/配置</th><th>耗时</th><th>样本</th><th>中位数</th><th>P90</th></tr></thead><tbody>' + timingRows + '</tbody></table></div>' : '<p class="muted">尚无速度样本。</p>') + '</details>';
   const summary = payload.summary || {};
   document.getElementById("cards").innerHTML =
     '<div class="card"><div class="k">总局数</div><div class="v">' + esc(summary.runs || 0) + "</div></div>" +

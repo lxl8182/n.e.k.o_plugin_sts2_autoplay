@@ -1,0 +1,130 @@
+{
+  "summary": {
+    "runs": 1,
+    "victories": 0,
+    "defeats": 1,
+    "best_floor": 22,
+    "total_hp_lost": 0
+  },
+  "runs": [
+    {
+      "run_id": "r",
+      "character": "DEFECT",
+      "outcome": "defeat",
+      "floor": 22,
+      "act": 1,
+      "ended_at": 1792247554.4972148,
+      "hp": {
+        "total_lost": null,
+        "loss_events": null,
+        "min_hp": null,
+        "max_hp": null,
+        "final_hp": null
+      },
+      "heaviest": [],
+      "lessons": [],
+      "preferences": [],
+      "reflection": "讨论后：结束前应先核对合法保命手段，再判断是否有解。",
+      "route": [],
+      "decisions": []
+    }
+  ],
+  "learning": {
+    "experiences": [
+      {
+        "id": "ed205b6c-cf24-4604-8e7d-ae7166b500d0",
+        "version": 1,
+        "text": "结束回合前比较扣除格挡后的来伤与剩余血量，达到致死线先检查保命手段。",
+        "kind": "player_correction",
+        "status": "active",
+        "conditions": {
+          "actions": [
+            "end_turn"
+          ]
+        },
+        "reads": 0,
+        "applicable_turns": 0,
+        "adoptions": 0,
+        "completed": 0,
+        "source": {
+          "run_id": "r",
+          "turn_id": "r:1:turn:2",
+          "action_id": null,
+          "message": "刚才应该先检查其他保命手段。",
+          "request_id": "1"
+        }
+      }
+    ],
+    "events": [],
+    "storage_error": "",
+    "interpretation": "applicable_turns为发生决策且匹配的回合数，reads为提供给模型次数，adoptions为关联动作，completed为实际完成；打法改善结合来源案例和结果比较。"
+  },
+  "effects": [
+    {
+      "run_id": "r",
+      "turns": 2,
+      "cases": 1,
+      "reviews": 2,
+      "action_statuses": {
+        "completed": 1
+      },
+      "outcomes": {
+        "before": {
+          "hp": "5/75"
+        },
+        "after": {
+          "screen": "GAME_OVER",
+          "floor": null,
+          "character": null,
+          "hp": null,
+          "player": {},
+          "enemies": []
+        }
+      },
+      "latency": [
+        {
+          "configuration": "bc22ac8c3857",
+          "path": "model",
+          "outcome": "reply_or_wait",
+          "samples": 1,
+          "timings": {
+            "refresh_ms": {
+              "samples": 1,
+              "median_ms": 0.9,
+              "p90_ms": 0.9
+            },
+            "input_ms": {
+              "samples": 1,
+              "median_ms": 0.4,
+              "p90_ms": 0.4
+            },
+            "model_ms": {
+              "samples": 1,
+              "median_ms": 0.0,
+              "p90_ms": 0.0
+            },
+            "decision_step_ms": {
+              "samples": 1,
+              "median_ms": 12.4,
+              "p90_ms": 12.4
+            }
+          },
+          "paths": {
+            "model": 1
+          },
+          "model_calls": 2,
+          "solver_calls": 0,
+          "counts": {
+            "continuation_reused": 0,
+            "continuation_cancelled": 0,
+            "solver_cache_hits": 0,
+            "prompt_tokens": 0,
+            "cached_tokens": 0
+          },
+          "cancellation_causes": {}
+        }
+      ],
+      "storage_error": ""
+    }
+  ]
+}

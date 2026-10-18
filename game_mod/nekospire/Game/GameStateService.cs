@@ -1,5 +1,7 @@
 using System.Collections;
 using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Text.RegularExpressions;
 using Godot;
 using MegaCrit.Sts2.Core.CardSelection;
@@ -14,6 +16,8 @@ using MegaCrit.Sts2.Core.Entities.RestSite;
 using MegaCrit.Sts2.Core.Events;
 using MegaCrit.Sts2.Core.Context;
 using MegaCrit.Sts2.Core.Helpers;
+using MegaCrit.Sts2.Core.HoverTips;
+using MegaCrit.Sts2.Core.Localization;
 using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Models.Characters;
@@ -28,6 +32,7 @@ using MegaCrit.Sts2.Core.Nodes.Cards.Holders;
 using MegaCrit.Sts2.Core.Nodes.Combat;
 using MegaCrit.Sts2.Core.Nodes.CommonUi;
 using MegaCrit.Sts2.Core.Nodes.Debug.Multiplayer;
+using MegaCrit.Sts2.Core.Nodes.Events;
 using MegaCrit.Sts2.Core.Nodes.Ftue;
 using MegaCrit.Sts2.Core.Nodes.GodotExtensions;
 using MegaCrit.Sts2.Core.Nodes.Rewards;
@@ -120,6 +125,8 @@ internal static class GameStateService
             modal = modal,
             game_over = gameOver,
             main_menu = mainMenu,
+            action_results = CompanionActionResults.Observe(),
+            action_results_epoch = CompanionActionResults.Epoch,
             agent_view = BuildAgentViewPayload(
                 screen,
                 session,
@@ -133,6 +140,7 @@ internal static class GameStateService
                 map,
                 selection,
                 characterSelect,
+                multiplayerLobby,
                 timeline,
                 chest,
                 eventPayload,
@@ -436,6 +444,16 @@ internal static class GameStateService
                 name = "choose_treasure_relic",
                 requires_target = false,
                 requires_index = true
+            });
+        }
+
+        if (GetEventDialogueButton(currentScreen) != null)
+        {
+            descriptors.Add(new ActionDescriptor
+            {
+                name = "advance_event_dialogue",
+                requires_target = false,
+                requires_index = false
             });
         }
 
@@ -891,6 +909,8 @@ internal static class GameStateService
 
     public static bool CanConfirmSelection(IScreenContext? currentScreen)
     {
+        if (currentScreen is NCardGridSelectionScreen grid && TryGetGridSelectionMetadata(grid, out var gridMetadata))
+            return gridMetadata.CanConfirm;
         return TryGetCombatHandSelectionMetadata(currentScreen, out _, out var metadata) &&
             metadata.RequiresConfirmation &&
             metadata.CanConfirm;
@@ -949,9 +969,27 @@ internal static class GameStateService
         return null;
     }
 
+    public static NButton? GetEventDialogueButton(IScreenContext? currentScreen)
+    {
+        if (currentScreen is not NEventRoom { Layout: NAncientEventLayout layout })
+        {
+            return null;
+        }
+
+        var button = typeof(NAncientEventLayout)
+            .GetField("_dialogueHitbox", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(layout) as NButton;
+        return button != null && GodotObject.IsInstanceValid(button) && button.IsVisibleInTree() && button.IsEnabled
+            ? button : null;
+    }
+
     public static bool CanChooseEventOption(IScreenContext? currentScreen)
     {
         if (currentScreen is not NEventRoom)
+        {
+            return false;
+        }
+
+        if (GetEventDialogueButton(currentScreen) != null)
         {
             return false;
         }
@@ -1434,7 +1472,7 @@ internal static class GameStateService
 
     public static IReadOnlyList<NCardHolder> GetDeckSelectionOptions(IScreenContext? currentScreen)
     {
-        if (currentScreen is NCardsViewScreen)
+        if (currentScreen is NCardsViewScreen or NCardPileScreen)
         {
             return Array.Empty<NCardHolder>();
         }
@@ -1565,6 +1603,35 @@ internal static class GameStateService
         const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
         var field = typeof(NPlayerHand).GetField("_selectedCards", flags);
         return field?.GetValue(hand) is System.Collections.ICollection collection ? collection.Count : 0;
+    }
+
+    public static IReadOnlySet<CardModel> GetSelectedCards(IScreenContext? screen)
+    {
+        var owner = TryGetCombatHandSelection(screen, out var hand) ? (object)hand! : screen;
+        for (var type = owner?.GetType(); type != null; type = type.BaseType)
+        {
+            var field = type.GetField("_selectedCards", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+            if (field?.GetValue(owner) is IEnumerable<CardModel> cards)
+                return cards.ToHashSet();
+        }
+        return new HashSet<CardModel>();
+    }
+
+    public static bool TryGetGridSelectionMetadata(NCardGridSelectionScreen screen, out CombatHandSelectionMetadata metadata)
+    {
+        for (var type = screen.GetType(); type != null; type = type.BaseType)
+        {
+            var field = type.GetField("_prefs", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+            if (field?.GetValue(screen) is not CardSelectorPrefs prefs)
+                continue;
+            var selected = GetSelectedCards(screen).Count;
+            var canConfirm = selected >= prefs.MinSelect && FindDescendants<NConfirmButton>(screen)
+                .Any(button => button.IsVisibleInTree() && button.IsEnabled);
+            metadata = new(prefs.MinSelect, prefs.MaxSelect, selected, true, canConfirm);
+            return true;
+        }
+        metadata = default;
+        return false;
     }
 
     private static bool TryGetCombatHandConfirmButton(NPlayerHand hand, out NConfirmButton? confirmButton)
@@ -1790,7 +1857,21 @@ internal static class GameStateService
             return string.Empty;
         }
 
-        var normalized = Regex.Replace(value, @"\[(?:/?[^\]]+)\]", string.Empty);
+        // 富文本图标的内容本身就是资源路径，先还原语义，再去掉标签。
+        var normalized = Regex.Replace(value, @"res://[\w/.-]+\.(?:png|svg|webp)", match =>
+        {
+            var icon = Path.GetFileNameWithoutExtension(match.Value);
+            if (icon.EndsWith("energy_icon", StringComparison.Ordinal))
+                return "能量";
+            return icon switch
+            {
+                "star_icon" => "星星", "gold_icon" => "金币", "card_icon" => "卡牌",
+                "potion_icon" => "药水", "chest_icon" => "宝箱",
+                _ => icon.Replace("_icon", "").Replace('_', ' ')
+            };
+        });
+        normalized = Regex.Replace(normalized, @"\[(?:/?[^\]]+)\]", string.Empty);
+        normalized = Regex.Replace(normalized, @"(?:能量){2,}", match => $"{match.Value.Length / 2}能量");
         normalized = Regex.Replace(normalized, @"\s+", " ");
         return normalized.Trim();
     }
@@ -1828,12 +1909,18 @@ internal static class GameStateService
 
     public static NButton? GetCardsViewBackButton(IScreenContext? currentScreen)
     {
-        if (currentScreen is not NCardsViewScreen cardsViewScreen)
+        if (currentScreen is not NCardsViewScreen && currentScreen is not NCardPileScreen && currentScreen is not NDeckUpgradeSelectScreen)
         {
             return null;
         }
 
-        var backButton = cardsViewScreen.GetNodeOrNull<NButton>("BackButton");
+        var backButton = currentScreen switch
+        {
+            NCardPileScreen pileScreen => typeof(NCardPileScreen).GetField("_backButton", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(pileScreen) as NButton,
+            NDeckUpgradeSelectScreen upgradeScreen => upgradeScreen.GetNodeOrNull<NButton>("%Close"),
+            NCardsViewScreen cardsScreen => cardsScreen.GetNodeOrNull<NButton>("BackButton"),
+            _ => null
+        };
         return backButton != null &&
             GodotObject.IsInstanceValid(backButton) &&
             backButton.IsVisibleInTree() &&
@@ -2251,6 +2338,11 @@ internal static class GameStateService
             names.Add("choose_treasure_relic");
         }
 
+        if (GetEventDialogueButton(currentScreen) != null)
+        {
+            names.Add("advance_event_dialogue");
+        }
+
         if (CanChooseEventOption(currentScreen))
         {
             names.Add("choose_event_option");
@@ -2438,6 +2530,18 @@ internal static class GameStateService
         CombatEnemyPayload[] enemies)
     {
         var risks = new List<CombatLethalRiskPayload>();
+        // 口径：只比"敌人意图合计伤害 vs 当前格挡"。结束回合补格挡（冰球被动）、自身毒结算、
+        // 本回合后续击杀攻击者等都没有计入，如实列进 unmodeled，避免下游把"没算"当成"安全"（Q09）。
+        var unmodeled = new List<string>();
+        if (player.orbs.Any(orb => orb.orb_id.Contains("FROST", StringComparison.OrdinalIgnoreCase)))
+        {
+            unmodeled.Add("frost_orb_passive_block");
+        }
+        if (player.powers.Any(power => power.power_id.Contains("POISON", StringComparison.OrdinalIgnoreCase)))
+        {
+            unmodeled.Add("self_poison_tick");
+        }
+        const string assumes = "enemy_intent_total_vs_current_block";
         var incomingDamage = enemies
             .Where(enemy => enemy.is_alive)
             .SelectMany(enemy => enemy.intents)
@@ -2457,7 +2561,9 @@ internal static class GameStateService
                     incoming_damage = incomingDamage,
                     damage_after_block = damageAfterBlock,
                     player_hp = player.current_hp,
-                    player_block = player.block
+                    player_block = player.block,
+                    assumes = assumes,
+                    unmodeled = unmodeled.ToArray()
                 });
             }
         }
@@ -2478,7 +2584,9 @@ internal static class GameStateService
                 player_hp = player.current_hp,
                 player_block = player.block,
                 power_id = power.power_id,
-                power_amount = amount
+                power_amount = amount,
+                assumes = assumes,
+                unmodeled = unmodeled.ToArray()
             });
         }
 
@@ -2556,6 +2664,7 @@ internal static class GameStateService
         MapPayload? map,
         SelectionPayload? selection,
         CharacterSelectPayload? characterSelect,
+        MultiplayerLobbyPayload? multiplayerLobby,
         TimelinePayload? timeline,
         ChestPayload? chest,
         EventPayload? eventPayload,
@@ -2581,7 +2690,7 @@ internal static class GameStateService
             run = BuildAgentRunPayload(combatState, runState, run, glossaryTerms),
             map = BuildAgentMapPayload(map),
             selection = BuildAgentSelectionPayload(selection, glossaryTerms),
-            character_select = BuildAgentCharacterSelectPayload(characterSelect),
+            character_select = BuildAgentCharacterSelectPayload(characterSelect, multiplayerLobby),
             timeline = BuildAgentTimelinePayload(timeline),
             chest = BuildAgentChestPayload(chest),
             @event = BuildAgentEventPayload(eventPayload),
@@ -2741,7 +2850,8 @@ internal static class GameStateService
             max = selection.max_select,
             selected = selection.selected_count,
             confirm = selection.can_confirm,
-            cards = selection.cards.Select(card => BuildAgentChoiceCardPayload(card.index, card.name, card.upgraded, card.energy_cost, card.star_cost, card.costs_x, card.star_costs_x, GetPreferredCardRulesText(card.rules_text, card.resolved_rules_text), glossaryTerms)).ToArray()
+            can_cancel = selection.can_cancel,
+            cards = selection.cards.Select(card => BuildAgentChoiceCardPayload(card.index, card.name, card.upgraded, card.energy_cost, card.star_cost, card.costs_x, card.star_costs_x, GetPreferredCardRulesText(card.rules_text, card.resolved_rules_text), glossaryTerms, card.selected)).ToArray()
         };
     }
 
@@ -2807,10 +2917,17 @@ internal static class GameStateService
             id = eventPayload.event_id,
             title = eventPayload.title,
             finished = eventPayload.is_finished,
+            is_shared = eventPayload.is_shared,
+            page_index = eventPayload.page_index,
+            local_vote = eventPayload.local_vote,
+            player_votes = eventPayload.player_votes,
+            dialogue_pending = eventPayload.dialogue_pending,
+            dialogue_line = eventPayload.dialogue_line,
             options = eventPayload.options.Select(option => new
             {
                 i = option.index,
                 line = FormatEventOptionLine(option),
+                relic_preview = option.relic_preview,
                 locked = option.is_locked,
                 proceed = option.is_proceed
             }).ToArray()
@@ -2846,6 +2963,7 @@ internal static class GameStateService
             {
                 i = relic.index,
                 line = $"{relic.name} [{relic.rarity}] | {relic.price}g",
+                effect = NormalizeCardRulesText(relic.description ?? string.Empty),
                 affordable = relic.enough_gold,
                 stocked = relic.is_stocked
             }).ToArray(),
@@ -2853,6 +2971,7 @@ internal static class GameStateService
             {
                 i = potion.index,
                 line = $"{potion.name ?? "空"}{(string.IsNullOrWhiteSpace(potion.usage) ? string.Empty : $"：{potion.usage}")} | {potion.price}g",
+                effect = NormalizeCardRulesText(potion.description ?? string.Empty),
                 affordable = potion.enough_gold,
                 stocked = potion.is_stocked
             }).ToArray(),
@@ -2926,19 +3045,19 @@ internal static class GameStateService
         };
     }
 
-    private static object? BuildAgentCharacterSelectPayload(CharacterSelectPayload? characterSelect)
+    private static object? BuildAgentCharacterSelectPayload(CharacterSelectPayload? characterSelect, MultiplayerLobbyPayload? multiplayerLobby)
     {
-        if (characterSelect == null)
+        if (characterSelect == null && multiplayerLobby == null)
         {
             return null;
         }
 
         return new
         {
-            selected = characterSelect.selected_character_id,
-            embark = characterSelect.can_embark,
-            ascension = characterSelect.ascension,
-            characters = characterSelect.characters.Select(character => new
+            selected = characterSelect?.selected_character_id ?? multiplayerLobby?.selected_character_id,
+            embark = characterSelect?.can_embark ?? false,
+            ascension = characterSelect?.ascension,
+            characters = (characterSelect?.characters ?? multiplayerLobby!.characters).Select(character => new
             {
                 i = character.index,
                 line = character.is_random ? $"{character.name} (随机)" : character.name,
@@ -2982,7 +3101,8 @@ internal static class GameStateService
             relics = chest.relic_options.Select(relic => new
             {
                 i = relic.index,
-                line = $"{relic.name} [{relic.rarity}]"
+                line = $"{relic.name} [{relic.rarity}]",
+                effect = NormalizeCardRulesText(relic.description ?? string.Empty)
             }).ToArray()
         };
     }
@@ -3053,7 +3173,8 @@ internal static class GameStateService
         bool costsX,
         bool starCostsX,
         string rulesText,
-        HashSet<string> glossaryTerms)
+        HashSet<string> glossaryTerms,
+        bool? selected = null)
     {
         var keywords = GetGlossaryMatches(rulesText);
         CollectGlossaryTerms(glossaryTerms, rulesText);
@@ -3061,6 +3182,7 @@ internal static class GameStateService
         return new
         {
             i = index,
+            selected,
             line = FormatCardLine(name, upgraded, 1, energyCost, starCost, costsX, starCostsX, rulesText),
             keywords,
             mods = Array.Empty<string>()
@@ -3251,6 +3373,51 @@ internal static class GameStateService
         }
 
         return string.Join(" | ", segments);
+    }
+
+    private static string FormatEventText(LocString? source, EventModel model)
+    {
+        if (source == null) return string.Empty;
+        // 首次捕获可能早于界面给LocString补变量；只格式化副本，不改变事件状态。
+        var text = new LocString(source.LocTable, source.LocEntryKey);
+        foreach (var variable in model.DynamicVars.Values) text.Add(variable);
+        text.Add("IsMultiplayer", model.Owner?.RunState.Players.Count > 1);
+        text.AddVariablesFrom(source);
+        return text.GetFormattedText();
+    }
+
+    internal static object[] BuildRelatedEffects(object model, object? linkedModel = null)
+    {
+        var effects = new Dictionary<string, object>();
+        foreach (var source in new[] { model, linkedModel }.Where(value => value != null))
+        {
+            if (GetReflectedProperty(source!, "HoverTips") is not IEnumerable tips) continue;
+            foreach (var value in tips)
+            {
+                if (value is not IHoverTip tip) continue;
+                string kind, id, name, description;
+                if (tip is CardHoverTip cardTip)
+                {
+                    var card = cardTip.Card;
+                    kind = "card"; id = card.Id.Entry; name = card.Title;
+                    description = GetResolvedCardRulesText(card);
+                }
+                else if (tip.CanonicalModel is EnchantmentModel enchantment)
+                {
+                    kind = "enchantment"; id = enchantment.Id.Entry;
+                    name = enchantment.Title.GetFormattedText();
+                    description = (tip is HoverTip enchantmentTip ? enchantmentTip.Description : null)
+                        ?? GetDynamicFormattedTextProperty(enchantment, "DynamicDescription", "Description") ?? string.Empty;
+                }
+                else if (tip is HoverTip hover && tip.CanonicalModel is not RelicModel)
+                {
+                    kind = "effect"; id = tip.Id; name = hover.Title ?? string.Empty; description = hover.Description ?? string.Empty;
+                }
+                else continue;
+                effects[kind + ":" + id] = new { kind, id, name, description };
+            }
+        }
+        return effects.Values.ToArray();
     }
 
     private static object[] BuildStructuredPileCards(CardModel[] cards)
@@ -3734,12 +3901,16 @@ internal static class GameStateService
             return null;
         }
 
-        var combatHandSelection = TryGetCombatHandSelectionMetadata(currentScreen, out _, out var metadata)
-            ? metadata
-            : default;
+        var hasMetadata = TryGetCombatHandSelectionMetadata(currentScreen, out _, out var metadata);
+        if (!hasMetadata && currentScreen is NCardGridSelectionScreen grid)
+            hasMetadata = TryGetGridSelectionMetadata(grid, out metadata);
+        if (!hasMetadata)
+            metadata = new(1, 1, 0, false, false);
+        var selected = GetSelectedCards(currentScreen);
 
         return new SelectionPayload
         {
+            selection_id = currentScreen is GodotObject node ? node.GetInstanceId().ToString() : string.Empty,
             kind = currentScreen switch
             {
                 NDeckUpgradeSelectScreen => "deck_upgrade_select",
@@ -3752,12 +3923,13 @@ internal static class GameStateService
                 _ => "deck_card_select"
             },
             prompt = GetDeckSelectionPrompt(currentScreen) ?? string.Empty,
-            min_select = combatHandSelection.MinSelect,
-            max_select = combatHandSelection.MaxSelect,
-            selected_count = combatHandSelection.SelectedCount,
-            requires_confirmation = combatHandSelection.RequiresConfirmation,
-            can_confirm = combatHandSelection.CanConfirm,
-            cards = cards.Select((holder, index) => BuildSelectionCardPayload(holder.CardModel!, index)).ToArray()
+            min_select = metadata.MinSelect,
+            max_select = metadata.MaxSelect,
+            selected_count = metadata.SelectedCount,
+            requires_confirmation = metadata.RequiresConfirmation,
+            can_confirm = metadata.CanConfirm,
+            can_cancel = CanCloseCardsView(currentScreen),
+            cards = cards.Select((holder, index) => BuildSelectionCardPayload(holder.CardModel!, index, selected.Contains(holder.CardModel!))).ToArray()
         };
     }
 
@@ -3869,22 +4041,45 @@ internal static class GameStateService
                     {
                         index = i,
                         text_key = SafeReadString(() => opt.TextKey),
-                        title = SafeReadString(() => opt.Title?.GetFormattedText()),
-                        description = SafeReadString(() => opt.Description?.GetFormattedText()),
+                        title = SafeReadString(() => FormatEventText(opt.Title, eventModel)),
+                        description = SafeReadString(() => FormatEventText(opt.Description, eventModel)),
+                        related_effects = BuildRelatedEffects(opt, opt.Relic),
                         is_locked = SafeReadBool(() => opt.IsLocked),
                         is_proceed = SafeReadBool(() => opt.IsProceed),
                         will_kill_player = GetEventOptionWillKillPlayer(eventModel, opt),
-                        has_relic_preview = GetReflectedProperty(opt, "Relic") != null
+                        has_relic_preview = GetReflectedProperty(opt, "Relic") != null,
+                        relic_preview = GetReflectedProperty(opt, "Relic") is RelicModel preview
+                            ? BuildRunRelicPayload(preview, i) : null
                     });
                 }
             }
 
+            var synchronizer = RunManager.Instance.EventSynchronizer;
+            var runState = RunManager.Instance.DebugOnlyGetState();
+            var localPlayer = GetLocalPlayer(runState);
+            var votes = synchronizer.IsShared && runState != null
+                ? runState.Players.Select(player => new EventPlayerVotePayload
+                {
+                    player_id = NetIdToString(player.NetId),
+                    is_local = localPlayer != null && player.NetId == localPlayer.NetId,
+                    option_index = synchronizer.GetPlayerVote(player)
+                }).ToArray()
+                : Array.Empty<EventPlayerVotePayload>();
             return new EventPayload
             {
                 event_id = SafeReadString(() => eventModel.Id?.Entry, "unknown"),
                 title = SafeReadString(() => eventModel.Title?.GetFormattedText()),
                 description = SafeReadString(() => eventModel.Description?.GetFormattedText()),
                 is_finished = SafeReadBool(() => eventModel.IsFinished),
+                is_shared = synchronizer.IsShared,
+                page_index = (uint?)typeof(MegaCrit.Sts2.Core.Multiplayer.Game.EventSynchronizer)
+                    .GetField("_pageIndex", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(synchronizer),
+                local_vote = votes.FirstOrDefault(vote => vote.is_local)?.option_index,
+                player_votes = votes,
+                dialogue_pending = GetEventDialogueButton(currentScreen) != null,
+                dialogue_line = currentScreen is NEventRoom { Layout: NAncientEventLayout layout }
+                    ? (int?)typeof(NAncientEventLayout).GetField("_currentDialogueLine", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(layout)
+                    : null,
                 options = options.ToArray()
             };
         }
@@ -4069,7 +4264,9 @@ internal static class GameStateService
             index = index,
             relic_id = relic.Id.Entry,
             name = relic.Title.GetFormattedText(),
-            rarity = relic.Rarity.ToString()
+            rarity = relic.Rarity.ToString(),
+            description = GetDynamicFormattedTextProperty(relic, "DynamicDescription", "Description"),
+            related_effects = BuildRelatedEffects(relic)
         }).ToArray();
     }
 
@@ -4156,7 +4353,7 @@ internal static class GameStateService
             submenu_open = submenuOpen,
             can_open_multiplayer_menu = CanOpenMultiplayerMenu(currentScreen),
             save_and_quit_available = CanSaveAndQuit(currentScreen, runState),
-            is_multiplayer_run = RunManager.Instance.NetService.Type.IsMultiplayer(),
+            is_multiplayer_run = RunManager.Instance.NetService?.Type.IsMultiplayer() ?? false,
         };
     }
 
@@ -4220,7 +4417,9 @@ internal static class GameStateService
         {
             index = index,
             card_id = card.Id.Entry,
+            entity_id = GetCardEntityId(card),
             name = card.Title,
+            card_type = card.Type.ToString(),
             upgraded = card.IsUpgraded,
             target_type = card.TargetType.ToString(),
             requires_target = CardRequiresTarget(card),
@@ -4240,6 +4439,16 @@ internal static class GameStateService
         };
     }
 
+    private sealed record EnemyIdentity(string Value);
+    private static readonly ConditionalWeakTable<Creature, EnemyIdentity> EnemyIdentities = new();
+    private static readonly ConditionalWeakTable<CardModel, EnemyIdentity> CardIdentities = new();
+    private static readonly string EntitySession = Guid.NewGuid().ToString("N");
+    private static long _enemyIdentityCounter;
+    public static string GetEnemyEntityId(Creature enemy) =>
+        EnemyIdentities.GetValue(enemy, _ => new EnemyIdentity($"{EntitySession}-enemy-{Interlocked.Increment(ref _enemyIdentityCounter)}")).Value;
+    public static string GetCardEntityId(CardModel card) =>
+        CardIdentities.GetValue(card, _ => new EnemyIdentity($"{EntitySession}-card-{Interlocked.Increment(ref _enemyIdentityCounter)}")).Value;
+
     private static CombatEnemyPayload BuildEnemyPayload(Creature enemy, int index)
     {
         var moveId = enemy.Monster?.NextMove?.Id;
@@ -4249,6 +4458,7 @@ internal static class GameStateService
         {
             index = index,
             enemy_id = enemy.ModelId.Entry,
+            entity_id = GetEnemyEntityId(enemy),
             name = enemy.Name,
             current_hp = enemy.CurrentHp,
             max_hp = enemy.MaxHp,
@@ -4311,18 +4521,163 @@ internal static class GameStateService
                 "Debuff",
                 StringComparison.Ordinal);
 
+            var description = ReadPowerDescription(power);
             result.Add(new CombatPowerPayload
             {
                 index = index,
                 power_id = string.IsNullOrWhiteSpace(idEntry) ? "unknown_power" : idEntry,
                 name = string.IsNullOrWhiteSpace(title) ? idEntry : title,
                 amount = amount,
-                is_debuff = isDebuff
+                display_amount = GetReflectedNullableIntProperty(power, "DisplayAmount"),
+                is_debuff = isDebuff,
+                description = description,
+                description_source = string.IsNullOrEmpty(description) ? "missing" : "runtime_hover_tip"
             });
             index += 1;
         }
 
         return result.ToArray();
+    }
+
+    // 当前实例的悬停说明含实战动态值；简化提示可能是固定的单人默认数值。
+    private static string ReadPowerDescription(object power)
+    {
+        var text = NormalizeCardRulesText(SafeReadString(() => ReadMatchingHoverTipDescription(power)));
+        return HasUnresolvedPlaceholder(text) ? string.Empty : text;
+    }
+
+    // Orb 的效果文本：与 Power 同一套回退，只是 OrbModel 的 DumbHoverTip 是无参属性。
+    // **不走 LocString 兜底**（allowLocString: false）：OrbModel.SmartDescription 的模板里带
+    // "{Passive}"/"{Evoke}" 这类需要 LocaString source extension 的选择器，本环境没注册该扩展，
+    // GetFormattedText() 必然失败并且**每次都在 Godot 里打印整段 C# 栈**（详见 ReadEffectDescription）。
+    private static string ReadOrbDescription(object orb) =>
+        ReadEffectDescription(orb, dumbTipTakesAmount: false, allowLocString: false);
+
+    // 效果文本：按"游戏自己的渲染路径"取，逐级回退，拿到就返回。
+    //
+    // 为什么不能只读 HoverTips[].Description：那是**未代入变量的模板**
+    // （实盘拿到 "{Amount}回合内，受到的攻击伤害增加{DamageIncrease:percentMore()}%。"），
+    // 模型看到的是占位符而不是 50%，等于没给。游戏的 DumbHoverTip / LocString.GetFormattedText()
+    // 才会把变量填进去。本方法不做任何数值推演——全都取游戏权威文本，取不到就留空。
+    private static string ReadEffectDescription(object model, bool dumbTipTakesAmount, bool allowLocString = true)
+    {
+        // **惰性回退**：逐条求值，拿到可用文本就立刻返回，不再碰后面的候选。
+        //
+        // 为什么必须惰性：LocString 的 GetFormattedText() 在代入失败时会走 Godot 的
+        // `Localization formatting error!` 并**打印整段 C# 调用栈**（不是异常、SafeReadString
+        // 拦不住）。旧实现把候选**全部**先求值再挑，于是每帧、每次 /state 都刷一遍栈；
+        // 2026-10-12 实测单次会话刷了 8658 条、godot.log 涨到 22MB，/state 明显变慢，规划期与
+        // 派发期的视图对不上就报 stale。惰性 + 按类型开关后：DumbHoverTip（①）通常第一条就命中，
+        // 根本不会去碰会报错的兜底。
+        var candidates = new List<Func<string>>
+        {
+            // ① 游戏自己填好规范数值的工具提示（DumbHoverTip）。
+            //    PowerModel 是 GetDumbHoverTip(int? amount)（传入层数才能代入 {Amount}/{percentMore()}）；
+            //    OrbModel 是无参属性 DumbHoverTip。
+            () => SafeReadString(() =>
+            {
+                object? tip;
+                if (dumbTipTakesAmount)
+                {
+                    var amount = GetReflectedNullableIntProperty(model, "DisplayAmount")
+                        ?? GetReflectedNullableIntProperty(model, "Amount");
+                    tip = InvokeReflectedMethod(model, "GetDumbHoverTip", new object?[] { amount });
+                }
+                else
+                {
+                    tip = GetReflectedProperty(model, "DumbHoverTip");
+                }
+
+                return tip == null ? string.Empty : GetReflectedStringProperty(tip, "Description") ?? string.Empty;
+            }),
+            // ② HoverTips 里与本模型同 Id 的那条（拿不到同 Id 就用第一条）。
+            () => SafeReadString(() => ReadMatchingHoverTipDescription(model)),
+        };
+
+        if (allowLocString)
+        {
+            // ③ SmartDescription / Description：LocString 调 GetFormattedText() 才是已解析文本。
+            //    只有上面两条都拿不到（例如占位符未代入）才会走到这里。
+            candidates.Add(() => SafeReadString(() => InvokeLocStringFormatted(model, "SmartDescription")));
+            candidates.Add(() => SafeReadString(() => InvokeLocStringFormatted(model, "Description")));
+        }
+
+        foreach (var candidate in candidates)
+        {
+            var normalized = NormalizeCardRulesText(candidate());
+            if (!string.IsNullOrWhiteSpace(normalized) && !HasUnresolvedPlaceholder(normalized))
+            {
+                return normalized;
+            }
+        }
+
+        // 全都带着未解析占位符：宁可不给（返回空），也别把 "{DamageIncrease:percentMore()}"
+        // 这种模板当事实喂给模型，否则它只会照着模板瞎猜一个倍率。
+        return string.Empty;
+    }
+
+    // 只读属于当前模型的提示；不借用其他关联效果的说明。
+    private static string ReadMatchingHoverTipDescription(object model)
+    {
+        if (GetReflectedProperty(model, "HoverTips") is not System.Collections.IEnumerable tips)
+        {
+            return string.Empty;
+        }
+
+        var id = GetReflectedProperty(model, "Id");
+        var modelId = SafeReadString(() => id?.ToString() ?? string.Empty);
+        var entry = id == null ? string.Empty : SafeReadString(() => GetReflectedStringProperty(id, "Entry") ?? string.Empty);
+        foreach (var tip in tips)
+        {
+            if (tip == null)
+            {
+                continue;
+            }
+
+            var description = GetReflectedStringProperty(tip, "Description") ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(description))
+            {
+                continue;
+            }
+
+            var tipId = GetReflectedStringProperty(tip, "Id") ?? string.Empty;
+            if ((!string.IsNullOrEmpty(modelId) && string.Equals(tipId, modelId, StringComparison.Ordinal))
+                || (!string.IsNullOrEmpty(entry) && string.Equals(tipId, entry, StringComparison.Ordinal)))
+            {
+                return description;
+            }
+
+        }
+
+        return string.Empty;
+    }
+
+    // LocString 的 GetFormattedText() 返回代入变量后的文本；拿不到返回空。
+    private static string InvokeLocStringFormatted(object target, string propertyName)
+    {
+        var value = GetReflectedProperty(target, propertyName);
+        if (value == null)
+        {
+            return string.Empty;
+        }
+
+        return value.GetType().GetMethod("GetFormattedText", Type.EmptyTypes)?.Invoke(value, null)?.ToString() ?? string.Empty;
+    }
+
+    // 文本里还有 {Name} / {Name:format()} 这类未代入占位符。
+    private static bool HasUnresolvedPlaceholder(string text) =>
+        Regex.IsMatch(text ?? string.Empty, @"\{[A-Za-z_][^}]*\}");
+
+    private static object? InvokeReflectedMethod(object target, string methodName, object?[] args)
+    {
+        try
+        {
+            return target.GetType().GetMethod(methodName)?.Invoke(target, args);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static CombatEnemyIntentPayload[] BuildEnemyIntentPayloads(Creature enemy)
@@ -4400,7 +4755,8 @@ internal static class GameStateService
             name = orb.Title.GetFormattedText(),
             passive_value = orb.PassiveVal,
             evoke_value = orb.EvokeVal,
-            is_front = slotIndex == 0
+            is_front = slotIndex == 0,
+            description = ReadOrbDescription(orb)
         };
     }
 
@@ -4558,7 +4914,8 @@ internal static class GameStateService
             index = index,
             reward_type = GetRewardTypeName(reward),
             description = reward?.Description.GetFormattedText() ?? string.Empty,
-            claimable = button.IsEnabled
+            claimable = button.IsEnabled && (reward is not PotionReward ||
+                GetLocalPlayer(RunManager.Instance.DebugOnlyGetState())?.HasOpenPotionSlots == true)
         };
     }
 
@@ -4605,6 +4962,7 @@ internal static class GameStateService
             relic_id = relic.Id.Entry,
             name = relic.Title.GetFormattedText(),
             description = GetDynamicFormattedTextProperty(relic, "DynamicDescription", "Description"),
+            related_effects = BuildRelatedEffects(relic),
             stack = GetReflectedNullableIntProperty(relic, "Amount"),
             is_melted = relic.IsMelted
         };
@@ -4668,13 +5026,13 @@ internal static class GameStateService
 
         try
         {
-            var getRawText = value.GetType().GetMethod("GetRawText", Type.EmptyTypes);
-            if (getRawText != null)
+            var getFormattedText = value.GetType().GetMethod("GetFormattedText", Type.EmptyTypes);
+            if (getFormattedText != null)
             {
-                return getRawText.Invoke(value, null)?.ToString();
+                return getFormattedText.Invoke(value, null)?.ToString();
             }
 
-            return value.GetType().GetMethod("GetFormattedText")?.Invoke(value, null)?.ToString();
+            return value.GetType().GetMethod("GetRawText", Type.EmptyTypes)?.Invoke(value, null)?.ToString();
         }
         catch
         {
@@ -4796,7 +5154,12 @@ internal static class GameStateService
             energy = player.PlayerCombatState?.Energy ?? 0,
             stars = player.PlayerCombatState?.Stars ?? 0,
             focus = player.Creature.GetPowerAmount<FocusPower>(),
-            is_alive = player.Creature.IsAlive
+            powers = BuildCreaturePowerPayloads(player.Creature),
+            hand = (player.PlayerCombatState?.Hand.Cards.ToList() ?? new List<CardModel>())
+                .Select((card, index) => BuildHandCardPayload(combatState, card, index)).ToArray(),
+            is_alive = player.Creature.IsAlive,
+            is_action_phase = IsPlayerActionPhaseFor(combatState, player),
+            ready_to_end_turn = CombatManager.Instance.IsPlayerReadyToEndTurn(player)
         };
     }
 
@@ -4854,9 +5217,11 @@ internal static class GameStateService
             max_hp = summary.max_hp,
             block = summary.block,
             energy = summary.energy,
+            powers = summary.powers,
             stars = summary.stars,
             is_alive = summary.is_alive,
             is_action_phase = IsPlayerActionPhaseFor(combatState, player),
+            ready_to_end_turn = CombatManager.Instance.IsPlayerReadyToEndTurn(player),
             hand = hand.Select((card, index) => BuildHandCardPayload(combatState, card, index)).ToArray()
         };
     }
@@ -4945,6 +5310,8 @@ internal static class GameStateService
             relic_id = relic?.Id.Entry ?? string.Empty,
             name = relic?.Title.GetFormattedText() ?? string.Empty,
             rarity = relic?.Rarity.ToString() ?? string.Empty,
+            description = relic != null ? GetDynamicFormattedTextProperty(relic, "DynamicDescription", "Description") : null,
+            related_effects = relic != null ? BuildRelatedEffects(relic) : Array.Empty<object>(),
             price = entry.IsStocked ? entry.Cost : 0,
             is_stocked = entry.IsStocked,
             enough_gold = entry.IsStocked && entry.EnoughGold
@@ -4960,6 +5327,7 @@ internal static class GameStateService
             potion_id = potion?.Id.Entry,
             name = potion?.Title.GetFormattedText(),
             rarity = potion?.Rarity.ToString(),
+            description = potion != null ? GetDynamicFormattedTextProperty(potion, "DynamicDescription", "Description") : null,
             usage = potion?.Usage.ToString(),
             price = entry.IsStocked ? entry.Cost : 0,
             is_stocked = entry.IsStocked,
@@ -5012,13 +5380,15 @@ internal static class GameStateService
         };
     }
 
-    private static SelectionCardPayload BuildSelectionCardPayload(CardModel card, int index)
+    private static SelectionCardPayload BuildSelectionCardPayload(CardModel card, int index, bool selected)
     {
         var resolvedRulesText = GetResolvedCardRulesText(card);
         var dynamicValues = BuildCardDynamicValuePayloads(card);
         return new SelectionCardPayload
         {
             index = index,
+            entity_id = GetCardEntityId(card),
+            selected = selected,
             card_id = card.Id.Entry,
             name = card.Title,
             upgraded = card.IsUpgraded,
@@ -5080,7 +5450,7 @@ internal static class GameStateService
 
     private static bool CanDiscardPotionsInCurrentScreen(IScreenContext? currentScreen)
     {
-        return currentScreen is not (NRewardsScreen or NCardRewardSelectionScreen);
+        return currentScreen is not NCardRewardSelectionScreen;
     }
 
     private static bool IsPotionDiscardable(Player player, PotionModel? potion)
@@ -5564,7 +5934,7 @@ internal static class GameStateService
             return "CARD_SELECTION";
         }
 
-        if (currentScreen is NCardsViewScreen)
+        if (currentScreen is NCardsViewScreen or NCardPileScreen)
         {
             return "CARDS_VIEW";
         }
@@ -5735,6 +6105,9 @@ internal sealed class GameStatePayload
     public int? turn { get; init; }
 
     public string[] available_actions { get; init; } = Array.Empty<string>();
+
+    public IReadOnlyList<CompanionActionResult> action_results { get; init; } = [];
+    public string action_results_epoch { get; init; } = "";
 
     public CombatPayload? combat { get; init; }
 
@@ -5961,6 +6334,8 @@ internal sealed class MapPayload
 
 internal sealed class SelectionPayload
 {
+    public string selection_id { get; init; } = string.Empty;
+
     public string kind { get; init; } = string.Empty;
 
     public string prompt { get; init; } = string.Empty;
@@ -5974,6 +6349,8 @@ internal sealed class SelectionPayload
     public bool requires_confirmation { get; init; }
 
     public bool can_confirm { get; init; }
+
+    public bool can_cancel { get; init; }
 
     public SelectionCardPayload[] cards { get; init; } = Array.Empty<SelectionCardPayload>();
 }
@@ -6093,6 +6470,7 @@ internal sealed class ChestPayload
 
 internal sealed class ChestRelicOptionPayload
 {
+    public object[] related_effects { get; init; } = Array.Empty<object>();
     public int index { get; init; }
 
     public string relic_id { get; init; } = string.Empty;
@@ -6100,6 +6478,8 @@ internal sealed class ChestRelicOptionPayload
     public string name { get; init; } = string.Empty;
 
     public string rarity { get; init; } = string.Empty;
+
+    public string? description { get; init; }
 }
 
 internal sealed class EventPayload
@@ -6112,11 +6492,33 @@ internal sealed class EventPayload
 
     public bool is_finished { get; init; }
 
+    public bool is_shared { get; init; }
+
+    public uint? page_index { get; init; }
+
+    public uint? local_vote { get; init; }
+
+    public EventPlayerVotePayload[] player_votes { get; init; } = Array.Empty<EventPlayerVotePayload>();
+
+    public bool dialogue_pending { get; init; }
+
+    public int? dialogue_line { get; init; }
+
     public EventOptionPayload[] options { get; init; } = Array.Empty<EventOptionPayload>();
+}
+
+internal sealed class EventPlayerVotePayload
+{
+    public string player_id { get; init; } = string.Empty;
+
+    public bool is_local { get; init; }
+
+    public uint? option_index { get; init; }
 }
 
 internal sealed class EventOptionPayload
 {
+    public object[] related_effects { get; init; } = Array.Empty<object>();
     public int index { get; init; }
 
     public string text_key { get; init; } = string.Empty;
@@ -6132,6 +6534,8 @@ internal sealed class EventOptionPayload
     public bool will_kill_player { get; init; }
 
     public bool has_relic_preview { get; init; }
+
+    public RunRelicPayload? relic_preview { get; init; }
 }
 
 internal sealed class RestPayload
@@ -6218,6 +6622,7 @@ internal sealed class ShopCardPayload
 
 internal sealed class ShopRelicPayload
 {
+    public object[] related_effects { get; init; } = Array.Empty<object>();
     public int index { get; init; }
 
     public string relic_id { get; init; } = string.Empty;
@@ -6225,6 +6630,8 @@ internal sealed class ShopRelicPayload
     public string name { get; init; } = string.Empty;
 
     public string rarity { get; init; } = string.Empty;
+
+    public string? description { get; init; }
 
     public int price { get; init; }
 
@@ -6242,6 +6649,8 @@ internal sealed class ShopPotionPayload
     public string? name { get; init; }
 
     public string? rarity { get; init; }
+
+    public string? description { get; init; }
 
     public string? usage { get; init; }
 
@@ -6360,6 +6769,9 @@ internal sealed class CombatPlayerPayload
 
 internal sealed class CombatPlayerSummaryPayload
 {
+    public bool is_action_phase { get; init; }
+
+    public bool ready_to_end_turn { get; init; }
     public string player_id { get; init; } = string.Empty;
 
     public int slot_index { get; init; }
@@ -6383,6 +6795,10 @@ internal sealed class CombatPlayerSummaryPayload
     public int stars { get; init; }
 
     public int focus { get; init; }
+
+    public CombatPowerPayload[] powers { get; init; } = Array.Empty<CombatPowerPayload>();
+
+    public CombatHandCardPayload[] hand { get; init; } = Array.Empty<CombatHandCardPayload>();
 
     public bool is_alive { get; init; }
 }
@@ -6408,6 +6824,7 @@ internal sealed class CoopStatePayload
 
 internal sealed class CoopPlayerPayload
 {
+    public bool ready_to_end_turn { get; init; }
     public string player_id { get; init; } = string.Empty;
 
     public int slot_index { get; init; }
@@ -6427,6 +6844,8 @@ internal sealed class CoopPlayerPayload
     public int block { get; init; }
 
     public int energy { get; init; }
+
+    public CombatPowerPayload[] powers { get; init; } = Array.Empty<CombatPowerPayload>();
 
     public int stars { get; init; }
 
@@ -6473,11 +6892,19 @@ internal sealed class CombatOrbPayload
     public decimal evoke_value { get; init; }
 
     public bool is_front { get; init; }
+
+    // 效果文本（如“被动：造成3点伤害。激发：造成8点伤害。”）。此前只有名字+数值，
+    // 模型不知道这个球"做什么"（如"电球"=闪电球每回合被动打3、激发打8）。
+    public string description { get; init; } = string.Empty;
 }
 
 internal sealed class CombatHandCardPayload
 {
     public int index { get; init; }
+
+    public string entity_id { get; init; } = string.Empty;
+
+    public string card_type { get; init; } = string.Empty;
 
     public string card_id { get; init; } = string.Empty;
 
@@ -6515,6 +6942,8 @@ internal sealed class CombatHandCardPayload
 internal sealed class CombatEnemyPayload
 {
     public int index { get; init; }
+
+    public string entity_id { get; init; } = string.Empty;
 
     public string enemy_id { get; init; } = string.Empty;
 
@@ -6577,6 +7006,12 @@ internal sealed class CombatLethalRiskPayload
     public string? power_id { get; init; }
 
     public int? power_amount { get; init; }
+
+    // 本口径实际比较了什么；下游据此说明"这是意图伤害对当前格挡"，而不是全量结算模拟。
+    public string? assumes { get; init; }
+
+    // 本次没有计入的结束回合结算（冰球被动补格挡、自身毒、计划内提前击杀等）。
+    public string[] unmodeled { get; init; } = Array.Empty<string>();
 }
 
 internal sealed class CombatPowerPayload
@@ -6589,7 +7024,15 @@ internal sealed class CombatPowerPayload
 
     public int? amount { get; init; }
 
+    public int? display_amount { get; init; }
+
+    public string description_source { get; init; } = "missing";
+
     public bool is_debuff { get; init; }
+
+    // 效果文本（如“受到的攻击伤害提高 50%”）。此前只输出 name+amount，模型据此只能猜倍率
+    // （易伤是 ×1.5 还是 ×2）。取游戏权威来源，拿不到就留空，绝不臆造数值。
+    public string description { get; init; } = string.Empty;
 }
 
 internal sealed class RewardPayload
@@ -6716,6 +7159,10 @@ internal sealed class SelectionCardPayload
 {
     public int index { get; init; }
 
+    public string entity_id { get; init; } = string.Empty;
+
+    public bool selected { get; init; }
+
     public string card_id { get; init; } = string.Empty;
 
     public string name { get; init; } = string.Empty;
@@ -6758,6 +7205,7 @@ internal sealed class CardDynamicValuePayload
 
 internal sealed class RunRelicPayload
 {
+    public object[] related_effects { get; init; } = Array.Empty<object>();
     public int index { get; init; }
 
     public string relic_id { get; init; } = string.Empty;

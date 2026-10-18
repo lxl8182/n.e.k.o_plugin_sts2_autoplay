@@ -45,8 +45,8 @@ internal static class CardGenerationPotionMirrors
         else
         {
             context.History.CardGenerationOptions(result.Cards);
-            // The options are deterministic, but the selected card and its addition to hand remain unresolved.
-            context.History.RecordRisk(PredictionRiskReason.UnresolvedPlayerChoice);
+            // The options are deterministic and the search branches over them via CardGenerationOptions.
+            context.History.RecordRisk(PredictionRiskReason.ModeledPlayerChoice);
         }
     }
 

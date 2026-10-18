@@ -228,9 +228,9 @@ internal static class CardSelectionCardMirrors
         {
             if (!context.OwnerState.Hand.IsEmpty)
             {
-                // Vanilla asks the player which hand card to exhaust. The choice and resulting
-                // pile state cannot be determined during prediction.
-                context.History.RecordRisk(PredictionRiskReason.UnresolvedPlayerChoice);
+                // Vanilla asks the player which hand card to exhaust. 选项已枚举，搜索按
+                // CardChoiceSupport 的 TrueGrit 规格分支，属已建模的不确定。
+                context.History.RecordRisk(PredictionRiskReason.ModeledPlayerChoice);
             }
             return;
         }

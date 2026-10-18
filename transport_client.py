@@ -72,6 +72,7 @@ class STS2TransportClient:
         self.base_url = base_url.rstrip("/")
         self.connect_timeout = connect_timeout
         self.request_timeout = request_timeout
+        self._effect_catalogs: dict[str, dict[str, Any]] = {}
 
     async def close(self) -> None:
         return None
@@ -80,17 +81,44 @@ class STS2TransportClient:
         return await self._request("GET", "/health")
 
     async def get_state(self) -> Dict[str, Any]:
-        return await self._request("GET", "/state")
+        state = await self._request("GET", "/state")
+        # 旧 Mod 的候选物品缺说明，按游戏自己的稳定 ID 补齐；新版现场说明优先。
+        for collection, id_key, items in (
+            ("relics", "relic_id", (state.get("chest") or {}).get("relic_options") or []),
+            ("relics", "relic_id", (state.get("shop") or {}).get("relics") or []),
+            ("potions", "potion_id", (state.get("shop") or {}).get("potions") or []),
+        ):
+            missing = [item for item in items if item.get(id_key) and not item.get("description")]
+            if not missing:
+                continue
+            if collection not in self._effect_catalogs:
+                try:
+                    exported = await self._request("GET", "/data/" + collection)
+                except STS2TransportError as exc:
+                    # 补充说明失败时保留可读现场，并向模型暴露具体缺项。
+                    for item in missing:
+                        item["effect_error"] = str(exc)
+                    continue
+                self._effect_catalogs[collection] = {item["id"]: item for item in exported.get("value") or []}
+            for item in missing:
+                source = self._effect_catalogs[collection].get(item[id_key]) or {}
+                if source.get("description"):
+                    item["description"] = source["description"]
+                if source.get("related_effects") and not item.get("related_effects"):
+                    item["related_effects"] = source["related_effects"]
+        return state
 
     async def get_available_actions(self) -> Dict[str, Any]:
         return await self._request("GET", "/actions/available")
 
-    async def get_combat_plan(self) -> Dict[str, Any]:
+    async def get_combat_plan(self, *, companion: bool = False) -> Dict[str, Any]:
         """Read the mod's authoritative combat solver plan (GET /solver/plan).
 
         Returns the SolverPlanPayload (in_combat/action/card_index/card_id/target_index/line),
         or {"in_combat": false, "reason": "..."} when not in combat.
         """
+        if companion:
+            return await self._request("GET", "/solver/plan", params={"mode": "companion"}, timeout=8.0)
         return await self._request("GET", "/solver/plan")
 
     async def execute_action(self, action: str, **kwargs: Any) -> Dict[str, Any]:
@@ -176,6 +204,10 @@ class STS2TransportClient:
         scrolling for up to ~20s, which reads as "关不掉".
         """
         return await self._request("POST", "/danmaku/clear", json={})
+
+    async def set_companion_status(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        """Refresh the host's fixed status lease; revision is monotonic across plugin restarts."""
+        return await self._request("POST", "/companion/status", json=dict(payload))
 
     async def get_config(self) -> Dict[str, Any]:
         """Read the mod's config (GET /config). The api_key is never exposed by the mod.

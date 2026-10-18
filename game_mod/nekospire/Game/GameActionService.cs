@@ -53,6 +53,23 @@ namespace NekoComm.Game;
 
 internal static class GameActionService
 {
+    private static INetGameService? _directHostSession;
+
+    internal static void CloseDirectHostSession(INetGameService? session, NetError error)
+    {
+        if (session == null || !ReferenceEquals(session, _directHostSession))
+            return;
+        var transport = typeof(NetHostGameService).GetField("_netHost", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(session)!;
+        var connection = (ENetConnection)transport.GetType().GetField("_connection", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(transport)!;
+        session.Disconnect(error, now: true);
+        // Disconnect skips StopHost after IsConnected becomes false; the socket can still be bound.
+        connection.Dispose();
+        _directHostSession = null;
+        var portBound = System.Net.NetworkInformation.IPGlobalProperties.GetIPGlobalProperties()
+            .GetActiveUdpListeners().Any(endpoint => endpoint.Port == 33771);
+        GD.Print($"[NekoSpire] direct co-op host cleanup finished; udp_33771_bound={portBound}");
+    }
+
     /// <summary>
     /// Tracks whether the agent explicitly skipped the card reward via skip_reward_cards.
     /// When set, DrainRewardFlowAsync will not auto-claim card rewards.
@@ -93,6 +110,28 @@ internal static class GameActionService
     public static Task<ActionResponsePayload> ExecuteAsync(ActionRequest request)
     {
         var actionName = request.action?.Trim().ToLowerInvariant();
+        if (request.expected_turn is int expectedTurn)
+        {
+            var combat = CombatManager.Instance.DebugOnlyGetState();
+            var player = GameStateService.GetLocalPlayer(combat);
+            if (combat == null || combat.RoundNumber != expectedTurn || player == null ||
+                player.NetId.ToString() != request.expected_player_id)
+                throw new ApiException(409, "invalid_state", "Confirmed combat player or turn has changed.");
+            if (request.expected_card_entity_id != null)
+            {
+                var hand = player.PlayerCombatState?.Hand.Cards.ToList();
+                if (hand == null || request.card_index is not int cardIndex || cardIndex < 0 || cardIndex >= hand.Count ||
+                    GameStateService.GetCardEntityId(hand[cardIndex]) != request.expected_card_entity_id)
+                    throw new ApiException(409, "invalid_state", "Confirmed hand card has changed.");
+            }
+            if (request.expected_enemy_entity_id != null)
+            {
+                var enemies = combat.Enemies.ToList();
+                if (request.target_index is not int targetIndex || targetIndex < 0 || targetIndex >= enemies.Count ||
+                    GameStateService.GetEnemyEntityId(enemies[targetIndex]) != request.expected_enemy_entity_id)
+                    throw new ApiException(409, "invalid_target", "Confirmed enemy has changed; target was not replaced.");
+            }
+        }
 
         return actionName switch
         {
@@ -121,6 +160,7 @@ internal static class GameActionService
             "open_chest" => ExecuteOpenChestAsync(),
             "choose_treasure_relic" => ExecuteChooseTreasureRelicAsync(request),
             "choose_event_option" => ExecuteChooseEventOptionAsync(request),
+            "advance_event_dialogue" => ExecuteAdvanceEventDialogueAsync(),
             "choose_capstone_option" => ExecuteChooseCapstoneOptionAsync(request),
             "choose_bundle" => ExecuteChooseBundleAsync(request),
             "confirm_bundle" => ExecuteConfirmBundleAsync(),
@@ -271,7 +311,8 @@ internal static class GameActionService
                 return true; // round advanced (combat progressed past this player's turn)
             }
 
-            if (!GameStateService.IsPlayerActionPhaseFor(combatState, player))
+            if (CombatManager.Instance.IsPlayerReadyToEndTurn(player)
+                || !GameStateService.IsPlayerActionPhaseFor(combatState, player))
             {
                 return true; // this player's action phase ended (turn handed off)
             }
@@ -280,6 +321,7 @@ internal static class GameActionService
         var finalCombatState = CombatManager.Instance.DebugOnlyGetState();
         return finalCombatState == null
             || !CombatManager.Instance.IsInProgress
+            || CombatManager.Instance.IsPlayerReadyToEndTurn(player)
             || !GameStateService.IsPlayerActionPhaseFor(finalCombatState, player);
     }
 
@@ -1285,7 +1327,7 @@ internal static class GameActionService
             });
         }
 
-        // option_index: -1 = skip card, 0/1/2 = pick that card, absent = auto (first card)
+        // option_index: -1 = skip card, 0/1/2 = pick that card, absent = preserve prior skip or auto (first card)
         // card_index is accepted as a backwards-compatible alias for picking a card.
         if (request.option_index.HasValue)
         {
@@ -1308,7 +1350,6 @@ internal static class GameActionService
         else
         {
             _pendingCardRewardChoice = -1;
-            _cardRewardSkipped = false;
         }
 
         var stable = await DrainRewardFlowAsync(TimeSpan.FromSeconds(20));
@@ -1384,6 +1425,15 @@ internal static class GameActionService
         }
 
         var selectedReward = rewardButtons[request.option_index.Value];
+        if (selectedReward.Reward is PotionReward &&
+            GameStateService.GetLocalPlayer(RunManager.Instance.DebugOnlyGetState())?.HasOpenPotionSlots != true)
+        {
+            throw new ApiException(409, "invalid_action", "Potion slots are full; discard a potion or leave the rewards screen.", new
+            {
+                action = "claim_reward",
+                option_index = request.option_index
+            });
+        }
         if (!selectedReward.IsEnabled)
         {
             throw new ApiException(409, "invalid_action", "The selected reward is not claimable in the current state.", new
@@ -1521,6 +1571,8 @@ internal static class GameActionService
 
         var isCombatHandSelection = GameStateService.TryGetCombatHandSelectionMetadata(currentScreen, out var combatHand, out var combatHandSelection);
         var selected = options[request.option_index.Value];
+        if (GameStateService.GetSelectedCards(currentScreen).Contains(selected.CardModel!))
+            throw new ApiException(409, "invalid_target", "Card is already selected; choose another card or confirm_selection.");
         if (isCombatHandSelection)
         {
             if (selected is not NHandCardHolder handHolder)
@@ -1546,7 +1598,7 @@ internal static class GameActionService
 
         var stable = currentScreen switch
         {
-            NCardGridSelectionScreen cardSelectScreen => await ConfirmDeckSelectionAsync(cardSelectScreen, TimeSpan.FromSeconds(10)),
+            NCardGridSelectionScreen cardSelectScreen => await ConfirmDeckSelectionAsync(cardSelectScreen, TimeSpan.FromSeconds(10), selected.CardModel),
             NChooseACardSelectionScreen chooseCardScreen => await WaitForChooseCardSelectionResolutionAsync(chooseCardScreen, TimeSpan.FromSeconds(10)),
             _ when isCombatHandSelection => await WaitForCombatHandSelectionStepAsync(combatHandSelection, TimeSpan.FromSeconds(10)),
             _ => false
@@ -1566,6 +1618,17 @@ internal static class GameActionService
     {
         var currentScreen = ActiveScreenContext.Instance.GetCurrentScreen();
         var screen = GameStateService.ResolveScreen(currentScreen);
+
+        if (currentScreen is NCardGridSelectionScreen grid && GameStateService.CanConfirmSelection(grid))
+        {
+            var completed = await ConfirmDeckSelectionAsync(grid, TimeSpan.FromSeconds(10));
+            return new ActionResponsePayload
+            {
+                action = "confirm_selection", status = completed ? "completed" : "pending", stable = completed,
+                message = completed ? "Selection submitted." : "Selection is still transitioning.",
+                state = GameStateService.BuildStatePayload()
+            };
+        }
 
         if (!GameStateService.CanConfirmSelection(currentScreen) ||
             !GameStateService.TryGetCombatHandSelection(currentScreen, out var combatHand) ||
@@ -1615,7 +1678,7 @@ internal static class GameActionService
             }, retryable: true);
 
         backButton.ForceClick();
-        var stable = await WaitForCardsViewCloseAsync(TimeSpan.FromSeconds(10));
+        var stable = await WaitForCardsViewCloseAsync(currentScreen, TimeSpan.FromSeconds(10));
 
         return new ActionResponsePayload
         {
@@ -1646,20 +1709,20 @@ internal static class GameActionService
         return ActiveScreenContext.Instance.GetCurrentScreen() is not NChooseACardSelectionScreen;
     }
 
-    private static async Task<bool> WaitForCardsViewCloseAsync(TimeSpan timeout)
+    private static async Task<bool> WaitForCardsViewCloseAsync(IScreenContext? originalScreen, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;
         while (DateTime.UtcNow < deadline)
         {
             await WaitForNextFrameAsync();
 
-            if (ActiveScreenContext.Instance.GetCurrentScreen() is not NCardsViewScreen)
+            if (!ReferenceEquals(ActiveScreenContext.Instance.GetCurrentScreen(), originalScreen))
             {
                 return true;
             }
         }
 
-        return ActiveScreenContext.Instance.GetCurrentScreen() is not NCardsViewScreen;
+        return !ReferenceEquals(ActiveScreenContext.Instance.GetCurrentScreen(), originalScreen);
     }
 
     private static async Task<bool> WaitForCombatHandSelectionResolutionAsync(TimeSpan timeout)
@@ -1951,7 +2014,7 @@ internal static class GameActionService
         return false;
     }
 
-    private static async Task<bool> ConfirmDeckSelectionAsync(NCardGridSelectionScreen screen, TimeSpan timeout)
+    private static async Task<bool> ConfirmDeckSelectionAsync(NCardGridSelectionScreen screen, TimeSpan timeout, CardModel? selectedCard = null)
     {
         var deadline = DateTime.UtcNow + timeout;
 
@@ -1963,6 +2026,11 @@ internal static class GameActionService
             {
                 return true;
             }
+
+            // 单张选中是一次完成；尚未选够时不等待或提交整页，下一次选择不能反选刚才的牌。
+            if (selectedCard != null && GameStateService.TryGetGridSelectionMetadata(screen, out var metadata)
+                && GameStateService.GetSelectedCards(screen).Contains(selectedCard) && metadata.SelectedCount < metadata.MaxSelect)
+                return true;
 
             var previewContainer = screen.GetNodeOrNull<Control>("%PreviewContainer");
             var previewConfirm = screen.GetNodeOrNull<NConfirmButton>("%PreviewConfirm")
@@ -2177,6 +2245,22 @@ internal static class GameActionService
         };
     }
 
+    private static Task<ActionResponsePayload> ExecuteAdvanceEventDialogueAsync()
+    {
+        var currentScreen = ActiveScreenContext.Instance.GetCurrentScreen();
+        var button = GameStateService.GetEventDialogueButton(currentScreen)
+            ?? throw new ApiException(409, "invalid_action", "Event dialogue is not waiting for a click.");
+        button.ForceClick();
+        return Task.FromResult(new ActionResponsePayload
+        {
+            action = "advance_event_dialogue",
+            status = "completed",
+            stable = true,
+            message = "Event dialogue advanced.",
+            state = GameStateService.BuildStatePayload()
+        });
+    }
+
     private static async Task<ActionResponsePayload> ExecuteChooseEventOptionAsync(ActionRequest request)
     {
         var currentScreen = ActiveScreenContext.Instance.GetCurrentScreen();
@@ -2253,11 +2337,28 @@ internal static class GameActionService
             });
         }
 
+        var previousEventId = eventModel.Id?.Entry;
+        var previousOptionSignature = BuildEventOptionSignature(eventModel);
+        var previousOptionCount = options.Count;
         RunManager.Instance.EventSynchronizer.ChooseLocalOption(request.option_index.Value);
+        var synchronizer = RunManager.Instance.EventSynchronizer;
+        var localPlayer = GameStateService.GetLocalPlayer(RunManager.Instance.DebugOnlyGetState());
+        if (synchronizer.IsShared && localPlayer != null
+            && synchronizer.GetPlayerVote(localPlayer) == (uint)request.option_index.Value)
+        {
+            return new ActionResponsePayload
+            {
+                action = "choose_event_option",
+                status = "completed",
+                stable = true,
+                message = "Shared event vote registered; waiting for event resolution.",
+                state = GameStateService.BuildStatePayload()
+            };
+        }
         var stableOption = await WaitForEventOptionTransitionAsync(
-            eventModel.Id?.Entry,
-            BuildEventOptionSignature(eventModel),
-            options.Count,
+            previousEventId,
+            previousOptionSignature,
+            previousOptionCount,
             TimeSpan.FromSeconds(10));
 
         return new ActionResponsePayload
@@ -3428,6 +3529,9 @@ internal static class GameActionService
         // Never start a fresh host room over a resumable save (see GuardAgainstSavedRun).
         GuardAgainstSavedRun("start_multiplayer_host");
 
+        var characterSelect = submenuStack.GetSubmenuType<NCharacterSelectScreen>();
+        CleanUpPreviousMultiplayerSession(characterSelect);
+
         // R2 same-machine direct connect: force a plain ENet host on 33771 (bypass the Steam-host
         // decision) so the catgirl client can connect directly to 127.0.0.1:33771.
         var netService = new NetHostGameService(PeerVersionInfo.LocalDefault());
@@ -3441,7 +3545,7 @@ internal static class GameActionService
             });
         }
 
-        var characterSelect = submenuStack.GetSubmenuType<NCharacterSelectScreen>();
+        _directHostSession = netService;
         characterSelect.InitializeMultiplayerAsHost(netService, 4);
         submenuStack.Push(characterSelect);
 
@@ -3519,6 +3623,22 @@ internal static class GameActionService
         }
     }
 
+    private static void CleanUpPreviousMultiplayerSession(NCharacterSelectScreen characterSelect)
+    {
+        if (characterSelect.Lobby != null)
+        {
+            InvokePrivateVoid(characterSelect, "CleanUpLobby", true, NetError.Quit);
+        }
+
+        CloseDirectHostSession(_directHostSession, NetError.Quit);
+
+        var previousSession = RunManager.Instance.NetService;
+        if (previousSession != null && previousSession.Type.IsMultiplayer())
+        {
+            previousSession.Disconnect(NetError.Quit, now: true);
+        }
+    }
+
     private static async Task<ActionResponsePayload> ExecuteJoinMultiplayerDirectAsync()
     {
         var currentScreen = ActiveScreenContext.Instance.GetCurrentScreen();
@@ -3540,6 +3660,8 @@ internal static class GameActionService
             }, retryable: true);
 
         var netId = (ulong)global::System.Environment.ProcessId;
+        var characterSelect = submenuStack.GetSubmenuType<NCharacterSelectScreen>();
+        CleanUpPreviousMultiplayerSession(characterSelect);
         var initializer = new ENetClientConnectionInitializer(netId, "127.0.0.1", 33771);
         var netService = new NetClientGameService(PeerVersionInfo.LocalDefault());
         var joinFlow = new JoinFlow(netService);
@@ -3547,7 +3669,6 @@ internal static class GameActionService
 
         if (joinResult.sessionState.GetValueOrDefault() == RunSessionState.InLobby && joinResult.joinResponse.HasValue)
         {
-            var characterSelect = submenuStack.GetSubmenuType<NCharacterSelectScreen>();
             characterSelect.InitializeMultiplayerAsClient(joinFlow.NetService, joinResult.joinResponse.Value);
             submenuStack.Push(characterSelect);
 
@@ -5091,6 +5212,14 @@ internal static class GameActionService
 internal sealed class ActionRequest
 {
     public string? action { get; init; }
+
+    public int? expected_turn { get; init; }
+
+    public string? expected_player_id { get; init; }
+
+    public string? expected_card_entity_id { get; init; }
+
+    public string? expected_enemy_entity_id { get; init; }
 
     public int? player_index { get; init; }
 

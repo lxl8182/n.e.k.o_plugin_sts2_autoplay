@@ -2,14 +2,24 @@
 
 **目录**：仓库根目录（Python 包），`plugin.toml` 声明入口 `STS2AutoplayPlugin`。
 
-本插件负责**决策与表达**：给尖塔2的猫娘陪玩提供自动出牌/走图、局势点评、事件房 LLM 打分、游戏内弹幕，以及跨局记忆沉淀。它通过 Mod 的 HTTP API（`/state`、`/events/stream`、`/action`、`/solver/plan`、`/danmaku`）与游戏交互，自身**不读取** `strategies/` md——那是策略内容，交给 `strategy_repository` 解析。
+本插件协调尖塔2同伴的统一聊天、计划与动作会话：宿主提供最终主人格、背景、文字/语音队列和播放，插件调用同一agent模型回答及决策，Mod提供局面、求解和执行。当前事实取猫娘进程同一/state响应的agent_view、agent_facts与action_refs，统一入口的局末复盘进入当前会话，每局只自动表达一次。通过Mod HTTP API（`/state`、`/events/stream`、`/action`、`/danmaku`）交互；统一模型按角色读取总纲并按实际场景读取策略，条件经验负责纠正与偏好；旧局口号不再转成策略指令。
+
+游戏期间保留本体启用的主动话题来源，经后台获取后进入统一同伴会话；点歌和搜表情包用独立媒体请求交给现有搜索/播放器，不等待搜索完成才出牌。搜索、派发和播放器真实状态分开记入上下文，普通闲聊和点歌保留有效游戏计划。情绪气泡可在桌宠设置的「情绪表情包」入口按角色上传多张图片，触发时随机选择并避免连续重复；空项使用默认猫图。
+
+## 当前交付与验收（2026-10-15）
+
+N1过程记录、N2最近回合自然追问、N3条件经验沉淀与采用已实现；102项相关Python检查及历史页JavaScript语法检查通过，机制验收完成。9个运行文件已同步实际安装目录并核对SHA256；上次交付时宿主未运行，正常启动加载新版。
+
+你可以在现有聊天直接问“刚才为什么没防御/上回合为什么这样出”，不需要打开历史选中操作。实玩确认包括：最近回合解释是否准确、纠正后是否采用及修改/撤销是否符合原话、局末是否根据整局过程复盘，以及打法/配合/速度基线和原有升级取消。清单统一见[开发计划第2节](../nekospire-companion-plan.md)。
+
+N4具体打法修正、N5进一步性能优化按记录中的实际问题继续选题。原历史页“经验采用与速度记录”提供采用统计和耗时样本数、中位数/P90，用于实玩对比。
 
 ## 入口 actions（`__init__.py`）
 
 - **状态**：`sts2_health_check`、`sts2_get_status`、`sts2_read_state`
 - **自动玩**：`sts2_start_autoplay`、`sts2_pause_autoplay`、`sts2_resume_autoplay`、`sts2_stop_autoplay`、`sts2_set_standby`
 - **陪玩**：`sts2_enable_companion_mode`、`sts2_disable_companion_mode`
-- **弹幕**：`sts2_set_danmaku`（`enabled=true/false`，真正的总开关，关掉同时通知 mod 停止渲染并清屏）
+- **弹幕**：默认关闭；`sts2_set_danmaku`（`enabled=true/false`，真正的总开关，关掉同时通知 mod 停止渲染并清屏）
 - **存档**：`sts2_continue_run`（回主菜单点「继续」回到存档；不可用时回报当前界面与可用动作）
 - **co-op**：`sts2_open_coop_room`
 - **策略**：`sts2_apply_user_override`
@@ -20,52 +30,39 @@
 | 模块 | 职责 |
 |---|---|
 | `service.py` | 总控：事件循环接线、决策/点评/记忆入口 |
-| `loop_runner.py` | 轮询 + SSE 事件流 + 自动玩循环；缓存 `/solver/plan`（整回合）、事件房 LLM |
+| `loop_runner.py` | 轮询 + SSE 只读刷新；串行触发纯 LLM 自主动作循环 |
 | `transport_client.py` | Mod HTTP 客户端（`/state`、`/action`、`/solver/plan`、`/danmaku`、SSE） |
 | `neko_interface.py` | NEKO SDK 接口（只读/控制 SD 工具入口） |
-| `heuristic_planner.py` / `companion_evaluator.py` | 决策：局面评估、出牌/选牌/路线启发式 + 点评触发器 |
-| `catgirl_llm.py` | LLM 生成：`CatgirlCommentGenerator`（弹幕/点评**文案**）。只有文案，没有决策 |
+| `llm_planner.py` | 战斗重判先求解一次，同一主人格模型选择求解器/自定计划、回答与发言 |
+| `action_engine.py` | 决策边界：严格校验 LLM 动作，不替换非法选择 |
+| `action_identity.py` | 卡牌/目标稳定实体绑定、现场下标解析、有限战术前提和取消诊断 |
+| `companion_session.py` | 局内记忆：真实对话、带时间/战斗/回合的行动结果、未来回合意图，跨局重置 |
+| `heuristic_planner.py` / `companion_evaluator.py` | 旧评估/策略兼容代码；不再作为自主决策来源 |
+| `catgirl_llm.py` | 宿主 agent 模型客户端与当前角色主人格读取；旧点评接口仅保留兼容 |
 | `play_style.py` | 游玩模式（认真/捣蛋/笨蛋）的档位常量、别名与"从有序候选里挑一个"的纯函数 |
-| `catgirl_memory.py` | 跨局记忆沉淀（见下节） |
-| `strategy_repository.py` / `strategy_parser.py` | 策略加载：`strategies/` 解析 + `strategy_directives` 组装 |
+| `catgirl_memory.py` | 战报、条件经验、版本/修改撤销、相关读取与实际采用结果 |
+| `companion_journal.py` | 整局紧凑过程、两回合详细依据、重点案例与效果统计 |
+| `strategy_repository.py` / `strategy_parser.py` | 兼容层加载角色/场景文档和玩家覆盖；旧局教训不自动注入 |
 | `dispatcher.py` | 状态反馈 / 陪玩通知的 NEKO 输出边界 |
 
 ## 决策与表达
 
-- **决策**：地图/奖励/卡组/事件全部由**启发式**决定——插件不靠 LLM 做任何决策（事件房原本的 LLM 评分融合已于 2026-10 摘除）；战斗出牌由 `/solver/plan` 权威决定，回退启发式。
-- **多张选牌**：选牌屏需要选 2 张以上时，插件与猫娘驱动都按「这一屏**没按过**的下一张」推进（记住已按过的 option_index 集合，换屏即重置），能确认就优先 `confirm_selection`。以前两边都恒发 `option_index=0`，第二张永远选不上、`max_select` 到不了，界面就卡在那里。
-- **其它非战斗选择**：`bundle_selection`（先选后确认）、`capstone_selection`（逐项扫，不重复按同一按钮，index 0 可能是返回键）、`cards_view`（关闭）、`modal`（先 dismiss 再 confirm）、`game_over`（回主菜单）都已覆盖，不再落进 `unknown` 后静默卡住。
-- **奖励**：卡牌奖励屏优先**拿牌**（以前 `resolve_rewards` 排在前面，等于把每张奖励卡都白白 drain 掉）。
-- **已知未覆盖**：出战斗外的**选遗物**屏（`NChooseARelicSelection`，如珠宝盒）mod 侧没有对应动作，需要人工点。
-- **表达**：猫娘点评 + 游戏内弹幕。
-- **偏好吸收**：`sts2_apply_user_override` 把用户自然语言指点转成结构化偏好 / override。
-- **跨局记忆**：见下节。
-
-## 猫娘记忆成长（跨局教训 → 决策）
-
-每局结束（死亡/通关，`state_machine` 判为 `screen_class=terminal`）时，插件把本局 `recent_decision_memory` 总结成「教训 + 偏好」，写入 `catgirl_memory.py` 的 `CatgirlMemoryStore`，持久化到 `<LOCALAPPDATA>/N.E.K.O/sts2_autoplay/catgirl_memory.json`。下一局 `strategy_repository.build_context()` 会把最近几局的教训并入 `strategy_directives.avoid`、偏好并入 `prefer`（软约束），从而影响选牌/路线/战斗决策。总结引擎为**启发式打底 + LLM 可选**（`service._catgirl_llm.available` 时才叠加，失败静默回退）。
+- **决策**：整局由本体 agent 模型主导。当前事实使用猫娘 `agent_view`，另附局内上下文与有来源的跨局经验；不接 `/coop/state`。战斗可行动且需要重判时，先调用一次自己的 `GET /solver/plan?mode=companion`，结果与 `solver_steps` 确定前缀交同一模型，默认选择 `plan_source=solver`；要求冲突或覆盖不足时模型可选 `custom`。程序原样采用被选中的求解器动作，不让模型重抄牌序。陪玩短搜索4秒、Mod总期限6秒，HTTP等待8秒、外围含刷新等待9秒；通常一次模型调用，格式修正最多再一次，总预算60秒。不暴露求解function tool，`function_calling_available=false`表示本路径未启用工具往返，不影响预求解。
+- **选择**：普通事件和收益取舍交给模型。模型选定继续占卜后，自定义界面按原有接口暴露的合法下标推进，记录无效尝试；保留原有 Mod 信息，不修改或重编 Mod。接口未给出占卜选项时会报告缺项，不猜造下标。
+- **表达**：文字/语音与游戏事件进入同一planner会话，单轮输出reply、plan_update和动作，沿用完整宿主人格，并把宿主生效主人/当前角色档案放入固定system，按档案称呼玩家。自动行动及纯游戏要求只保留一份绑定的speech，闲聊/询问用reply；数字步号清除。Flash使用简短、直接的任务prompt，每个可行动战斗回合首次出手用1–2短句表达主要目标、取舍与自然感受；同回合可继续交流，不设发言次数或计划节流，输出ID去重仍保留。采用求解器也保留模型的回合意图，speech_step_ids关联实际步骤，牌名/目标可用`{card:0}`/`{target:0}`绑定；安排改变时简短改口。必需发言缺失或绑定错误时沿用既有一次格式修正，仍失败则记录sts2_speech_deferred并继续校验、执行合法动作；已分类且更新动作的游戏要求也不因文案失败阻塞，闲聊/询问仍须回答。执行层不再补首牌模板；自然牌数、未选中的牌/目标及未经验证的收益数字只记sts2_speech_advisory，保留发言且不重试；显式引用仍校验。用药独立说明药水、对象及用途，已明确说过同一步时不重复，静音续步由实际药水与目标补句。speech与reply独立校验，战术语音播放完刷新校验，普通闲聊/回顾不挡无关续步。
+- **等待与恢复**：局面/对话不变时复用等待决定，正常等待队友不报卡住；无进展会记录并报告一次，只有现场变化才清除。单次决策/派发失败退避重试，间隔最长8秒；连续3轮失败暂停行动，直接通知具体原因；文字真正送达后才清除，断线保留、重连补送，同连接最多3次投递，不调用模型。旧输入与事件不再触发重试，新输入仍可有限回应，明确继续/启动/切回program后恢复；checkpoint保留失败暂停及未送达通知；人物设置重建会话时重新接管当前连接。药水满栏时选择丢旧药再领取或离开，避免无效领取。缺少对话总线时跳过导入并显示说明；缺少 `agent_view` 不发动作并报告。
+- **记忆与规划**：即时会话保留最近16条真实发言和20条行动；另由`companion_journal.py`按局保存整局紧凑过程、最近两回合详细依据及重点案例，重载后保留。玩家可直接追问当前/上一回合，原理由、实际结果和事后评价分别保存。结构化经验按角色、牌/遗物、遭遇和资源条件最多读取3条，附来源及近期真实采用结果，支持修改/撤销；旧战报仍按角色和时间保留兼容读取。局末自由反思作为评价独立保存。当前事实和有效要求优先；结算按is_victory，胜利结算归零不计实际损血。
+- **计划复用与耗时**：主动作与最多4个续步按card_ref/target_ref绑定entity_id，派发时解析现场下标，模型不预测删牌后的手牌line。固定集火、击杀血量范围、血量顺序/差及防守前提按模型所选条件校验；队友削血但前提成立可继续，目标缺失或新信息停止依赖尾部。规划时保存enemy_intents，存活敌人意图变化报enemy_intent_changed并重判，忽略血量与位置变化。agent_facts明确是否攻击及已知来伤，击杀后按最新意图重算防守。有效续步去掉1.5秒空等，自己ready_to_end_turn完成后等待队友。decision_metrics、latency_samples和取消诊断用于下一局比较实际效果。
+- **求解器续步**：只采用当前回合、当前手牌可绑定的前缀；同种相同牌面分配不同实体，不把重复初始下标当成同一张牌反复使用。不同升级/临时牌面无法确定身份时停止前缀，sts2_solver_prefix记录停止原因；药水缺稳定引用时交模型按现场处理。抽牌、选牌、未知卡牌及结束回合处停止尾部。`solver_assumptions`按步骤附玩家打法的必要现场前提。有效续步不再求解、不调用模型；结束续步还有可打0费实体时统一复核一次，end_turn须逐实体说明不出的取舍，允许遗物格挡等理由。日志分开记录`solver_used`（有成功参考结果）和`solver_adopted`（采用牌序），sts2_solver_line记录原始首回合牌序。
+- **取消诊断**：`sts2_observation_changed`记录最多6个变更字段路径及前后值，与revision/step关联；保留自身资源、界面和敌人效果的派发校验，不能将真实变化统称为续步模型错误。
+- **API缓存**：固定同一会话system（工具集合为空），完整请求历史追加，动态局面与求解结果放末尾并稳定序列化；超过80,000 prompt token后按完整轮次成块裁剪。剔除run.piles与求解结果重复的现场/引用；重载可恢复checkpoint。缓存字段按`prompt_cache_hit_tokens`、`cache_read_input_tokens`、标准`cached_tokens`优先读取，日志记录source与完整usage。请求复用宿主astream，include_usage开启，完整JSON收齐后再校验动作；sts2_stream_complete记录首字与总耗时。HTTP追踪记录实际stream、system_hash、parameters_hash、共同消息数/字符数和请求ID，随机关联tag仅在header，正文和凭据不记日志。当前只排查命中率，计价暂缓。
+- **输入分类**：模型仅使用短消息id填写message_effects；已知传输request_id可转回对应id，旧消息附加项过滤，当前新消息分类必须完整。格式修正反馈列出实际所需id，避免笼统报错反复卡住合法动作。
+- **战斗就绪**：卡牌离手能证明已执行，但动画与Mod的200ms稳定闸还可能阻止下一步；此时保留续步并等待动作重新可用，有新输入仍可回答。ready_to_end_turn仅在COMBAT有效，奖励页不沿用旧战斗的结束标记。
+- **暂停讨论**：Mod 自主驱动 hold、插件执行权限、宿主聊天彼此独立。讨论结束保留原控制模式和玩家运行意图，期间玩家主动暂停仍有效。
 
 ## 弹幕/点评
 
-- 猫娘点评经插件 `_maybe_emit_catgirl_llm` → `_push_catgirl` → `POST /danmaku`（文本 + 头像）进游戏内渲染；评论不再走 NEKO 宿主 `push_message`。
-- 战斗时给 LLM 的 prompt 精简为「怪物血量 + 我方生命 + 当前层级」；仅 SSE `event_type == player_action_window_opened`（轮到玩家行动）才附当前回合出牌建议 line（`_build_combat_prompt`，复用 `loop_runner._solver_plan_cached`，签名命中不重复搜 `/solver/plan`）。
-- 弹幕只响应三个战斗事件：`combat_started` / `available_actions_changed` / `combat_turn_changed`，其中仅 `combat_turn_changed`（回合推进）带 line。
-
-### 生成预算必须给推理模型留余量（v0.5.5 起）
-
-`_DEFAULT_MAX_TOKENS = 1500`（原本是 **220**）。主系统默认模型 `free-agent-model` 是**推理模型**：
-实测它对战斗/奖励这类需要分析的局面会把 220 个 token **全部烧在 reasoning 上**
-（`completion_tokens=220`、`completion_tokens_details.reasoning_tokens=220`、`finish_reason="length"`），
-最终 `message.content` 是空串 —— 于是这些场景**一次都产出不了点评**，猫娘在游戏里一句话都不说
-（地图/商店/选牌偶尔成功，只是那几次思考短，赶在预算内答完了）。改成 1500 后同样两个场景
-`finish_reason=stop`、content 正常（实测思考占 440~500 token，输出仍受 prompt 限在 10~25 字）。
-
-配套两条防复发措施：
-
-- LLM **可用但没产出**时**必须退回启发式文本**（`_catgirl_llm_async` 里原先是"什么都不推"，
-  而 `_maybe_emit_catgirl_llm` 又因为 `llm_ok=True` 不会走它自己的兜底分支 —— 两条路都不出声）。
-- 失败原因用 **info 级报一次**并带上 `finish_reason`（原先写在 debug 级，线上只看到
-  "LLM 失败/空"，根本分不清是预算不够、被拒绝还是网络问题）。
+本期交流由统一planner决定，宿主负责渲染与播放；旧独立点评接口仅保留兼容。游戏内弹幕开关与动作执行、宿主聊天分别控制。
 
 ### 怎么真正关掉弹幕（v0.3.1 起）
 
@@ -81,85 +78,27 @@
 
 ## 地图投票与存档（co-op 行为）
 
-**先分清两种运行模式**，它们的地图行为**不同**：
+插件接管猫娘后持续保持 Mod `hold`，等待正在执行的 Mod 动作结束再调用模型，避免两个驱动同时操作。猫娘自己按当前地图视图投票，玩家投票和聊天可以影响模型判断；已经投票时等待队友，不靠保守评分或自动跟票替代模型。
 
-| 模式 | 判定方式 | 地图行为 |
-|---|---|---|
-| **插件控制**（NEKO 已连接） | mod 收到带 `X-Neko-External-Control: 1` 的请求，且在**租约 30 秒**内 | 按 `coop_map_policy` 走（见下） |
-| **mod 独自运行**（NEKO 不在） | 租约到期（插件退出/崩溃后最多 30 秒） | **完全自己跑，永不阻塞**：有人投就跟随，没人投等 `coop_map_vote_wait_seconds` 后自己选 |
-
-插件在每个请求（含 SSE 流）上都带那个标识头，且它空闲 3 秒 / 活动 1 秒轮询一次 `/state`，所以该头天然就是心跳；插件挂掉后 mod 会自动退回独自运行，**不会卡死**。`/state` 里会回显 `external_control: {attached, client_id, seconds_since_contact, lease_seconds}` 便于诊断。
-
-**插件控制下的 `coop_map_policy` / 插件侧 `map_policy` 三态：**
-
-- **`wait`（默认）** —— **彻底等待**：多人局里不投票、也不自动跟票，路线完全留给玩家，直到玩家对猫娘发话。这就是"不抢路线"。单机局没有队友可等，仍会自己选，否则每张图白等一轮。
-- **`follow`** —— 队友先投了就镜像跟随；没人投票时等 `map_vote_wait_seconds`（默认 20s）再自己选。
-- **`auto`** —— 不等，立即按自己的偏好选。
-
-**和猫娘说话来协作（`sts2_set_route`，同时是 `llm_tool`）：**
-
-| 你说 | mode | 行为 |
-|---|---|---|
-| "定个路线"／"你来定"／"挑条稳的" | `safe` | 按保守权重自己算一个节点并投票 |
-| "我选完了，来选这个"／"跟我一样" | `mirror` | 投你当前那一票 |
-| "你选中间"／"选第三个"／"选最左边" | `pick` | 按你指的位置投（中间/第N个/最左/最右） |
-| "不对不对我选错了，你选中间" | `pick` | **再调一次即改票** |
-
-注意：`safe` 是**启发式**保守评分（躲精英、血低于 60% 优先休息），**不是真实战损预测**；改票必须赶在地图推进之前。旧配置兼容：只有 `map_follow_player` 的老配置按 `true`→follow、`false`→auto 解释。
+`sts2_set_route` 将路线讨论写入局内对话，不直接投票。`map_policy` 和带锚点的 guidance 一起进入模型上下文，由 LLM 判断；不使用启发式替换模型投票。
 
 - **回到存档**：主菜单有可继续存档时，插件主菜单决策**优先 `continue_run`**（以前优先 `open_character_select`，会抢在存档前面开新局）；猫娘进程则**完全不碰存档**（两个进程共用 `user://`，谁点「继续」谁就把存档吃掉），只保留重新加入房间的能力。`sts2_continue_run` 是显式的补救入口；`continue_run` 现在会先收干净主菜单子菜单（子菜单开着时「继续」按钮会被藏起来，以前会直接 409）。
 - **防呆**：主菜单存在可继续存档时，`start_coop_session` / `start_multiplayer_host` 会返回 `409 active_run_present` 而不是默默另开一局（`POST /config {coop_yield_to_saved_run:false}` 可关闭这道守卫）。
 - **已知限制**：游戏本体看起来没有「客户端加入进行中局」（join-in-progress）。即使主机点「继续」读回 co-op 存档，AI 队友也可能回不到那一局——这是游戏侧能力边界，不是插件能绕过的。
 
-## 控制档位（自己玩 / 听安排 / 停手）
+## 控制档位与游玩风格
 
-用 `sts2_set_control_mode` 切换，猫娘也会在你说话时自己调用它：
+| 档位 | 行为 |
+|---|---|
+| `program` | 自主判断并执行自己的合法动作 |
+| `advise` | 所有界面只判断，不自动执行 |
+| `standby` | 停止自主动作与规划，仍可只读查询和聊天 |
 
-| 档位 | 你说的话 | 行为 |
-|---|---|---|
-| `program`（**默认**） | "你自己玩"、"随便打" | 照常决策并执行。与今天完全一致 |
-| `advise` | "听我安排"、"你先别动"、"等我说" | **只算不做**：战斗之外的决策界面一步一步等你发话 |
-| `standby` | "停手"、"待机" | 彻底停手，连计划都不算 |
+`sts2_start_discussion` / `sts2_end_discussion` 用于暂停与恢复动作，讨论期间不要求逐步批准。`sts2_pause_autoplay` 同样停止动作，聊天继续。`sts2_execute_planned_operation` 可显式执行一步，但不能绕过讨论暂停。
 
-**切换是悄悄发生的。** 换档不会触发猫娘开口（推送用 `ai_behavior="blind"`，连喂给 LLM 都不喂，只留一条给面板与排障看的内部记录），`llm_tool` 版也只回机器可读的最小结果（`{"ok": true, "style": ...}`）——若回一句中文，它很可能顺口念出来。所以**它不会说"好，我切到捣蛋模式了"**，换完就照常继续；你问起现在是什么档位它才回答。
+插件接管期间各档位都向 Mod 推 `hold`，执行权限由插件单独决定。暂停不会把控制权交回 Mod。
 
-它也**可以自己判断着切**，不必等你明说：你的语气里透出意思就够了（"你今天怎么这么笨" → 捣蛋或笨蛋；"给我认真点" → 认真；"这步我来定" → 听安排）。工具描述里明确授权了这种自主切换。
-
-`advise` 的配合方式就是现成的那对入口：
-
-- "你打算怎么走" → `sts2_get_planned_operation`，它把计划说出来
-- "就这个"／"打吧" → `sts2_execute_planned_operation`，走一步（这是**显式授权**，会越过停手闸门）
-- "你自己玩" → `sts2_start_autoplay`，等于切回 `program`
-
-**停手范围有硬边界，这三条都是"会让游戏卡死"的地方：**
-
-- **战斗永不停手** —— 玩家替不了猫娘出牌，停手会把回合永久卡住。所以 `advise` 只覆盖选路/奖励/选卡/遗物/宝箱/事件/商店/休息/双选/里程碑这些"慢决策"。
-- **主菜单 / 组队大厅 / 选角色永不停手** —— 那是猫娘加入房间的必经流程（开菜单 → 连主机 → 选角色 → ready），停手就根本进不了局。`standby` 也一样。
-- **认不出的界面不停手** —— 宁可没听成安排，也不能让 mod 意外卡死。
-
-例外：`standby` 是**彻底**停手，所以它**包括战斗**——回合会停住，直到你发话。这是该档位的预期语义，不是故障。
-
-**档位会同步给 mod**（`POST /config {coop_control_mode: auto|advise|hold}`），因为 mod 有自己的自动玩驱动：只停插件等于没停。映射为 `program→auto`、`advise→advise`、`standby→hold`。与地图策略一样，这个同步只在**插件附着**时才有意义（见上文的租约判定）；插件不在时 mod 一律自己跑。
-
-## 游玩模式（认真 / 捣蛋 / 笨蛋）
-
-和"控制档位"是两件不同的事：控制档位决定**谁来拍板**，游玩模式决定**拍得多不认真**。
-
-| 档位 | 你说的话 | 行为 |
-|---|---|---|
-| `serious`（**默认**） | "认真打"、"好好打"、"我要通关" | 与改动前**逐字相同** |
-| `mischievous` | "捣蛋"、"闹着玩"、"别太认真" | 20% 概率把最优操作换成**次优**的合法选择 |
-| `silly` | "笨蛋"、"你傻啦"、"随便打打" | 60% 概率把最优操作换成**评分最差**的合法选择 |
-
-运行时切换：`sts2_set_play_style(style=...)`；配置项 `play_style`（插件 `plugin.toml` / `config.example.toml`）。
-
-**三条硬约束：**
-
-1. **`serious` 零影响**——扰动层在 serious 下**直接原样返回**规划器的结果，连候选排序都不算，所以默认档不可能有回归。
-2. **永远合法**——换出来的候选只来自该屏的**合法下标集合**（不可打出的牌、不可买的商品都会被排除），换完还要再通过 `action_engine` 校验；换不出合法操作就**放弃扰动、退回最优**，绝不发非法动作。
-3. **覆盖全部决策屏**——战斗出牌、地图、奖励、选卡（各变体）、事件、商店、休息、宝箱、双选、里程碑都会受影响；其中事件/地图/奖励/删牌是按各屏**原有评分**排序，其余屏退化为"最优 + 其它合法下标"。
-
-例外：**玩家亲口授权的那一步不受影响**。`sts2_execute_planned_operation`（"就这个"）是显式授权，即使当前是笨蛋档，它也照你说的走。
+`serious` / `mischievous` / `silly` 作为风格输入交给模型理解；插件不再按概率替换模型选择，也不按候选评分扰动动作。
 
 ## 插件驱动的是哪个进程（host / catgirl）
 
@@ -179,23 +118,28 @@
 
 **默认是自动的**：`sts2_open_coop_room(host=True)` 成功后，插件会向主机读 `GET /config` 的 `coop_client_port`，据此推导猫娘地址，**轮询等它冷启动**（最长 45 秒），起来就切过去接管。
 
-切过去时会顺手给那个实例推 `coop_control_mode="hold"`，让它**自己的 mod 驱动在除"进局流程"外的界面停手**——否则两个驱动会抢着下同一个动作。进局（主菜单 → 组队大厅 → 选角色 → ready）**仍由 mod 自己做**，那正是插件够不着的部分。插件若挂掉，租约到期后 mod 会自动恢复自己玩。
+接管时给猫娘实例推 `coop_control_mode="hold"`，避免 Mod 与插件同时行动。开房后 Mod 负责拉起进程、进入房间并停在角色选择界面；由你手动选择猫娘角色并确认 ready/embark，插件和 Mod 不代点。新版插件会校验手动选人能力回执。Mod hold 在当前进程内保持，插件重新连接后同步；仅切换面板管理实例不改变控制状态。
 
-**读不通就退回**：活动实例是猫娘时若连续三次读不通，插件自动退回主机实例，不会卡在一个死地址上。
+同伴认知、查询与动作固定使用猫娘进程。面板活动实例只影响管理操作；猫娘连接中断时明确报错，不能改去操作真人主机。
 
 注意 `GET /config` 里的 `coop_client_port` 是 **mod 0.1.4** 起才有的只读字段。老版本 mod 没有它时插件**不猜端口**，会停在主机实例并如实说明——单人流程不受影响。
 
 ## 数据流
 
 ```
-游戏战斗/场景变化
-  → Mod (C#) 采集状态、推送 /events/stream
-  → 插件 loop_runner 消费
-  → heuristic_planner / companion_evaluator 出决策
-  → （可选）catgirl_llm 生成弹幕/点评
-  → Mod /action 执行动作 → /danmaku 渲染弹幕
-  → （run 结束）catgirl_memory 总结教训/偏好 → 落盘 → 下一局注入 strategy_directives
+宿主文字/语音队列 + 最终人格/背景 ─┐
+猫娘/state → agent_view/facts/refs ─┴→ 插件统一调度与CompanionSession
+  → 战斗重判先求解一次，绑定当前回合确定前缀
+  → 同一LLM会话：回复 + 保留/更新/等待计划 + 选择solver/custom
+  → 绑定实体及具体发言 → 宿主output镜像/TTS
+  → 刷新，检查新输入/控制/前提，按实体解析当前下标 → 校验 → /action
+  → 确认真实结果 → session/checkpoint → 有效续步直接执行，否则重新判断
 ```
+
+宿主接线位于NEKO源码main_routers/sts2_companion_router.py及web_app注册；需源码后端。
+接口为/api/sts2-companion/poll、output、release，默认unified_session_enabled=true。
+角色+实例+90秒租约限定所有权，重载保留未确认输入及会话，旧动作计划不直接重放。
+完整部署与待验收状态见[AGENTS.md](AGENTS.md)和[开发方案](../nekospire-companion-plan.md)。
 
 ## 使用教程
 
@@ -214,7 +158,7 @@
 
 **目录**：`game_mod/nekospire/`，编译成 `nekospire.dll` 随游戏加载。默认监听 **18080**（环境变量 `STS2_API_PORT` 可改）。
 
-本 Mod（NekoSpire）是尖塔2 的猫娘陪玩桥：内嵌 **Combat Solver** 的战斗求解脑，通过 HTTP 把游戏状态与战斗路线暴露给 NEKO 插件，并自带游戏内弹幕渲染与 co-op 自动玩的底层驱动。它只提供**可执行**能力（出牌/状态采集、求解决策、弹幕渲染、本地自动玩），**不读取** `strategies/` md——那是插件的内容。
+本 Mod（NekoSpire）是尖塔2 的猫娘陪玩桥：内嵌 **Combat Solver** 的战斗求解脑，通过 HTTP 把游戏状态与战斗路线暴露给 NEKO 插件，并自带游戏内弹幕渲染与 co-op 自动玩的底层驱动。它只提供**可执行**能力（出牌/状态采集、求解决策、弹幕渲染、本地自动玩），**不读取**策略文档；插件兼容层读取角色策略及玩家覆盖。
 
 ## 主要功能
 
@@ -237,7 +181,7 @@
    - 置 `coop_enabled = true` 并存盘（`user://NekoSpire/settings.json`）；
    - 关掉主菜单子菜单后 `open_multiplayer_menu` → `start_multiplayer_host`（ENet `33771`）；
    - **拉起第二个游戏进程**（猫娘 client），环境变量 `STS2_API_PORT=<coop_client_port·默认18081>`、`STS2_ENABLE_DEBUG_ACTIONS=1`（同一 exe，**不带** `+connect_lobby`）。
-3. **猫娘进程自动接棒**。它读到同一份 `settings.json`，本进程端口 == `coop_client_port` → `IsClientByPort()` 判定自己是猫娘，`NekoAutoplayDriver` 启动：主菜单 → `open_multiplayer_menu` → `join_multiplayer_direct`（连 host `127.0.0.1:33771`）→ 大厅选 **IRONCLAD**（roster 0）+ ready → 开局 → 地图互投。
+3. **猫娘进程自动接棒**。它读到同一份 `settings.json`，本进程端口 == `coop_client_port` → `IsClientByPort()` 判定自己是猫娘，`NekoAutoplayDriver` 启动：主菜单 → `open_multiplayer_menu` → `join_multiplayer_direct`（连 host `127.0.0.1:33771`）→ 进入大厅后停住，等待你选择角色并手动 ready/开局；确认后才开始地图互投。
 4. **host 手动玩，猫娘自动跟随**。战斗用 `/solver/plan` 的下一步；地图/奖励/选牌/事件四屏先问 LLM（第 1 步配的那个），LLM 不可用或返回非法动作则退回各屏启发式；每个候选都以游戏自己的 `available_actions` 把关，绝不发非法动作。
 5. **弹幕解说只在 host 进程**渲染（`NekoDanmakuDriver` 用 `IsCatgirlProcess()` 在猫娘进程跳过），所以猫娘进程专心地当队友、不刷弹幕。
 
@@ -267,17 +211,14 @@ scripts\Start-NekoCoop.ps1 -SkipHostLaunch -ClientAutoplays           # host 你
 
 `/solver/plan` 是短预算搜索（默认 Short 8s / Deep 120s；Deep 仅在 Short 无法解决时触发），求解在 worker 线程后台运行并周期性让出 CPU。自建 `Game/Sim/` 确定性结算器仅当 `SolverEnabled=false` 时作为回退；求解器不可用时自动玩退回「第一张可打出的牌」，避免卡死。
 
-## 出错不停车（v0.5.2 起）
+## 有界重试与失败暂停
 
 自动玩**不会因为一次错误就停手**，这一条是被真实的"猫娘站着不动"逼出来的：
 
-- `autoplay_state` 只表示**玩家意图**（running / paused / standby / idle），任何错误都不改它；
-  健康状态另由 `transport_state` / `last_error` / `consecutive_errors` 表达。
-  曾经把错误写成 `autoplay_state="error"`，而自动玩循环只在 `running` 时才干活 —— 于是一次被拒的
-  动作就让猫娘**永久空转**，玩家只看到它不动。
+- 单次错误保留运行意图并退避；连续3轮决策/派发失败则明确设为paused，pause_reason=decision_failure。每轮模型最多一次格式修正，合法动作不因附加文案持续失败而阻塞。暂停原因直接通过已有输出/TTS通道投递，不再要求失败中的planner生成解释。读状态成功不清空决策错误；新输入可获得有限回应，动作等待明确恢复，重载继承失败暂停。
 - **动作被拒 = 状态漂移，不是致命错**：`invalid_target`（例如整回合缓存的战斗计划里
   `target_index` 指向已经死掉的敌人）这类拒绝会自动作废缓存的 `/solver/plan`、强制重刷 `/state`
-  后按现场重算，并继续下一轮；退避上限 8 秒。
+  后按现场重算；退避上限8秒，连续3轮仍失败则暂停等待指令。
 - **战斗计划缓存签名含"存活敌人集合"**：回合内死一只敌人就重取计划，避免继续用过期下标。
 - **发牌前最后一道兜底**：`action_engine` 会用现场 `hand[i].valid_target_indices` 校正越界的
   `target_index`（拿不到合法集就不猜，保持原样）。
@@ -296,7 +237,9 @@ scripts\Start-NekoCoop.ps1 -SkipHostLaunch -ClientAutoplays           # host 你
   现在角色已选好就直接 `embark`。同一类错误（**幂等动作被当成推进手段反复发**）在商店也出现过，
   排查时可作为一条通用线索。
 
-## 地图选路：链式递推（v0.5.7 起）
+## 旧启发式地图选路（历史实现）
+
+以下描述仅供旧代码维护参考，本期自主循环不使用这些评分。
 
 选路不是"只看眼前一步"，而是**从每个候选节点递归到 boss，评估整条路线**。
 
@@ -394,20 +337,12 @@ mod 下发的 `node_type` 是**游戏枚举名**（`Point.PointType.ToString()`�
 
 ## 局末总结与反思（v0.6.1 起）
 
-每局结束（阵亡/通关）做一次结构化总结，而不是只在终端屏上写一行计数：
+正常游玩时持续记录整局紧凑过程和最近两回合详细依据，重点案例另行保留。过程保存在`catgirl_memory.json`旁的`run_process/`中；即时会话的最近20条动作不再承担整局归档。
 
-- **损血归因**：每次刷新记一条生命采样（`hp_trail`，换局自动清零），局末算出总损血、
-  单次掉血最多的三处（带界面/层级/血量前后）、最低血与结束血量 —— 就是"看看哪些地方损血导致失败"。
-- **战报**（`_run_summary_digest`）：结局 + 角色 + 层级 + 损血归因 + 最近决策 + 已知教训，
-  压成一行作为**简化提示词**。
-- **反思**：由**本体的模型与人设**异步生成（不卡终端屏），落盘后**作为一条教训**参与下一局的
-  `strategy_directives`，同时作为弹幕说给玩家、并用 `ai_behavior="respond"` 推给本体让它开口。
-- 长文本推本体走 SDK 的 `ctx.push_message` 而**不是**插件的 dispatcher：后者会把正文截到 **30 字**
-  （`_host_reply_text`），战报会被切碎。
-
-> 顺带修掉一个**从来没生效过**的东西：`catgirl_memory.summarize_run` 里那条"LLM 自然语言归纳"是
-> **同步**调用 `async def generate`，拿到协程后 `.splitlines()` 抛错被吞；外面还有
-> `self._engine == "llm"` 这道默认关闭的闸门。所以它一直是纯启发式。
+- **战报事实：** 胜负、角色、进度、逐房间选择与收获、生命观测和实际动作。重载保留过程，采样间隔保留标记；联机前后变化按观测区间记录。
+- **局末复盘：** 统一模型沿用当前会话，读取覆盖整局的房间汇总、最多12个重点回合、3个重点案例和6条最近问答，自动表达一次；玩家新问题照常回答。
+- **评价与经验：** 反思文字独立保存；可复用结论经`learning_updates`提炼为带条件、来源和版本的经验，模型自评标记为候选。整段反思不再直接追加为长期策略。
+- **玩家纠正：** 明确纠正和讨论结论无需每次说“记住”，按原话范围区分当前要求、案例纠正与长期偏好；支持修改/撤销，后续相关局面少量读取并记录实际采用及回合结果。
 
 ### 损血归因按**房间标识**，不是层数（v0.7.0 起）
 
@@ -466,20 +401,18 @@ mod 下发的 `node_type` 是**游戏枚举名**（`Point.PointType.ToString()`�
 **一直是空的**（又一处形状错配）。现在也一并修了。每次决定用 info 级记一条
 `[sts2_rest] 选项=[...] 血=…/… -> 选 option_index=…`，方便玩家核对"为什么又回血了"。
 
-## 角色：每局随机，并播报抽到了谁（v0.6.2 起）
+## 角色：玩家手动选择
 
-选人界面改走**游戏自带的「随机」候选**（`is_random`），而不是插件自己摇 —— 随机语义交给游戏，
-开局后再从 `run` 里读出实际角色，播报一次（`[sts2_character] 本局角色=…`）并告诉本体。
-「随机」只按一次（按键由**执行**推动，见上文那条通用护栏），按过就转入 `embark`。
+进房后停在选人界面。你手动选择猫娘角色并确认 ready/embark；插件只读取确认后的角色，不替你操作。
 
 ## 自动游玩历史页（v0.6.1 起）
 
 插件 UI 新增面板「自动游玩历史」（`static/history.html`），每局展示：结局/角色/层级、损血合计与
-**最痛几处**、教训与复盘、以及**逐条选择**（步数/界面/动作/理由）。
+**最痛几处**、教训与复盘、以及**逐条选择**（步数/界面/动作/理由）。新增“经验采用与速度记录”，展示匹配回合、读取、关联动作/完成，以及按局、配置和处理路径分组的耗时样本数、中位数/P90。
 
 数据通路：前端页面是插件服务器按静态文件发的（`GET /plugin/{id}/ui/<path>`），**没有直读插件内存的通道**，
-所以每次局末把 `catgirl_memory.json` 投影成 `static/autoplay_history.json`（`history_view.py`），
-页面 `fetch` 同一个静态目录下的它。权威数据仍是 `catgirl_memory.json`，快照只是视图缓存
+所以启动、局末及复盘纠正后把战报、经验与效果报告投影成 `static/autoplay_history.json`（`history_view.py`），
+页面 `fetch` 同一个静态目录下的它。权威数据是 `catgirl_memory.json` 和相邻的 `run_process/` 按局记录，快照只是视图缓存
 （升级插件被覆盖也无所谓，下次局末会重写）。
 
 ## 多语言的一个大坑（v0.6.4 起）
@@ -498,47 +431,15 @@ default_locale = "zh-CN"
 locales_dir = "i18n"
 ```
 
-并补齐了 7 种语言缺的 `companion.suggestion.reward_default`；`tests/test_i18n_completeness.py`
-守住"en 里的 `companion.*` 键在所有随包语言里都必须有译文"，防止英文再次漏到玩家眼前。
+并补齐了 7 种语言缺的 `companion.suggestion.reward_default`，避免英文漏到玩家眼前。
 
-## 求解器怎么跑的 / 计划快照（v0.7.2 起）
+## 求解器请求期限
 
-### 现状（改动前）
-
-- **mod 侧**：`GET /solver/plan` **每次调用都会重跑一遍 CombatSolver 搜索**（Short 预算 8 秒，
-  Deep 仅在 Short 无解时才触发）。所以"调用次数"直接等于"卡顿与 CPU"。
-- **插件侧**：按"整回合"缓存计划 —— 签名 = `run_id | turn | 存活敌人组合`，配一个
-  `solver_step_index` 逐步推进；签名变化或步骤用尽才重查。
-
-也就是说"算一次、按快照执行"**大体上已经存在**，但复用的判据只有"回合号 + 敌人没死"。
-这不够：**抽牌/弃牌会让手牌位置漂移**，步进下标会指到别的牌上；敌人死了会让目标失效 ——
-这些都不改回合号，却足以让快照里的下一步变成非法动作。
-
-### 现在（玩家口径："算一次、做成快照、按快照执行；每次行动后和快照对比，一致继续、不一致重算"）
-
-复用快照的**唯一判据**变成：**快照里下一步在当前局面下仍然可执行**（`_plan_step_is_executable`）：
-
-| 步骤 | 校验 |
-|---|---|
-| `play_card` | 优先按 **`card_id`** 找当前手牌里可打出的那张（位置会漂、id 不会）；只有下标时校验范围与 `playable`；牌需要目标时校验 `target_index` 仍在 `valid_target_indices` 里 |
-| `use_potion` | 该药水仍在且 `can_use` |
-| `end_turn` | `end_turn` 仍在这回合的可用动作里 |
-| 其它（选牌等） | 交给下层选牌逻辑，**不在这里反复重算** |
-
-判据是保守的：**拿不准就说"能执行"**，让原有的动作层兜底 —— 不能因为"不认识这一步"就每 tick
-重跑 8 秒的搜索。
-
-留痕（用来看"到底省了多少次求解"）：
-
-```
-[sts2_plan] 复用快照 step=2/5（局面与快照一致）
-[sts2_plan] 重新计算计划（原因：手牌里已没有可打出的 STRIKE）
-```
-
-另有一条互补的兜底：动作被 mod 拒收（`invalid_target` 之类）时也会作废快照并强制重刷
-（见"出错不停车"一节）。
+陪玩重判请求 `/solver/plan?mode=companion`：短搜索与Smart药水审计共享4秒预算，总期限6秒，取消token贯通后台搜索。求解请求串行，排队计入期限；插件HTTP等待8秒、外围含刷新等待9秒。成功或失败结果按现场与要求版本缓存，格式重试不重复启动搜索。有效续步直接执行。未带mode的独立求解仍使用原有8秒Short/120秒Deep预算。
 
 ## 复盘期间暂停自动游玩（v0.7.2 起）
+
+统一入口启用时，局末结构化摘要只投递一次，由planner沿用当前会话表达并存入复盘；不启动旧的独立生成与暂停/恢复链。自动结算输出使用`run_end:<run_id>`，checkpoint保留已发言局号，界面或控制变化不再重复生成；玩家的新输入仍可正常回答。下面的暂停/恢复机制仅用于未接管统一会话的兼容路径。
 
 玩家口径："复盘的时候暂停自动游玩，复盘完再继续"——否则猫娘会在复盘还没讲完时就冲进主菜单开下一局。
 

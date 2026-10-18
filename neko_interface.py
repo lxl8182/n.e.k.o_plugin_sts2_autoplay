@@ -36,6 +36,15 @@ class STS2NekoInterface:
             "catgirl_sync": catgirl_sync,
         }
 
+    async def query_combat(self, question: str = "") -> dict[str, Any]:
+        return await self._service.get_combat_query(question)
+
+    async def start_discussion(self, reason: str = "user") -> dict[str, Any]:
+        return await self._service.start_discussion(reason)
+
+    async def end_discussion(self) -> dict[str, Any]:
+        return await self._service.end_discussion()
+
     async def get_readout(self) -> dict[str, Any]:
         snapshot_result = await self._service.get_snapshot()
         snapshot = snapshot_result.get("snapshot") if isinstance(snapshot_result.get("snapshot"), dict) else {}
@@ -69,8 +78,8 @@ class STS2NekoInterface:
     async def set_control_mode(self, mode: str) -> dict[str, Any]:
         """切换猫娘的控制档位：`program` 自己玩 / `advise` 听安排 / `standby` 停手。
 
-        `advise` 下非战斗决策界面只算不做，等玩家发话（`sts2_execute_planned_operation`
-        就是"我点头了，走一步"）；战斗照常自动打。档位会同步给 mod，让它自己的驱动一起停手。
+        `advise` 下所有界面只判断不自动执行；显式单步执行仍须通过暂停与现场校验。
+        插件保持 Mod 自主驱动 hold，聊天不受执行档位影响。
         """
         result = await self._service.set_control_mode(mode)
         result["refreshed"] = await self._refresh_if_connected()
@@ -89,8 +98,7 @@ class STS2NekoInterface:
     async def set_play_style(self, style: str) -> dict[str, Any]:
         """切换游玩模式：`serious` 认真（默认）/ `mischievous` 捣蛋 / `silly` 笨蛋。
 
-        不影响"控制档位"（谁来决定），只决定"决定得多不认真"：捣蛋有 20%、笨蛋有 60% 的概率
-        把最优操作换成次优/最差的**合法**选择。显式授权（`sts2_execute_planned_operation`）不受影响。
+        风格进入模型决策上下文；不按概率替换模型选定的动作。
         """
         result = self._service.set_play_style(style)
         result["refreshed"] = await self._refresh_if_connected()
@@ -126,6 +134,12 @@ class STS2NekoInterface:
         if not enabled:
             result["message"] = str(result.get("message") or "") + " 已同时通知 mod 停止渲染并清屏。"
             result["summary"] = result["message"]
+        return result
+
+    async def set_catgirl_name(self, name: str) -> dict[str, Any]:
+        """设置猫娘在联机里的显示名（两个游戏进程跑在同一 Steam 账号上，名字默认分不清）。"""
+        result = self._service.set_catgirl_name(name)
+        result["mod_sync"] = await self._service.sync_catgirl_name_to_mod()
         return result
 
     async def set_route(self, *, mode: str = "safe", pick: Any = None, index: Any = None) -> dict[str, Any]:
@@ -244,13 +258,22 @@ class STS2NekoInterface:
         return self._service.start_autoplay()
 
     async def pause_autoplay(self, reason: str = "user") -> dict[str, Any]:
-        return self._service.pause_autoplay(reason=reason)
+        result = self._service.pause_autoplay(reason=reason)
+        await self._service._sync_companion_ingress()
+        await self._service._sync_execution_status()
+        return result
 
     async def resume_autoplay(self) -> dict[str, Any]:
-        return self._service.resume_autoplay()
+        result = self._service.resume_autoplay()
+        await self._service._sync_companion_ingress()
+        await self._service._sync_execution_status()
+        return result
 
     async def stop_autoplay(self, reason: str = "manual") -> dict[str, Any]:
-        return self._service.stop_autoplay(reason=reason)
+        result = self._service.stop_autoplay(reason=reason)
+        await self._service._sync_companion_ingress()
+        await self._service._sync_execution_status()
+        return result
 
     async def _current_snapshot(self) -> dict[str, Any]:
         status = await self._service.get_snapshot()

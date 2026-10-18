@@ -4,16 +4,9 @@ from typing import Any
 
 
 class STS2ModeController:
-    """猫娘的控制档位。
+    """插件执行权限：program 自主执行，advise 只判断，standby 停手。
 
-    - ``program``（自己玩）：照常决策并执行。默认。
-    - ``advise``（听安排）：照常**计算**但**不执行**；非战斗决策界面一律等玩家发话
-      （``sts2_execute_planned_operation`` 就是"我点头了，走一步"）。
-      战斗永远自动——玩家替不了猫娘出牌，停手会把回合卡死。
-    - ``standby``（彻底停手）：连计划都不算。
-
-    ``advise`` 与 ``standby`` 都会被同步给 mod（``coop_control_mode``），让 mod 自己的
-    自动玩驱动一起停手；只停插件等于没停。
+    Mod 自主驱动始终由 hold 仲裁；这些权限不抑制 N.E.K.O 本体聊天。
     """
 
     _ALIASES = {
@@ -65,12 +58,11 @@ class STS2ModeController:
             "advise": self.is_advise(normalized),
             # advise 仍然要算：玩家问"你打算怎么走"时得答得出来，所以规划器照跑。
             "allows_planner": normalized in {"program", "advise"},
-            # 是否允许自动执行。advise 下由 state_machine.ADVISE_HOLD_SCREENS 再收一道，
-            # 战斗不在那份清单里，所以战斗仍然自动打。
+            # 所有屏幕使用相同的插件执行权限。
             "allows_execute": normalized == "program",
             "allows_game_llm": False,
-            "prefers_heuristic": normalized in {"program", "advise"},
-            "prefers_model": False,
+            "prefers_heuristic": False,
+            "prefers_model": normalized in {"program", "advise"},
         }
 
 

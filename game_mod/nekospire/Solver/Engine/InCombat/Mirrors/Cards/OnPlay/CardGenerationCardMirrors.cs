@@ -332,8 +332,8 @@ internal static class CardGenerationCardMirrors
         }
 
         context.Simulator.History.CardGenerationOptions(cards);
-        // Vanilla next asks the player to choose an option. Record the deterministic options first,
-        // then mark the unresolved choice so replayed or nested results inherit the uncertainty.
-        context.History.RecordRisk(PredictionRiskReason.UnresolvedPlayerChoice);
+        // Vanilla next asks the player to choose an option. Record the deterministic options first;
+        // 这些选项随后由 CardChoiceSpec 交给搜索分支，属已建模的不确定。
+        context.History.RecordRisk(PredictionRiskReason.ModeledPlayerChoice);
     }
 }

@@ -14,9 +14,6 @@ namespace NekoComm.Game;
 
 internal static class CombatSolverFacade
 {
-    const int ShortBudgetMilliseconds = 3000;
-    const int DeepBudgetMilliseconds = 3000;
-
     public static async Task<SolverPlanPayload> BuildPlanAsync(
         CombatState state,
         Player me,
@@ -39,6 +36,10 @@ internal static class CombatSolverFacade
             includeTurnSetup = false;
             if (!ReferenceEquals(root.PlayerIdentity, me))
                 return Failed("solver_failed", "捕获的玩家与本地玩家不一致。");
+            // 出牌动画/结算/队友回合期间求解必然抛"只能在玩家出牌阶段计算"；先给出可识别的状态，
+            // 插件据此等待新鲜现场，而不是把它当失败交给模型手算（2026-10-17 02:43:31）。
+            if (root.CurrentSide != CombatSide.Player || root.PlayerPhase != PlayerTurnPhase.Play)
+                return Failed("phase_not_ready", "当前不在玩家出牌阶段，等现场恢复后再求解。");
             names = SolverDisplayNames.Capture(state);
             damage = BattleDamageTracker.Observe(state);
         }
@@ -59,7 +60,7 @@ internal static class CombatSolverFacade
         try
         {
             var first = await RunSolveAsync(root, names, damage, smartPolicy, cancellationToken);
-            if (tolerance.IsWithinTolerance(first.Snapshot.CumulativePlayerHpLost))
+            if (options.ForceShortOnly || tolerance.IsWithinTolerance(first.Snapshot.CumulativePlayerHpLost))
                 return MapResult(first, me, options, root);   // acceptable damage -> no potions
 
             int potionSlots = me.Potions.Count();
@@ -79,6 +80,10 @@ internal static class CombatSolverFacade
                     best = bounded;                            // keep the best we found so far
             }
             result = best;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return Failed("solver_cancelled", "求解已到期限或请求已取消。");
         }
         catch (Exception ex)
         {
@@ -316,12 +321,25 @@ internal static class CombatSolverFacade
     private static SolverPlanPayload Failed(string reason, string message) => new()
     {
         in_combat = false,
+        // reason 同时写进 search_status，插件据此区分"暂时不可求解"（phase_not_ready）与真实失败。
+        search_status = reason,
         warnings = new[] { message },
     };
 }
 
 internal sealed class SolverFacadeOptions
 {
+    // Companion requests need a usable current-turn prefix before the next model decision.
+    // Smart potion audits share the short-search budget; no extra facade searches follow it.
+    public static SolverFacadeOptions Companion { get; } = new()
+    {
+        ForceShortOnly = true,
+        ShortBudgetMilliseconds = 4000,
+        DeepBudgetMilliseconds = 4000,
+        MaxDegreeOfParallelism = SolverWeights.DefaultSearchMaxDegreeOfParallelism,
+        DamageThreshold = 8,
+    };
+    public const int CompanionDeadlineMilliseconds = 6000;
     // Defaults mirror the vendored engine's Medium performance preset (SolverSearchProfile.Short/Deep),
     // so /solver/plan searches with the same authority as the engine's own auto-turn-search. The previous
     // 3s / ForceShortOnly / single-thread defaults under-searched and could miss a killing line the engine

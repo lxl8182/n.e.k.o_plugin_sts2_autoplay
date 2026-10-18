@@ -15,6 +15,7 @@ internal static class Router
     private const string LogPrefix = "[NekoComm.Router]";
 
     private static long _requestCounter;
+    private static readonly SemaphoreSlim SolverGate = new(1, 1);
 
     public static async Task HandleAsync(HttpListenerContext context, CancellationToken cancellationToken)
     {
@@ -99,7 +100,25 @@ internal static class Router
             {
                 // Use the ASYNC InvokeAsync overload: the vendored Capture runs on the game thread,
                 // while the search is offloaded to a Task.Run worker so the game thread is not blocked.
-                var plan = await GameThread.InvokeAsync(() => GameSolverService.BuildSolverPlanAsync());
+                bool companion = request.QueryString["mode"] == "companion";
+                using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                if (companion)
+                    deadline.CancelAfter(SolverFacadeOptions.CompanionDeadlineMilliseconds);
+                var started = System.Diagnostics.Stopwatch.StartNew();
+                SolverPlanPayload plan;
+                await SolverGate.WaitAsync(deadline.Token);
+                try
+                {
+                    plan = await GameThread.InvokeAsync(() => GameSolverService.BuildSolverPlanAsync(
+                        deadline.Token, companion ? SolverFacadeOptions.Companion : null));
+                }
+                finally
+                {
+                    SolverGate.Release();
+                }
+                Log.Info($"[NekoSpire.Solver] mode={(companion ? "companion" : "default")} " +
+                    $"elapsed_ms={started.ElapsedMilliseconds} deadline_ms={(companion ? SolverFacadeOptions.CompanionDeadlineMilliseconds : 0)} " +
+                    $"cancelled={deadline.IsCancellationRequested} in_combat={plan.in_combat}");
                 await WriteJsonAsync(response, 200, new
                 {
                     ok = true,
@@ -169,6 +188,30 @@ internal static class Router
                 return;
             }
 
+            if (request.Url?.AbsolutePath == "/companion/status" &&
+                request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            {
+                var snapshot = await GameThread.InvokeAsync(CompanionStatusService.Snapshot);
+                await WriteJsonAsync(response, 200, new { ok = true, request_id = requestId, data = snapshot });
+                statusCode = 200;
+                return;
+            }
+
+            if (request.Url?.AbsolutePath == "/companion/status" &&
+                request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                var update = await JsonHelper.DeserializeAsync<CompanionStatusRequest>(request.InputStream, cancellationToken);
+                if (update == null || string.IsNullOrWhiteSpace(update.session_id) || update.session_id.Length > 200 ||
+                    update.revision < 1 || update.text == null || update.detail == null ||
+                    update.text.Length > 160 || update.detail.Length > 500 ||
+                    !double.IsFinite(update.ttl_seconds) || update.ttl_seconds is < 3 or > 60)
+                    throw new ApiException(400, "invalid_request", "Status requires session_id, positive revision, text<=160, detail<=500 and ttl_seconds between 3 and 60.");
+                var status = await CompanionStatusService.UpdateAsync(update);
+                await WriteJsonAsync(response, 200, new { ok = true, request_id = requestId, data = new { status } });
+                statusCode = 200;
+                return;
+            }
+
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/danmaku/clear")
             {
@@ -230,11 +273,20 @@ internal static class Router
                     data = new
                     {
                         coop_enabled = cfg.coop_enabled,
+                        coop_manual_character_selection = cfg.coop_manual_character_selection,
+                        coop_client_port = cfg.coop_client_port,
+                        coop_control_mode = cfg.coop_control_mode,
+                        coop_discussion_paused = cfg.coop_discussion_paused,
+                        coop_hold_persistent = true,
+                        autoplay_action_in_flight = NekoAutoplayDriver.Instance.ActionInFlight,
                         llm_enabled = cfg.llm_enabled,
                         danmaku_enabled = cfg.danmaku_enabled,
                         danmaku_push_enabled = cfg.danmaku_push_enabled,
+                        companion_status_enabled = cfg.companion_status_enabled,
                         coop_map_follow_player = cfg.coop_map_follow_player,
                         coop_map_vote_wait_seconds = cfg.coop_map_vote_wait_seconds,
+                        coop_catgirl_name = cfg.coop_catgirl_name,
+                        coop_host_name = cfg.coop_host_name,
                         coop_yield_to_saved_run = cfg.coop_yield_to_saved_run,
                         llm_base_url = cfg.llm_base_url,
                         llm_model = cfg.llm_model,
@@ -255,16 +307,24 @@ internal static class Router
                 var cfgWrite = await JsonHelper.DeserializeAsync<ConfigWriteRequest>(request.InputStream, cancellationToken);
                 if (cfgWrite == null)
                     throw new ApiException(400, "invalid_request", "Request body must be a JSON object.");
+                if (cfgWrite.coop_control_mode != null && cfgWrite.coop_control_mode.Trim().ToLowerInvariant() is not ("auto" or "advise" or "hold"))
+                    throw new ApiException(400, "invalid_request", "coop_control_mode must be auto, advise or hold.");
 
                 var cfg = NekoConfig.Current;
                 var pushWasEnabled = cfg.danmaku_push_enabled;
                 cfg.llm_enabled = cfgWrite.llm_enabled ?? cfg.llm_enabled;
                 cfg.danmaku_enabled = cfgWrite.danmaku_enabled ?? cfg.danmaku_enabled;
                 cfg.danmaku_push_enabled = cfgWrite.danmaku_push_enabled ?? cfg.danmaku_push_enabled;
+                cfg.companion_status_enabled = cfgWrite.companion_status_enabled ?? cfg.companion_status_enabled;
                 cfg.coop_enabled = cfgWrite.coop_enabled ?? cfg.coop_enabled;
+                cfg.coop_manual_character_selection = cfgWrite.coop_manual_character_selection ?? cfg.coop_manual_character_selection;
+                cfg.coop_control_mode = string.IsNullOrWhiteSpace(cfgWrite.coop_control_mode) ? cfg.coop_control_mode : cfgWrite.coop_control_mode.Trim().ToLowerInvariant();
+                cfg.coop_discussion_paused = cfgWrite.coop_discussion_paused ?? cfg.coop_discussion_paused;
                 cfg.coop_client_port = cfgWrite.coop_client_port ?? cfg.coop_client_port;
                 cfg.coop_map_follow_player = cfgWrite.coop_map_follow_player ?? cfg.coop_map_follow_player;
                 cfg.coop_map_vote_wait_seconds = cfgWrite.coop_map_vote_wait_seconds ?? cfg.coop_map_vote_wait_seconds;
+                cfg.coop_catgirl_name = cfgWrite.coop_catgirl_name ?? cfg.coop_catgirl_name;
+                cfg.coop_host_name = cfgWrite.coop_host_name ?? cfg.coop_host_name;
                 cfg.llm_base_url = cfgWrite.llm_base_url ?? cfg.llm_base_url;
                 cfg.llm_model = cfgWrite.llm_model ?? cfg.llm_model;
                 cfg.llm_api_key = cfgWrite.llm_api_key ?? cfg.llm_api_key;
@@ -282,8 +342,14 @@ internal static class Router
                     data = new
                     {
                         status = "updated",
+                        coop_manual_character_selection = cfg.coop_manual_character_selection,
+                        coop_control_mode = cfg.coop_control_mode,
+                        coop_discussion_paused = cfg.coop_discussion_paused,
+                        coop_hold_persistent = true,
+                        autoplay_action_in_flight = NekoAutoplayDriver.Instance.ActionInFlight,
                         llm_enabled = cfg.llm_enabled,
                         danmaku_push_enabled = cfg.danmaku_push_enabled,
+                        companion_status_enabled = cfg.companion_status_enabled,
                         llm_model = cfg.llm_model,
                         llm_base_url = cfg.llm_base_url,
                     }
@@ -448,10 +514,16 @@ internal sealed record ConfigWriteRequest(
     bool? llm_enabled,
     bool? danmaku_enabled,
     bool? danmaku_push_enabled,
+    bool? companion_status_enabled,
     bool? coop_enabled,
+    bool? coop_manual_character_selection,
+    string? coop_control_mode,
+    bool? coop_discussion_paused,
     int? coop_client_port,
     bool? coop_map_follow_player,
     int? coop_map_vote_wait_seconds,
+    string? coop_catgirl_name,
+    string? coop_host_name,
     string? llm_base_url,
     string? llm_model,
     string? llm_api_key,

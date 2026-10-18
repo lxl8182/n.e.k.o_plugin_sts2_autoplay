@@ -154,7 +154,10 @@ def _enemy_intent_label(enemy: Any, raw_enemy: Any = None) -> str:
             if isinstance(total, (int, float)) and not isinstance(total, bool) and float(total) > 0:
                 hits = item.get("hits")
                 if isinstance(hits, (int, float)) and not isinstance(hits, bool) and int(hits) > 1:
-                    return f"{label} {int(total)}x{int(hits)}"
+                    damage = item.get("damage")
+                    if isinstance(damage, (int, float)) and not isinstance(damage, bool):
+                        return f"{label} {int(damage)}×{int(hits)}（合计{int(total)}）"
+                    return f"{label} 合计{int(total)}（{int(hits)}次）"
                 return f"{label} {int(total)}"
             return label
         return ""

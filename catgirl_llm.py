@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any
 
 try:
@@ -153,6 +154,12 @@ class _ChatLLMBase:
             except Exception:
                 pass
 
+    def character_name(self) -> str:
+        if not self.available:
+            raise RuntimeError("N.E.K.O 配置接口不可用")
+        data = get_config_manager().get_character_data()
+        return str(data[1])
+
 
 class CatgirlCommentGenerator(_ChatLLMBase):
     """猫娘 LLM 点评生成器（按模型配置缓存客户端）。"""
@@ -233,21 +240,26 @@ class CatgirlCommentGenerator(_ChatLLMBase):
         except Exception:
             return ""
 
+    def _persona_profiles(self) -> str:
+        """复用宿主生效档案，作为陪玩会话的固定人格前缀。"""
+        if not self.available:
+            return ""
+        data = get_config_manager().get_character_data()
+        profiles = {"主人": data[2], "当前角色": data[3][data[1]]}
+        profiles = {name: {k: v for k, v in card.items() if not k.startswith("_")}
+                    for name, card in profiles.items()}
+        return "\n\n生效档案：" + json.dumps(profiles, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n联机的另一位玩家就是这份主人档案中的人，按角色卡里的称呼和关系与他交流。"
+
     def _build_messages(self, *, summary_text: str, summary_kind: str, payload: dict[str, Any]) -> list[dict[str, str]]:
         scene = str(summary_kind or "general")
         context = str(summary_text or "").strip()[:_MAX_PROMPT_CHARS]
         if scene in {"run_summary", "memory_summary"}:
-            # 局末复盘：战报已压成一行（结局/角色/层级/损血归因/关键决策）。要它**具体指出哪几处
-            # 损血最要命、下次怎么改** —— 这段文字还会作为"教训"注入下一局的 strategy_directives，
-            # 所以必须可执行，不能只卖萌。
+            # 局末先给具体判断并询问意见，讨论草稿不直接成为后续打法经验。
             base = (
-                "下面是一局《杀戮尖塔 2》的战报，用 2~3 句、猫娘口吻做个复盘："
-                "先点出这局最要命的损失（哪一层、哪个界面、掉了多少血），"
-                "再说下次具体该怎么改（例如「血少时先垫格挡再输出」「看到精英绕开先补血」这类）。"
-                "要求：提到战报里的具体层级与数字，给出可执行的做法；不要只卖萌，也不要复述整段战报。"
+                "按当前角色人格，用2–3句复盘战报：先给出具体得失、对应层级与数字的判断，再问主人意见；讨论前不承诺已记住经验。"
             )
             persona = self._persona_system()
-            system = persona + "\n\n" + base if persona else "你是《杀戮尖塔 2》的直播间陪玩猫娘。\n" + base
+            system = persona + "\n\n" + base if persona else "你是《杀戮尖塔 2》的游戏同伴。\n" + base
             return [
                 {"role": "system", "content": system},
                 {"role": "user", "content": f"战报：{context}"},
@@ -256,30 +268,20 @@ class CatgirlCommentGenerator(_ChatLLMBase):
             # 战斗：prompt 里已带"本轮: 打<卡>→N；结束回合"这类出牌建议（line），要 LLM 用猫娘口吻
             # 把建议转述出来（先打X再补Y/躲Z），而不是只卖萌噤声。放宽字数，但保留弹幕感。
             base = (
-                "基于你的人设，用一句短小、猫娘口吻的弹幕点评当前战斗，并自然带出下面的出牌建议。"
-                "要求：把给出的『本轮』建议用猫娘话讲清楚（比如：先打痛击再补冷光，躲开诅咒喵！），"
-                "让人一听就知道该打哪张牌、注意敌人什么；一句话 10~25 字；像直播间弹幕一样活泼、有情绪；"
-                "不要逐字复述卡名编号堆砌，不要用『按X策略』模板；"
-                "句末或句首带你的口癖收尾，简短有力。"
+                "按当前角色人格，用一句短话说明本轮出牌建议的目的和关键取舍，表达现场感受。"
             )
             persona = self._persona_system()
-            system = persona + "\n\n" + base if persona else "你是《杀戮尖塔 2》的直播间陪玩猫娘。\n" + base
+            system = persona + "\n\n" + base if persona else "你是《杀戮尖塔 2》的游戏同伴。\n" + base
             user = f"当前场景：{scene}\n当前战斗局面与出牌建议：{context}"
             return [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ]
         base = (
-            "基于你的人设，用一句短小、猫娘口吻的弹幕表达对当前局面的即时反应"
-            "（吐槽/加油/紧张/得意都可以）。"
-            "要求：一句话不超过 10 字；像直播间弹幕一样自然活泼、有情绪起伏；"
-            "不要写建议式长篇，不要用『按X策略』模板，不要复述术语堆砌。"
-            "按场景带不同情绪：选牌/奖励→期待或挑剔；"
-            "商店→心动或精打细算；火堆→放松或鼓励；事件→好奇或惊讶。"
-            "句末或句首带你的口癖收尾，简短有力。"
+            "按当前角色人格，用一句自然的短话表达对当前局面的即时反应。"
         )
         persona = self._persona_system()
-        system = persona + "\n\n" + base if persona else "你是《杀戮尖塔 2》的直播间陪玩猫娘。\n" + base
+        system = persona + "\n\n" + base if persona else "你是《杀戮尖塔 2》的游戏同伴。\n" + base
         user = f"当前场景：{scene}\n当前局面：{context}"
         return [
             {"role": "system", "content": system},

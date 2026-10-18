@@ -405,7 +405,8 @@ internal static partial class CardChoiceSupport
         if (options.Count == 0)
             return null;
         simulator.History.CardsSelected(options);
-        simulator.History.RecordRisk(PredictionRiskReason.UnresolvedPlayerChoice);
+        // 选项已枚举并作为 CardChoiceSpec 交给搜索分支，属已建模的不确定，不再算覆盖缺失。
+        simulator.History.RecordRisk(PredictionRiskReason.ModeledPlayerChoice);
         string contextId = $"seeker:{simulator.Rng.CombatCardSelection.Counter()}:" +
             string.Join(',', options.Select(card =>
                 $"{card.Preview.Id.Entry}+{card.Preview.CurrentUpgradeLevel}"));

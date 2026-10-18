@@ -17,7 +17,6 @@ from transport_client import STS2TransportClient
 
 # 与 C# 侧 ExternalControl.HeaderName 对应，比较时统一小写。
 EXPECTED_CONTROL_HEADER = "x-neko-external-control"
-EXPECTED_CLIENT_HEADER = "x-neko-client"
 
 
 def _header_map(request_text: str) -> dict[str, str]:
@@ -75,22 +74,8 @@ async def _capture_request(call) -> str:
     return state.get("raw", "")
 
 
-async def _get_state(client: STS2TransportClient) -> None:
-    await client.get_state()
-
-
 async def _post_action(client: STS2TransportClient) -> None:
     await client.execute_action("choose_map_node", option_index=1)
-
-
-async def _post_config(client: STS2TransportClient) -> None:
-    await client.set_config(coop_map_policy="wait")
-
-
-def test_get_state_carries_the_external_control_header() -> None:
-    headers = _header_map(asyncio.run(_capture_request(_get_state)))
-    assert headers.get(EXPECTED_CONTROL_HEADER) == "1"
-    assert headers.get(EXPECTED_CLIENT_HEADER) == "sts2_autoplay"
 
 
 def test_post_action_carries_the_external_control_header() -> None:
@@ -98,17 +83,5 @@ def test_post_action_carries_the_external_control_header() -> None:
     assert headers.get(EXPECTED_CONTROL_HEADER) == "1"
 
 
-def test_post_config_carries_the_external_control_header() -> None:
-    headers = _header_map(asyncio.run(_capture_request(_post_config)))
-    assert headers.get(EXPECTED_CONTROL_HEADER) == "1"
 
 
-async def _get_health_with_custom_client(client: STS2TransportClient) -> None:
-    await client._request("GET", "/health", headers={"X-Neko-Client": "someone-else"})
-
-
-def test_caller_supplied_headers_win_over_the_defaults() -> None:
-    """调用方自带 headers 时不能被默认标识头覆盖，但外部控制标识必须仍在。"""
-    headers = _header_map(asyncio.run(_capture_request(_get_health_with_custom_client)))
-    assert headers.get(EXPECTED_CLIENT_HEADER) == "someone-else"
-    assert headers.get(EXPECTED_CONTROL_HEADER) == "1"

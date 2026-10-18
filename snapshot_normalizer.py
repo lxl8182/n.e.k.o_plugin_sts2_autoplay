@@ -32,8 +32,24 @@ def _safe_int(value: Any, default: int = 0) -> int:
 def normalize_snapshot(state_payload: Dict[str, Any], actions_payload: Dict[str, Any]) -> Dict[str, Any]:
     actions = normalize_actions(actions_payload)
     run = state_payload.get("run") if isinstance(state_payload.get("run"), dict) else {}
+    view = state_payload.get("agent_view") if isinstance(state_payload.get("agent_view"), dict) else {}
+    screen = state_payload.get("screen") or state_payload.get("screen_type") or "unknown"
+    game_over = state_payload.get("game_over") or {}
+    victory = game_over.get("is_victory")
+    outcome = ("victory" if victory else "defeat") if isinstance(victory, bool) else {
+        "VICTORY": "victory", "DEFEAT": "defeat"}.get(str(screen).upper())
+    potions = run.get("potions") or []
+    if potions and all(p.get("occupied") for p in potions):
+        blocked = {r["index"] for r in (state_payload.get("reward") or {}).get("rewards") or []
+                   if r.get("reward_type") == "Potion"}
+        if blocked:
+            reward = view.get("reward") or {}
+            view = {**view, "reward": {**reward, "rewards": [
+                {**r, "claimable": False, "blocked_reason": "potion_slots_full"} if r["i"] in blocked else r
+                for r in reward.get("rewards") or []]}}
     return {
-        "screen": state_payload.get("screen") or state_payload.get("screen_type") or "unknown",
+        "screen": screen,
+        "outcome": outcome,
         # 真实数据 floor/act/character 常在 run 里（run.floor / run.act_id / run.character_id）
         "floor": _safe_int(state_payload.get("floor") or state_payload.get("act_floor") or run.get("floor")),
         "act": _safe_int(state_payload.get("act") or run.get("act") or run.get("act_id")),
@@ -44,6 +60,8 @@ def normalize_snapshot(state_payload: Dict[str, Any], actions_payload: Dict[str,
         "available_action_count": len(actions),
         "raw_state": state_payload,
         "raw_actions": actions_payload,
+        # Mod 已裁好的单侧视图；决策层只消费它，不从 /coop/state 拼接信息。
+        "agent_view": view,
     }
 
 

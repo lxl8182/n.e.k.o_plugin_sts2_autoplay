@@ -9,6 +9,7 @@ from typing import Any
 
 from .decision_payload import DecisionPayload
 from .instructions import instruction_summary, normalize_strategy_instruction
+from .llm_planner import view_signature
 from .snapshot_normalizer import normalize_snapshot
 
 
@@ -46,15 +47,24 @@ class STS2LoopRunner:
         # Scene-change event streaming (mod GET /events/stream): drive a refresh on a real change
         # instead of polling /state on a timer. See _event_loop / _RELEVANT_EVENT_TYPES.
         self._event_task: asyncio.Task[Any] | Future[Any] | None = None
+        self._status_task: asyncio.Task[Any] | Future[Any] | None = None
         self._last_event_refresh = 0.0
         self._event_backoff = 1.0
         self._sse_connected = False
 
-    async def tick(self) -> dict[str, Any]:
-        client = self._service._require_client()
+    async def tick(self, *, plan_combat: bool = False) -> dict[str, Any]:
+        client = await self._service._ensure_companion_client()
         raw_state = await client.get_state()
         raw_actions = await client.get_available_actions()
         snapshot = normalize_snapshot(raw_state, raw_actions)
+        view = snapshot.get("agent_view") or {}
+        epoch = self._service._companion_session.epoch
+        if view:
+            from .agent_facts import build_agent_facts
+            self._service._companion_session.observe(view, in_combat=snapshot.get("in_combat"),
+                                                     effects=build_agent_facts(raw_state))
+        if self._service._companion_session.epoch != epoch:
+            self._service._reset_companion_run_context()
         action_registry = self._service._action_registry.build(snapshot)
         classification = self._service._state_machine.classify(snapshot)
         snapshot_with_context = {**snapshot, "classification": classification, "polled_at": time()}
@@ -80,73 +90,10 @@ class STS2LoopRunner:
             strategy_context,
         )
         mode_info = self._service._mode_controller.describe(self._service._state.control_mode)
-        # Combat recommendation source: the mod's authoritative /solver/plan (vendored CombatSolver).
-        # plan() is sync, so fetch here (async tick) and inject into the contexts it reads. A stale
-        # search or no-in-combat payload falls back to the heuristic combat path inside the planner.
-        # Cache by combat-state signature: the mod re-runs the CombatSolver search on EVERY /solver/plan
-        # call, so reuse the plan while the combat state (hand/energy/enemies/potions) is unchanged.
-        solver_plan = None
-        in_combat_decision = classification.get("state_name") == "combat" and mode_info.get("allows_planner")
-        step_index = self._service._state.solver_step_index if isinstance(self._service._state.solver_step_index, int) else 0
-        if in_combat_decision:
-            # ── 计划快照语义（玩家口径）──────────────────────────────────────────────
-            # "算一次、做成快照、直接按快照执行；每次行动后用当前局面和快照对比，
-            #   一致就继续，不一致就重新算。"
-            #
-            # mod 的 /solver/plan **每次调用都会重跑一遍 CombatSolver 搜索**（Short 预算是 8 秒），
-            # 所以能不重算就别重算。复用快照的唯一条件是：**快照里下一步在当前局面下仍然可执行**。
-            # 单看"签名没变"不够 —— 抽牌/弃牌会让手牌漂移，步进下标就会指到别的牌上。
-            sig = _combat_plan_signature(snapshot)
-            cached, reason = _reusable_plan(
-                self._solver_plan_cached,
-                self._solver_plan_sig,
-                sig,
-                step_index,
-                snapshot,
-            )
-            if cached is not None:
-                solver_plan = cached
-                self._log_plan_reuse(step_index, len(_current_turn_steps(cached) or []))
-            if solver_plan is None:
-                try:
-                    fetched = await client.get_combat_plan()
-                except Exception:
-                    fetched = None
-                if fetched and fetched.get("in_combat"):
-                    # Only cache an actionable plan; otherwise leave it empty so the next tick retries.
-                    solver_plan = fetched
-                    self._solver_plan_sig = sig
-                    self._solver_plan_cached = fetched
-                    self._service._state.solver_step_index = 0
-                    self._log_plan_refresh(reason or "首次取计划")
-                else:
-                    solver_plan = None
-        else:
-            # Not in a combat decision phase: drop the cache so re-entering combat refetches.
-            # 不清空 solver_step_index：中途可能出现选牌(combat_hand_select)等非决策态。
-            self._solver_plan_sig = None
-            self._solver_plan_cached = None
-        # 若当前这步是需要"选一张牌"的动作（消耗/拉弃牌堆/生成到手/变换等），solver 已选好那张
-        # （choice_card_id）。按当前步进索引取，供随后的选牌界面据此选牌。
-        if in_combat_decision and solver_plan:
-            pending_choice: str | None = None
-            steps = _current_turn_steps(solver_plan)
-            if steps:
-                i = step_index if step_index < len(steps) else len(steps) - 1
-                step0 = steps[i]
-                if isinstance(step0, dict) and step0.get("choice_card_id"):
-                    pending_choice = str(step0.get("choice_card_id"))
-            self._service._state.pending_card_choice_id = pending_choice
-        candidate_actions = self._service._candidate_generator.generate(
-            {
-                "snapshot": {**snapshot, "action_registry": action_registry},
-                "classification": classification,
-                "summary_context": summary_context,
-                "strategy_context": strategy_context,
-                "solver_plan": solver_plan,
-            },
-            mode="program",
-        )
+        if self._service._state.discussion_active:
+            # 讨论暂停只关执行；仍可在停手状态计算提议。
+            mode_info = {**mode_info, "allows_planner": True}
+        candidate_actions = []
         instructions = list(self._service._state.pending_guidance)
         instructions.append(
             normalize_strategy_instruction(
@@ -193,18 +140,13 @@ class STS2LoopRunner:
         decision_payload["run_intent"] = dict(self._service._state.run_intent)
         summary_context["decision_payload"] = decision_payload
         strategy_context["decision_payload"] = decision_payload
-        planning_context = {
-            "snapshot": {**snapshot, "action_registry": action_registry},
-            "classification": classification,
-            "summary_context": summary_context,
-            "strategy_context": strategy_context,
-            "mode": mode_info,
-            "solver_plan": solver_plan,
-            "pending_card_choice_id": self._service._state.pending_card_choice_id,
-            "solver_step_index": self._service._state.solver_step_index,
-        }
-        planned_operation = self._service._planner.plan(planning_context) if mode_info.get("allows_planner") else None
-        planned_operation_dict = planned_operation.as_dict() if planned_operation is not None else None
+        # 状态刷新只读；模型调用由单独的动作循环串行进行，聊天/SSE 不等待模型。
+        previous_operation = self._service._state.snapshot.get("planned_operation")
+        planned_operation_dict = None
+        if (isinstance(previous_operation, dict) and previous_operation.get("view_signature") == view_signature(snapshot.get("agent_view") or {})
+                and previous_operation.get("session_generation") == self._service._companion_session.generation
+                and previous_operation.get("control_mode") == self._service._state.control_mode):
+            planned_operation_dict = previous_operation
 
         agent_operation = planned_operation_dict
 
@@ -275,6 +217,9 @@ class STS2LoopRunner:
 
     def start_background(self) -> None:
         self._shutdown = False
+        if self._status_task is None or self._task_done(self._status_task):
+            self._ensure_owner_loop()
+            self._status_task = self._create_task(self._status_loop(), name="sts2-status-heartbeat")
         # 事件流模式下完全靠 /events/stream 驱动刷新（真正的变化才拉 /state），不再另起一个定时
         # 轮询循环——否则状态没变也每几秒重推一遍状态/通报，重复刷屏污染日志。轮询循环仅作为
         # use_event_stream=false（无 SSE 的客户端）的兜底。
@@ -365,6 +310,7 @@ class STS2LoopRunner:
         while not self._shutdown:
             try:
                 await self._service.refresh_state(trigger_sync=True)
+                await self._service.reconcile_turn_control()
             except Exception as exc:
                 self._service._mark_loop_error(exc)
             await asyncio.sleep(self._poll_interval())
@@ -382,7 +328,7 @@ class STS2LoopRunner:
         # with exponential backoff; the slow _poll_loop remains the safety net.
         while not self._shutdown:
             try:
-                client = self._service._require_client()
+                client = await self._service._ensure_companion_client()
                 if not hasattr(client, "subscribe_events"):
                     # No SSE-capable transport; nothing to do.
                     return
@@ -400,14 +346,19 @@ class STS2LoopRunner:
                         await self._maybe_event_refresh(force=True)
                         # 连接上 mod 后把其自身 LLM/弹幕交给本插件（mod 可能晚于插件启动），失败静默。
                         try:
-                            await self._service._require_client().set_config(llm_enabled=False, danmaku_enabled=False)
+                            await client.set_config(llm_enabled=False, danmaku_enabled=False)
+                            await self._service.sync_control_mode_to_mod()
+                            # 每次(重)连都推一次猫娘显示名：游戏可能晚于插件启动、或中途重启，
+                            # 这条 stream_ready 是必然触发的握手点，比单靠 startup/adopt 更可靠。
+                            await self._service.sync_catgirl_name_to_mod()
+                            await self._service.reconcile_turn_control()
                         except Exception:
                             pass
                         continue
                     if event_type in self._RELEVANT_EVENT_TYPES:
                         # 战斗弹幕只认三个战斗事件（见 _COMBAT_DANMAKU_EVENTS）；非战斗事件清空，
                         # 避免 _current_event_type 把上一场战斗的事件类型串进当前画面。
-                        self._current_event_type = event_type if event_type in self._COMBAT_DANMAKU_EVENTS else ""
+                        self._current_event_type = event_type
                         await self._maybe_event_refresh(force=False)
                     # heartbeat / unknown events -> ignore.
             except Exception as exc:
@@ -426,6 +377,7 @@ class STS2LoopRunner:
         self._last_event_refresh = now
         try:
             await self._service.refresh_state(trigger_sync=True)
+            await self._service.reconcile_turn_control()
         except Exception as exc:
             self._service._mark_loop_error(exc)
 
@@ -438,18 +390,30 @@ class STS2LoopRunner:
 
     async def _autoplay_loop(self) -> None:
         while not self._shutdown:
-            if self._service._state.autoplay_state != "running" or self._service._state.standby:
+            await self._service._sync_companion_ingress()
+            await self._service._sync_execution_status()
+            has_input = bool(self._service._companion_session.pending_messages() or self._service._ingress_callbacks
+                             or self._service._decision_failure_notice)
+            if (self._service._state.autoplay_state != "running" or self._service._state.standby) and not has_input:
                 await asyncio.sleep(0.25)
                 continue
             try:
-                await self._service.run_autoplay_step()
+                result = await self._service.run_autoplay_step()
             except Exception as exc:
-                # 出错**不停车**：记一次错误后退避重试。autoplay_state 只表达玩家意图，
-                # 任何错误都不该把它从 running 改掉（否则这个循环会永久空转，见 service._mark_loop_error）。
-                self._service._mark_loop_error(exc)
-                await asyncio.sleep(self._service._autoplay_retry_backoff())
+                # 单次错误退避；连续失败达到上限后暂停并投递原因。
+                self._service._mark_loop_error(exc, autoplay=True)
+                await asyncio.sleep(0.25 if self._service._decision_failure_notice
+                                    else self._service._autoplay_retry_backoff())
                 continue
-            await asyncio.sleep(self._service._cfg_action_interval())
+            delay = (self._service._autoplay_retry_backoff() if result.get("status") in {"error", "retrying"}
+                     else 0 if result.get("executed") and self._service._selected_steps
+                     else 0.1 if result.get("status") == "pending" else 0.25)
+            await asyncio.sleep(delay)
+
+    async def _status_loop(self) -> None:
+        while not self._shutdown:
+            await self._service._sync_execution_status()
+            await asyncio.sleep(3)
 
     def _log_plan_reuse(self, step_index: int, total: int) -> None:
         """按快照继续执行时留痕（同一步只记一次）—— 用来核对"到底省了多少次求解"。"""
@@ -501,7 +465,7 @@ class STS2LoopRunner:
 
     def stop_background_sync(self) -> None:
         self._shutdown = True
-        for task in (self._autoplay_task, self._poll_task, self._event_task):
+        for task in (self._autoplay_task, self._poll_task, self._event_task, self._status_task):
             if task is None or task.done():
                 continue
             try:
@@ -512,6 +476,7 @@ class STS2LoopRunner:
         self._autoplay_task = None
         self._poll_task = None
         self._event_task = None
+        self._status_task = None
         self._stop_owner_loop()
 
 

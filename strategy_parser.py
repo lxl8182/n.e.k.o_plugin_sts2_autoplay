@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import json
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +60,73 @@ class STS2StrategyParser:
         self._strategies_dir = strategies_dir or Path(__file__).with_name("strategies")
         self._prompt_cache: dict[tuple[str, str], str] = {}
         self._constraints_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        self._knowledge_files: dict[Path, tuple[tuple[int, int], str]] = {}
+
+    def decision_knowledge(self, strategy: str, scene: str) -> dict[str, Any]:
+        """读取当前角色知识，不沿兼容路径回退到其他角色。"""
+        base: dict[str, Any] = {"sources": [], "text": ""}
+        current: dict[str, Any] = {"sources": [], "text": ""}
+        scene_titles = {"combat": ("战斗",), "reward": ("选牌", "奖励"), "map": ("地图",),
+                        "shop": ("商店",), "event": ("事件",), "remove": ("移除", "删牌"),
+                        "exhaust": ("消耗",), "upgrade": ("升级",), "rest": ("休息", "营火", "火堆")}
+        all_titles = tuple(title for titles in scene_titles.values() for title in titles)
+        common_keys = {"required", "high_priority", "conditional", "low_priority"}
+        scene_keys = {"combat": {"combat_preferences", "combat_estimators"}, "map": {"map_preferences", "route_policy"},
+                      "shop": {"shop_preferences"}}
+        paths = [(self._strategies_dir / strategy / "base.md", True),
+                 (self._strategies_dir / strategy / f"{scene}.md", False),
+                 # 通用场景规则：与角色无关的页面流程/游戏规则，按当前场景按需加载。
+                 (self._strategies_dir / "common" / f"{scene}.md", False),
+                 # 情绪/吐槽与场景梗：常驻基础知识，主人可在 common/banter.md 里补梗（接口）。
+                 (self._strategies_dir / "common" / "banter.md", True),
+                 (self._strategies_dir / self._USER_OVERRIDE_DIR / strategy / "base.md", True),
+                 (self._strategies_dir / self._USER_OVERRIDE_DIR / strategy / f"{scene}.md", False),
+                 (self._strategies_dir / "player_overrides.md", True)]
+        for path, is_base in paths:
+            if not path.is_file():
+                continue
+            stat = path.stat()
+            stamp = (stat.st_mtime_ns, stat.st_size)
+            if path not in self._knowledge_files or self._knowledge_files[path][0] != stamp:
+                self._knowledge_files[path] = (stamp, self._read_strategy_file(path))
+            text = self._knowledge_files[path][1]
+            if "## 待补充" in text or (path.name == "player_overrides.md" and "- 暂无。" in text):
+                continue
+            source = {"path": path.relative_to(self._strategies_dir).as_posix(), "hash": sha256(text.encode()).hexdigest()[:16]}
+            body = re.sub(r"\A\ufeff?---\s*\r?\n[\s\S]*?\r?\n---\s*", "", text)
+            constraints = self._parse_frontmatter(text) or {}
+            if not is_base:
+                current["sources"].append(source)
+                current["text"] += body + "\n"
+                if constraints:
+                    current["text"] += json.dumps(constraints, ensure_ascii=False, sort_keys=True) + "\n"
+                continue
+            base["sources"].append(source)
+            sections = self._parse_sections(body)
+            if not sections:
+                base["text"] += body + "\n"
+            for section in sections:
+                title = section["title"]
+                part = "## " + title + "\n" + "\n".join(section["body_lines"])
+                if title.startswith("程序约束"):
+                    continue
+                if title.startswith(all_titles):
+                    if title.startswith(scene_titles.get(scene, ())) and not any(constraints.get(k) for k in scene_keys.get(scene, ())):
+                        if source not in current["sources"]:
+                            current["sources"].append(source)
+                        current["text"] += part + "\n"
+                else:
+                    base["text"] += part + "\n"
+            common = {k: v for k, v in constraints.items() if k in common_keys and v}
+            specific = {k: v for k, v in constraints.items() if k in scene_keys.get(scene, ()) and v}
+            if common:
+                base["text"] += json.dumps(common, ensure_ascii=False, sort_keys=True) + "\n"
+            if specific:
+                if source not in current["sources"]:
+                    current["sources"].append(source)
+                current["text"] += json.dumps(specific, ensure_ascii=False, sort_keys=True) + "\n"
+        base["text"], current["text"] = base["text"].strip(), current["text"].strip()
+        return {"base": base, "scene_rules": current}
 
     def available_strategies(self) -> list[str]:
         if not self._strategies_dir.exists() or not self._strategies_dir.is_dir():

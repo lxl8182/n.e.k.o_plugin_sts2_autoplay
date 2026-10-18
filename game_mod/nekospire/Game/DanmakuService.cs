@@ -22,6 +22,14 @@ namespace NekoComm.Game
             if (!NekoConfig.Current.danmaku_push_enabled)
                 return "disabled";
 
+            // The headless catgirl client never renders the overlay: it is a second game process the player
+            // does not watch, so a danmaku there is a bug, not a feature. NekoDanmakuDriver already skips
+            // itself, but the NEKO plugin posts to BOTH processes (host + catgirl) and only the per-process
+            // danmaku_push_enabled gate stood in the way — which is why the catgirl window showed danmaku the
+            // host did not. Gating here covers every producer, including future ones.
+            if (NekoAutoplayDriver.IsCatgirlProcess())
+                return "disabled";
+
             return await GameThread.InvokeAsync(() =>
             {
                 try

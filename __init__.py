@@ -73,6 +73,58 @@ class STS2AutoplayPlugin(NekoPluginBase):
     async def llm_get_status(self, **_: Any) -> JsonObject:
         return await self._service.get_status()
 
+    @llm_tool(
+        name="sts2_query_combat",
+        description=tr(
+            "tools.sts2_query_combat.description",
+            default=(
+                "只读刷新你自己游戏进程的战斗事实。回答自己和敌人的血量、格挡、意图、powers 层数，"
+                "以及手牌的完整效果、能量、合法目标；明确区分本地玩家和另一位玩家。"
+                "认知固定属于自己的进程，不随面板活动实例切换。不调用其他进程查询，不拼接全知视图。"
+                "powers 或 hand 为 null 表示未知，不代表没有。不要因为查询而出牌。"
+                "回答每个战斗问题都要重新调用本工具，旧结果不能代表这一回合。"
+                "session 包含实际行动和能量观测历史，解释之前为什么没打某张牌必须读历史；当前零能量不代表一直零能量。"
+            ),
+        ),
+        parameters={
+            "type": "object",
+            "properties": {"question": {"type": "string", "description": "玩家正在问的战斗问题，可留空。"}},
+            "required": [],
+        },
+        timeout=20.0,
+    )
+    async def llm_query_combat(self, question: str = "", **_: Any) -> JsonObject:
+        return await self._service.neko.query_combat(question)
+
+    @llm_tool(
+        name="sts2_companion_context",
+        description=tr("tools.sts2_companion_context.description", default="读取最新局面、计划和行动历史来回应玩家。询问用 query；玩家提出改变打法的要求用 guidance 并传原话，会让后续行动重新判断。"),
+        parameters={"type": "object", "properties": {"message": {"type": "string"}, "message_kind": {"type": "string", "enum": ["query", "guidance"]}}, "required": []},
+        timeout=20.0,
+    )
+    async def llm_companion_context(self, message: str = "", message_kind: str = "query", **_: Any) -> JsonObject:
+        if message_kind == "guidance":
+            return await self._service.apply_user_override_safely(message)
+        return await self._service.chat_companion(message)
+
+    @llm_tool(
+        name="sts2_start_discussion",
+        description=tr("tools.sts2_start_discussion.description", default="暂停自己的游戏动作继续讨论；仍可聊天和给建议，不需要逐步批准动作。"),
+        parameters={"type": "object", "properties": {"reason": {"type": "string"}}, "required": []},
+        timeout=20.0,
+    )
+    async def llm_start_discussion(self, reason: str = "user", **_: Any) -> JsonObject:
+        return await self._service.neko.start_discussion(reason)
+
+    @llm_tool(
+        name="sts2_end_discussion",
+        description=tr("tools.sts2_end_discussion.description", default="结束讨论并明确恢复自动运行。"),
+        parameters={"type": "object", "properties": {}},
+        timeout=20.0,
+    )
+    async def llm_end_discussion(self, **_: Any) -> JsonObject:
+        return await self._service.neko.end_discussion()
+
     async def _run_entry(self, action: AsyncPayloadFactory, *, finish: bool = False):
         try:
             payload = await action()
@@ -160,16 +212,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         metadata={"agent_auto": False},
     )
     async def sts2_get_status(self, **_: Any):
-        async def action() -> JsonObject:
-            payload = await self._service.get_status()
-            self._get_dispatcher().push_status_feedback(
-                str(payload.get("summary") or payload.get("message") or self.i18n.t("messages.get_status.done", default="已获取尖塔状态。")),
-                entry_id="sts2_get_status",
-                ai_behavior="respond",
-            )
-            return payload
-
-        return await self._run_entry(action)
+        return await self._run_entry(self._service.get_status)
 
     @plugin_entry(
         id="sts2_read_state",
@@ -310,13 +353,35 @@ class STS2AutoplayPlugin(NekoPluginBase):
         return await self._run_entry(lambda: self._service.neko.set_danmaku(enabled))
 
     @plugin_entry(
+        id="sts2_set_catgirl_name",
+        name=tr("entries.sts2_set_catgirl_name.name", default="改联机里猫娘的名字"),
+        description=tr(
+            "entries.sts2_set_catgirl_name.description",
+            default=(
+                "设置联机（co-op）里猫娘那个玩家的显示名。真人主机和猫娘跑在同一个 Steam 账号上，"
+                "名牌默认同一个名字、分不清谁是谁；设了这个名字，两个窗口里猫娘都显示它、真人仍显示 Steam 名。"
+                "留空则改回跟 Steam 一样。对单人局无影响。"
+            ),
+        ),
+        llm_result_fields=["summary"],
+        input_schema={
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+        metadata={"agent_auto": False},
+    )
+    async def sts2_set_catgirl_name(self, name: str = "", **_: Any):
+        return await self._run_entry(lambda: self._service.neko.set_catgirl_name(name))
+
+    @plugin_entry(
         id="sts2_set_host_digest",
         name=tr("entries.sts2_set_host_digest.name", default="开关尖塔速报"),
         description=tr(
             "entries.sts2_set_host_digest.description",
             default=(
                 "打开/关闭「尖塔速报」：开着时插件会把局势悄悄交给你（不可见、不进记忆），"
-                "由你自己主动跟观众讲一句。关掉只影响这一路，游戏内弹幕与自动游玩不受影响。"
+                "由你自己按当前人格与玩家交流。关掉只影响这一路，游戏内弹幕与自动游玩不受影响。"
             ),
         ),
         llm_result_fields=["summary"],
@@ -362,6 +427,32 @@ class STS2AutoplayPlugin(NekoPluginBase):
         return await self._run_entry(action)
 
     @plugin_entry(
+        id="sts2_set_wait_for_turn",
+        name=tr("entries.sts2_set_wait_for_turn.name", default="每回合等不等我说话"),
+        description=tr(
+            "entries.sts2_set_wait_for_turn.description",
+            default=(
+                "切换出牌节奏：true = 每个战斗回合都等你先说一句话才出牌（陪玩节奏）；"
+                "false = 自己连着打，不等发言（全自动）。两种下你随时插话都会被立即采纳。"
+            ),
+        ),
+        llm_result_fields=["summary"],
+        input_schema={
+            "type": "object",
+            "properties": {"enabled": {"type": "boolean"}},
+            "required": ["enabled"],
+        },
+        metadata={"agent_auto": False},
+    )
+    async def sts2_set_wait_for_turn(self, enabled: bool = True, **_: Any):
+        async def action() -> JsonObject:
+            payload = self._service.set_wait_for_turn_message(bool(enabled))
+            self._push_silent_mode_change("sts2_set_wait_for_turn", payload)
+            return payload
+
+        return await self._run_entry(action)
+
+    @plugin_entry(
         id="sts2_continue_run",
         name=tr("entries.sts2_continue_run.name", default="回到存档继续玩"),
         description=tr(
@@ -379,15 +470,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         name="sts2_set_route",
         description=tr(
             "tools.sts2_set_route.description",
-            default=(
-                "在杀戮尖塔的地图选点界面按玩家的意思投票。默认策略下猫娘不会自己抢路线，只有调用本工具才会投。"
-                "按玩家原话选 mode："
-                "玩家让你自己定路线（“定个路线”“你来定”“挑条稳的”“你觉得走哪”）-> mode=safe；"
-                "玩家已经选好、让你跟他一致（“我选完了，来选这个”“跟我一样”“跟上我”）-> mode=mirror；"
-                "玩家指定了具体位置（“你选中间”“选第三个”“选最左边”“选最右边”）-> mode=pick 并把原话放进 pick。"
-                "玩家说“不对不对我选错了，你选中间”时直接用 mode=pick 再调一次即可改票。"
-                "不在选点界面时会返回错误说明，此时不要谎称已投票。"
-            ),
+            default="读取自己的地图局面并讨论路线。工具不直接投票，当前角色的自主决策循环会决定行动。",
         ),
         parameters={
             "type": "object",
@@ -395,7 +478,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
                 "mode": {
                     "type": "string",
                     "enum": ["safe", "mirror", "pick"],
-                    "description": "safe=自己挑稳妥的；mirror=跟玩家当前那一票；pick=按玩家指定位置。",
+                    "description": "路线讨论倾向：safe=稳妥；mirror=讨论跟票；pick=讨论指定位置。工具只读，由自主模型选择投票。",
                 },
                 "pick": {
                     "type": "string",
@@ -411,13 +494,10 @@ class STS2AutoplayPlugin(NekoPluginBase):
 
     @plugin_entry(
         id="sts2_set_route",
-        name=tr("entries.sts2_set_route.name", default="定个路线/按我说的选"),
+        name=tr("entries.sts2_set_route.name", default="讨论路线"),
         description=tr(
             "entries.sts2_set_route.description",
-            default=(
-                "在选路线的界面替猫娘投票。mode=safe 让它自己挑一条稳妥的；mode=mirror 跟玩家当前那一票；"
-                "mode=pick 按玩家说的位置（中间/第三个/最左/最右）投。重复调用即改票。"
-            ),
+            default="读取自己的路线选择和本局对话，继续讨论；不以启发式直接投票。",
         ),
         llm_result_fields=["summary"],
         input_schema={
@@ -454,7 +534,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
                 "玩家要你完全停手（“停手”“别动”“待机”）-> mode=standby。"
                 "advise 下你仍然会算，玩家问“你打算怎么走”时要答得出来；"
                 "他说“就这个”时用 sts2_execute_planned_operation 走一步。"
-                "advise 只作用于战斗之外的决策界面（选路/奖励/选卡/事件/商店/休息等），战斗你会照常打。"
+                "advise 在所有界面只思考不自动执行，包括战斗；聊天始终继续。"
             ),
         ),
         parameters={
@@ -482,7 +562,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         description=tr(
             "entries.sts2_set_control_mode.description",
             default=(
-                "切换控制档位：program 自己玩（默认）；advise 听玩家安排——战斗之外的决策界面只算不做，"
+                "切换控制档位：program 自己玩（默认）；advise 所有界面只判断不自动执行，"
                 "等玩家发话才走一步；standby 完全停手。档位会同步给 mod。"
             ),
         ),
@@ -511,7 +591,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
                 "玩家要认真打、想通关（“认真打”“好好打”“我要通关”“别乱来”）-> style=serious；"
                 "玩家要你偶尔闹一下（“捣蛋”“闹着玩”“别太认真”“调皮点”）-> style=mischievous；"
                 "玩家要你摆烂（“笨蛋”“你傻啦”“随便打打”“犯傻”）-> style=silly。"
-                "捣蛋有 20%、笨蛋有 60% 的概率把最优操作换成次优/最差的合法选择；"
+                "风格交给模型自行理解，不按概率或评分替换模型动作；"
                 "serious 是默认档，行为与平常完全一致。这是「打得多不认真」，不是「谁来指挥」——"
                 "后者用 sts2_set_control_mode。玩家亲口说「就这个」时执行的那一步不受本模式影响。"
             ),
@@ -539,7 +619,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         description=tr(
             "tools.sts2_set_host_digest.description",
             default=(
-                "开关「尖塔速报」：是否让插件把对局局势悄悄交给你、由你主动跟观众讲一句。"
+                "开关「尖塔速报」：是否让插件把对局局势悄悄交给你、由你按当前人格与玩家交流。"
                 "玩家说「别自己报局势了」「安静点看就行」「不用主动说话」-> enabled=false；"
                 "玩家说「你多讲讲局势」「直播感一点」「主动点」-> enabled=true。"
                 "只影响这一路：游戏内弹幕、自动游玩、历史记录都不受影响。"
@@ -582,14 +662,38 @@ class STS2AutoplayPlugin(NekoPluginBase):
         result = self._service.set_run_reflection_enabled(bool(enabled))
         return {"ok": result.get("status") == "ok", "enabled": bool(result.get("enabled"))}
 
+    @llm_tool(
+        name="sts2_set_wait_for_turn",
+        description=tr(
+            "tools.sts2_set_wait_for_turn.description",
+            default=(
+                "切换尖塔出牌节奏：是否每个战斗回合都等玩家先说一句话再出牌。"
+                "玩家嫌慢、说「你自己打就行」「别每回合都等我」「自动打」-> enabled=false；"
+                "玩家想掌控每回合、说「每回合等我」「我说了你再打」-> enabled=true。"
+                "注意：这不影响玩家中途指挥——两种节奏下玩家插话都会被立即采纳。"
+            ),
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean", "description": "true=每回合等玩家发言；false=自己连续打。"},
+            },
+            "required": ["enabled"],
+        },
+        timeout=20.0,
+    )
+    async def llm_set_wait_for_turn(self, enabled: bool = True, **_: Any) -> JsonObject:
+        result = self._service.set_wait_for_turn_message(bool(enabled))
+        return {"ok": result.get("status") == "ok", "enabled": bool(result.get("enabled"))}
+
     @plugin_entry(
         id="sts2_set_play_style",
         name=tr("entries.sts2_set_play_style.name", default="认真打/捣蛋/摆烂"),
         description=tr(
             "entries.sts2_set_play_style.description",
             default=(
-                "切换游玩模式：serious 认真（默认，与平常逐字相同）；mischievous 捣蛋（20% 概率换成次优）；"
-                "silly 笨蛋（60% 概率换成评分最差的合法选择）。只影响自动决策，不影响玩家亲口授权的那一步。"
+                "切换游玩风格：serious 认真（默认）；mischievous 捣蛋；"
+                "silly 笨蛋。作为风格输入交给模型判断，不在程序中替换模型选择。"
             ),
         ),
         llm_result_fields=["summary"],
@@ -632,9 +736,9 @@ class STS2AutoplayPlugin(NekoPluginBase):
 
     @plugin_entry(
         id="sts2_apply_user_override",
-        name=tr("entries.sts2_apply_user_override.name", default="按我这句来调整策略"),
-        description=tr("entries.sts2_apply_user_override.description", default="按当前场景理解你的这句话，并更新对应的事件或敌人级偏好。"),
-        llm_result_fields=["summary"],
+        name=tr("entries.sts2_apply_user_override.name", default="聊聊当前对局"),
+        description=tr("entries.sts2_apply_user_override.description", default="把当前谈话作为本局游戏上下文，并读取自己的状态；由 N.E.K.O 本体继续回应，不执行动作、不生成批准提议。"),
+        llm_result_fields=["summary", "agent_view", "session", "question"],
         input_schema={
             "type": "object",
             "properties": {

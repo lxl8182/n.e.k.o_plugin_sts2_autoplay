@@ -267,6 +267,9 @@ class STS2SummaryContextBuilder:
 
     def _build_combat_context(self, snapshot: dict[str, Any], raw_state: dict[str, Any]) -> dict[str, Any]:
         combat = raw_state.get("combat") if isinstance(raw_state.get("combat"), dict) else {}
+        players = combat.get("players") or []
+        local_identity = next((item for item in players if item.get("is_local")), {})
+        multiplayer = raw_state.get("multiplayer") or {}
         player = combat.get("player") if isinstance(combat.get("player"), dict) else {}
         hand = combat.get("hand") if isinstance(combat.get("hand"), list) else []
         enemies = combat.get("enemies") if isinstance(combat.get("enemies"), list) else []
@@ -276,6 +279,11 @@ class STS2SummaryContextBuilder:
         selection = raw_state.get("selection") if isinstance(raw_state.get("selection"), dict) else {}
         selection_cards = selection.get("cards") if isinstance(selection.get("cards"), list) else []
         return {
+            "local_player_identity": {
+                "player_id": local_identity.get("player_id"),
+                "character_name": local_identity.get("character_name") or local_identity.get("character_id"),
+                "net_game_type": multiplayer.get("net_game_type"),
+            },
             "turn": raw_state.get("turn") if raw_state.get("turn") is not None else combat.get("turn"),
             "floor": snapshot.get("floor") if snapshot.get("floor") is not None else raw_state.get("run", {}).get("floor"),
             "act": snapshot.get("act") if snapshot.get("act") is not None else raw_state.get("run", {}).get("act"),

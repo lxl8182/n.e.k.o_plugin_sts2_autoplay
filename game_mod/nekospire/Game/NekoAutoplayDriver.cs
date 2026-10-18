@@ -50,7 +50,8 @@ namespace NekoComm.Game
 
         private readonly object _gate = new();
         private bool _started;
-        private bool _inFlight;
+        private volatile bool _inFlight;
+        public bool ActionInFlight => _inFlight;
         private bool _openedMultiplayerMenu;
         private bool _runEnded;
         private double _lastActionAt;
@@ -76,6 +77,20 @@ namespace NekoComm.Game
         private bool _bundleChosen;
         private string _capstoneSignature = "";
         private int _capstoneLastOption = -1;
+
+        // Screens where the co-op join flow (open multiplayer menu -> host/join -> character select) must
+        // stay available even while the plugin holds the action window; otherwise the catgirl can never
+        // enter the room. MAIN_MENU covers the multiplayer menu, MULTIPLAYER_LOBBY the in-lobby screen.
+        private static bool IsJoinFlowScreen(string screen) =>
+            screen is "MAIN_MENU" or "MULTIPLAYER_LOBBY" or "CHARACTER_SELECT";
+
+        // Hold keeps room joining available. When the plugin owns selection, CHARACTER_SELECT always
+        // yields to it; DecideLobby also leaves character choice and ready-up to the plugin.
+        private static bool SuppressForHold(string screen) =>
+            (NekoConfig.Current.coop_manual_character_selection && screen == "CHARACTER_SELECT") ||
+            (!IsJoinFlowScreen(screen) &&
+            (NekoConfig.Current.coop_discussion_paused ||
+             string.Equals(NekoConfig.Current.coop_control_mode, "hold", StringComparison.OrdinalIgnoreCase)));
 
         public void Start()
         {
@@ -155,7 +170,7 @@ namespace NekoComm.Game
                 return;
             }
 
-            if (_runEnded)
+            if (_runEnded && state.screen == "GAME_OVER")
                 return;
             // Release the per-run latches once we are demonstrably back inside a run. Both used to latch for
             // the whole process lifetime: after one GAME_OVER the catgirl refused to act again (line above),
@@ -175,6 +190,11 @@ namespace NekoComm.Game
                 return;
             }
 
+            // The plugin's discussion mode owns the action window. Keep the join flow available,
+            // but never let this independent driver issue a combat/map/reward action while held.
+            if (SuppressForHold(state.screen))
+                return;
+
             ActionRequest? req;
             try
             {
@@ -186,7 +206,8 @@ namespace NekoComm.Game
                 return;
             }
 
-            if (req == null)
+            // A hold can arrive while DecideAsync is awaiting the solver/LLM.
+            if (req == null || SuppressForHold(state.screen))
                 return;
 
             _inFlight = true;
@@ -210,7 +231,17 @@ namespace NekoComm.Game
         {
             try
             {
-                return await GameThread.InvokeAsync(() => GameActionService.ExecuteAsync(req));
+                return await GameThread.InvokeAsync<ActionResponsePayload?>(async () =>
+                {
+                    // Recheck on the game thread immediately before submitting the action.
+                    var screen = GameStateService.BuildStatePayload().screen;
+                    if (SuppressForHold(screen))
+                        return null;
+                    if (NekoConfig.Current.coop_manual_character_selection &&
+                        req.action is "select_character" or "ready_multiplayer_lobby" or "embark")
+                        return null;
+                    return await GameActionService.ExecuteAsync(req);
+                });
             }
             catch (Exception ex)
             {
@@ -421,6 +452,8 @@ namespace NekoComm.Game
                 return null;
             if (!lobby.has_lobby && Has(s, "join_multiplayer_lobby"))
                 return Req("join_multiplayer_lobby");
+            if (NekoConfig.Current.coop_manual_character_selection)
+                return null;
             if (!string.Equals(lobby.selected_character_id, "IRONCLAD", StringComparison.OrdinalIgnoreCase) &&
                 Has(s, "select_character"))
                 return Req("select_character", option: ResolveClientCharacterIndex(s));

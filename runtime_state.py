@@ -49,6 +49,16 @@ class STS2RuntimeState:
     pause_reason: str = ""
     step_count: int = 0
     consecutive_errors: int = 0
+    decision_errors: int = 0
+    decision_error: str = ""
+    decision_failed_revision: int = -1
+    input_warning: str = ""
+    retry_at: float = 0.0
+    control_generation: int = 0
+    decision_metrics: dict[str, Any] = field(default_factory=dict)
+    latency_samples: list[dict[str, Any]] = field(default_factory=list)
+    discussion_previous: dict[str, Any] = field(default_factory=dict)
+    event_invalid_indices: list[int] = field(default_factory=list)
     # Incremented each time the scene-change event stream (GET /events/stream) drops/reconnects.
     sse_reconnect_count: int = 0
     last_poll_at: float = 0.0
@@ -118,6 +128,10 @@ class STS2RuntimeState:
     last_host_digest_at: float = 0.0
     # 最近一次交给本体的局势速报对应的场景键（同一局面只讲一次）。
     last_host_digest_key: str = ""
+    # 自动行动期间喂给本体的**被动局面上下文**（ai_behavior="read"，只进 LLM 上下文、
+    # 不触发开口）去重键。自动行动时本体的点评轨被压住，若不单独喂局面，本体对
+    # "现在什么情况"只能拿很久以前的旧画面回答 —— 这就是"事件界面旧快照"的成因。
+    last_host_context_key: str = ""
     # 本局生命轨迹（每次刷新追加一条），局末总结时用来做"哪里损血"的归因。
     hp_trail: list[dict[str, Any]] = field(default_factory=list)
     hp_trail_run_id: str = ""
@@ -137,6 +151,10 @@ class STS2RuntimeState:
     last_history_run_id: str = ""
     # 是否正因"局末复盘"而暂停自动游玩（复盘完要恢复；玩家自己动过就不擅自恢复）。
     reflection_paused: bool = False
+    # 战斗讨论模式：插件与 Mod 停手；允许确认单步或当前回合战术计划。
+    discussion_active: bool = False
+    discussion_status: str = "inactive"
+    # 仅本场/本回合有效的即时目标与顺序约束，不写入长期偏好。
     # 两个"跟本体说话"的开关（玩家口径：给尖塔速报和尖塔复盘各一个开关）。
     #   host_digest_enabled     尖塔速报：把局势悄悄交给本体，让它自己主动讲一句
     #   run_reflection_enabled  尖塔复盘：局末生成反思并推给本体

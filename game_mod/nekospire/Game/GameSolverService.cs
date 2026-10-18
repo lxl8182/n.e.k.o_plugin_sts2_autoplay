@@ -19,8 +19,10 @@ namespace NekoComm.Game
         // Flip to false to fall back to the self-built SimSolverPlan path.
         public static bool SolverEnabled = true;
 
-        public static async Task<SolverPlanPayload> BuildSolverPlanAsync(CancellationToken cancellationToken = default)
+        public static async Task<SolverPlanPayload> BuildSolverPlanAsync(CancellationToken cancellationToken = default,
+            SolverFacadeOptions? options = null)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var combat = CombatManager.Instance.DebugOnlyGetState();
             var run = RunManager.Instance.DebugOnlyGetState();
             if (combat == null || !CombatManager.Instance.IsInProgress)
@@ -34,7 +36,7 @@ namespace NekoComm.Game
             {
                 try
                 {
-                    return await CombatSolverFacade.BuildPlanAsync(combat, me, null, cancellationToken);
+                    return await CombatSolverFacade.BuildPlanAsync(combat, me, options, cancellationToken);
                 }
                 catch
                 {

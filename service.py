@@ -1,19 +1,34 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import inspect
+import re
+from copy import deepcopy, copy
+from datetime import datetime
+from threading import Lock
 from hashlib import sha1
 from random import Random, random
-from time import time
+from time import time, perf_counter, time_ns
+from uuid import uuid4
+from pathlib import Path
 from typing import Any, Callable
+
+import httpx
 
 from .action_engine import STS2ActionEngine
 from .action_registry import STS2ActionRegistry
-from .candidate_generator import STS2CandidateGenerator
+from .agent_facts import build_agent_facts, end_turn_danger
+from .action_identity import action_refs, resolve_action, observation_guard, enemy_intents
 from .catgirl_bridge import STS2CatgirlBridge
 from .catgirl_llm import CatgirlCommentGenerator
+from .companion_session import CompanionSession
+from .companion_journal import CompanionJournal
 from .catgirl_memory import CatgirlMemoryStore, _default_memory_path
 from .companion_evaluator import STS2CompanionEvaluator, _enemy_intent_label
+from .companion_feedback import apply_existing_expression, public_companion_text, speak_current_turn
+from .fact_gate import FactSuppressionGate
 from .history_view import write_history_view
 from .heuristic_planner import (
     MAP_POLICY_AUTO,
@@ -23,9 +38,11 @@ from .heuristic_planner import (
     normalize_map_policy,
 )
 from .instructions import normalize_guidance_instruction
-from .loop_runner import STS2LoopRunner, _combat_plan_signature, _current_turn_steps
+from .loop_runner import STS2LoopRunner, _current_turn_steps
+from .llm_planner import DecisionContextChanged, SolverPhaseWait, STS2LLMPlanner, view_signature
 from .mode_controller import STS2ModeController
 from .neko_interface import STS2NekoInterface
+from .planner_interface import public_kwargs
 from .play_style import (
     PLAY_STYLE_SERIOUS,
     choose_candidate,
@@ -35,7 +52,7 @@ from .preference_extractors import STS2PreferenceExtractor
 from .preference_store import STS2PreferenceStore
 from .runtime_state import STS2RuntimeState
 from .situation_summary_engine import STS2SituationSummaryEngine
-from .snapshot_normalizer import normalize_actions, normalize_snapshot
+from .snapshot_normalizer import normalize_actions
 from .state_machine import STS2StateMachine, should_hold_for_orders
 from .strategy_repository import STS2StrategyRepository
 from .summary_context_builder import STS2SummaryContextBuilder
@@ -45,6 +62,12 @@ from .transport_client import STS2ActionRejected, STS2TransportClient, STS2Trans
 STATUS_PUSH_MIN_INTERVAL = 2.0
 STATUS_PUSH_HEARTBEAT = 5.0
 
+
+
+class CompanionAudioPending(RuntimeError):
+    def __init__(self, receipt: dict):
+        super().__init__(receipt.get("reason") or "audio_incomplete")
+        self.receipt = receipt
 
 
 class STS2AutoplayService:
@@ -60,7 +83,7 @@ class STS2AutoplayService:
         self._catgirl_llm_enabled = True
         # 游戏内弹幕总开关。与 _catgirl_llm_enabled 语义不同：后者只管"点评用 LLM 还是启发式文本"，
         # 关掉它仍会走 _push_catgirl_fallback 推弹幕；本开关是唯一的真闸门（_push_catgirl 收口）。
-        self._danmaku_enabled = True
+        self._danmaku_enabled = False
         # 地图投票策略（startup 用插件配置覆盖）。默认 wait：多人局里彻底等待，不投票也不跟票，
         # 直到玩家通过对 NEKO 说话下令（sts2_set_route）。详见 heuristic_planner.MAP_POLICY_*。
         self._map_policy = MAP_POLICY_WAIT
@@ -68,6 +91,13 @@ class STS2AutoplayService:
         # 猫娘头像(base64)缓存:从 N.E.K.O 主 server card-drop 拉一次,TTL 300s
         self._avatar_b64: str | None = None
         self._avatar_at: float = 0.0
+        # 交流节奏：情绪吐槽冷却（按决策次数）与战斗 ask 话题去重（每场战斗每类一次）。
+        self._decision_seq = 0
+        self._banter_last_seq = -999
+        self._combat_ask_state: dict[str, Any] = {}
+        # 询问窗口：说完 ask 后先等主人回答再派发动作（战斗 10 秒 / 选项页 25 秒）。
+        self._ask_window_combat = 10.0
+        self._ask_window_page = 25.0
         # 游玩模式（认真/捣蛋/笨蛋）的随机源。可替换，便于测试确定性地验证概率与落点。
         self._play_style_random = play_style_random if play_style_random is not None else Random()
         self._client: STS2TransportClient | None = None
@@ -79,6 +109,12 @@ class STS2AutoplayService:
         self._catgirl_base_url: str = ""
         self._instance_failures: int = 0
         self._cfg: dict[str, Any] = {}
+        self._feedback_observation: dict[str, Any] = {}
+        self._feedback_last_event = ""
+        self._feedback_voice_at = 0.0
+        self._feedback_risk_announced = False
+        self._feedback_result: dict[str, Any] = {}
+        self._feedback_lock = Lock()
         self._state = STS2RuntimeState()
         self._state_machine = STS2StateMachine()
         self._summary_builder = STS2SummaryContextBuilder()
@@ -87,7 +123,10 @@ class STS2AutoplayService:
         self._catgirl_bridge = STS2CatgirlBridge(i18n=self._i18n, source_id="sts2_autoplay")
         self._preference_store = STS2PreferenceStore()
         self._preference_extractor = STS2PreferenceExtractor()
-        # 猫娘跨局记忆：run 结束总结教训/偏好，落盘后注入 strategy_directives 影响下一局决策。
+        # 事实闸门：插件活跃期间向本体数据根写心跳，本体据此跳过 fact 抽取。
+        # 游戏回合仍留在 recent.json（本体能聊当前局），但不沉淀进 facts.json。
+        self._fact_gate = FactSuppressionGate(self.logger)
+        # 跨局经验按条件匹配；旧局报和自由反思保留为历史记录。
         self._catgirl_memory = CatgirlMemoryStore(path=_default_memory_path(), logger=self.logger)
         self._strategy_repository = STS2StrategyRepository(
             logger,
@@ -97,23 +136,112 @@ class STS2AutoplayService:
         )
         self._mode_controller = STS2ModeController("program")
         self._planner = STS2HeuristicPlanner(logger)
-        self._candidate_generator = STS2CandidateGenerator(self._planner)
+        self._host_persona = ""
+        self._host_background = ""
+        self._conversation_seed: list[dict] = []
+        self._llm_planner = STS2LLMPlanner(logger, persona_provider=self._companion_persona)
+        self._companion_session = CompanionSession()
+        self._learning_available: list[dict] = []
+        self._latency_baseline: dict[str, Any] = {}
+        self._action_window: dict = {}
+        self._last_confirmed: dict = {}
+        self._telemetry_gap = False
+        self._companion_session.on_action = self._record_action_learning
+        self._companion_session.journal.on_turn = self._record_turn_learning
         self._action_registry = STS2ActionRegistry()
         self._action_engine = STS2ActionEngine(self._i18n)
         self._loop_runner = STS2LoopRunner(self)
         self.neko = STS2NekoInterface(self)
+        # 自动循环可能运行在自己的事件线程；用线程锁隔离派发，不能共享 asyncio.Lock。
+        self._discussion_confirm_lock = Lock()
+        self._action_dispatch_lock = Lock()
+        self._decision_lock = Lock()
+        self._last_decision_key = ""
+        self._stuck_recheck_key = ""
+        self._map_wait_key = ""
+        self._decision_failure_run_id = None
+        self._companion_push_keys: dict[str, tuple[str, float]] = {}
+        self._selected_steps: list[dict[str, Any]] = []
+        self._selected_generation: tuple[int, int, int] | None = None
+        self._solver_cache: tuple[str, dict[str, Any]] | None = None
+        self._last_observed_view = ""
+        self._last_operation: dict[str, Any] | None = None
+        self._last_dialogue_generation = -1
+        self._proactive_observation: dict[str, Any] = {}
+        self._communicated_turn: dict[str, Any] = {}
+        self._decision_failure_notice = ""
+        self._failure_notice_retry_at = 0.0
+        self._failure_notice_attempts = 0
+        self._notice_delivery_ready = True
+        self._notice_connection = ""
+        self._end_turn_review_key = ""
+        self._speech_state: dict[str, Any] = {}
+        self._step_timing: dict[str, Any] = {}
+        self._pending_action: dict[str, Any] | None = None
+        self._unconfirmed_action: tuple[str, str, dict[str, Any]] | None = None
+        self._mod_gate: dict[str, Any] = {}
+        self._dialogue_record_types: dict[str, int] = {}
+        self._wait_for_turn_message = False
+        self._turn_message_anchor: dict[str, Any] = {}
+        self._turn_message_since = time()
+        self._turn_message: dict[str, Any] | None = None
+        self._verified_user_messages: list[tuple[float, str]] = []
+        self._ingress_instance = str(uuid4())
+        self._ingress_enabled = False
+        self._ingress_active = False
+        self._ingress_ack: list[str] = []
+        self._ingress_seen: set[str] = set()
+        self._ingress_callbacks: list[dict] = []
+        self._ingress_material: dict = {}
+        self._ingress_csrf = ""
+        self._ingress_lock = Lock()
+        self._mod_gate_key: Any = None
+        self._ingress_claim = True
+        self._ingress_checkpoint_key: Any = None
+        self._ingress_character = ""
+        self._execution_phase: dict[str, str] = {}
+        self._last_step_result: dict[str, Any] = {}
+        self._status_push_key = ""
+        self._status_push_at = 0.0
+        self._status_revision = time_ns()
+        self._status_push_lock = Lock()
+        self._reported_status_key = ""
+        self._reported_status_at = 0.0
+        self._event_data_wait_key = ""
+        self._event_data_wait_at = 0.0
 
     def t(self, key: str, *, default: str = "", **params: Any) -> str:
         if self._i18n is not None:
             return self._i18n.t(key, default=default, **params)
         return default.format(**params) if params and default else (default or key)
 
+    def _companion_persona(self) -> str:
+        persona = self._host_persona or self._catgirl_llm._persona_system()
+        return persona + self._catgirl_llm._persona_profiles() if persona else ""
+
+    @property
+    def _selected_steps(self) -> list[dict[str, Any]]:
+        return self._companion_session.active_plan["remaining_steps"]
+
+    @_selected_steps.setter
+    def _selected_steps(self, steps: list[dict[str, Any]]) -> None:
+        self._companion_session.active_plan["remaining_steps"] = steps
+
     async def startup(self, cfg: dict[str, Any]) -> dict[str, Any]:
+        self._ingress_enabled = cfg.get("unified_session_enabled", True)
         try:
             self.logger.info("[sts2_code_version] 20260521_companion_eval_debug")
         except Exception:
             pass
         self._cfg = dict(cfg)
+        if self._catgirl_memory.path:
+            self._companion_session.journal.directory = os.path.join(os.path.dirname(self._catgirl_memory.path), "run_process")
+            self._companion_session.journal.logger = self.logger
+            self._companion_session.on_action = self._record_action_learning
+            self._companion_session.journal.on_turn = self._record_turn_learning
+        # 默认 false（全自动）：配置缺失时也不该退化成"每回合干等发言"——那会让玩家以为插件卡了。
+        # 想要陪玩节奏就显式设 true（或运行时调 sts2_set_wait_for_turn）。
+        self._wait_for_turn_message = bool(self._cfg.get("wait_for_turn_message", False))
         # 两个"跟本体说话"的开关（默认开）。关掉只影响速报/复盘这两路，不影响自动玩与记录。
         self._state.host_digest_enabled = bool(self._cfg.get("host_digest_enabled", True))
         self._state.run_reflection_enabled = bool(self._cfg.get("run_reflection_enabled", True))
@@ -122,8 +250,17 @@ class STS2AutoplayService:
         self._write_history_view()
         # 猫娘 LLM 点评：开关（生成间隔节流已不启用，防刷屏由外层 _should_deliver_sync 兜底）
         self._catgirl_llm_enabled = bool(self._cfg.get("catgirl_llm_enabled", True))
-        # 游戏内弹幕总开关（真闸门）。默认开；关闭后 _push_catgirl 直接早退，既不生成也不推。
-        self._danmaku_enabled = bool(self._cfg.get("danmaku_enabled", True))
+        # 游戏内弹幕默认关闭；关闭后 _push_catgirl 直接早退，既不生成也不推。
+        self._danmaku_enabled = bool(self._cfg.get("danmaku_enabled", False))
+        # co-op 显示名：真人主机与猫娘跑在同一 Steam 账号上，名牌本来同名、分不清谁是谁。
+        # 这里给猫娘一个专属显示名（默认取本体的角色名，可由 coop_catgirl_name 覆盖），
+        # 插件把名字推给两个游戏进程的 mod（POST /config coop_catgirl_name），
+        # mod 侧 PlayerNamePatch 只在"猫娘那个玩家"的名牌上替换。空串=关，全部回落到 Steam 名。
+        self._catgirl_display_name = str(self._cfg.get("coop_catgirl_name") or "").strip()
+        # 事实闸门：插件活着就一直抑制本体的事实抽取（recent 照常保留）。
+        # 默认开；只有显式配置 false 才不抑制。解析不到本体数据根时静默降级。
+        if bool(self._cfg.get("suppress_host_facts", True)):
+            self._fact_gate.start()
         # 地图投票：跟随玩家（co-op 队友先投就跟着投），以及无人投票时的等待秒数。
         # 地图投票策略：wait（默认，彻底等玩家发话）/ follow（自动跟票）/ auto（自己选）。
         # 兼容旧配置：只有 map_follow_player 布尔而没有 map_policy 时，true->follow、false->auto。
@@ -175,6 +312,8 @@ class STS2AutoplayService:
                 startup_result["companion_mode_enabled"] = True
             else:
                 self._sync_background_polling()
+            # 插件已启动就明确接管；idle/paused 表示等待玩家启动，不能让 Mod 偷跑。
+            startup_result["mod_sync"] = await self.sync_control_mode_to_mod()
             if bool(self._cfg.get("autoplay_on_start", False)) and not self._state.standby:
                 self.start_autoplay()
         except Exception as exc:
@@ -201,10 +340,14 @@ class STS2AutoplayService:
         return configured.rstrip("/") if configured else self._state.base_url.rstrip("/")
 
     async def shutdown(self) -> None:
+        await self._sync_companion_ingress()
+        await self._release_companion_ingress()
+        self._fact_gate.stop()
         await self._loop_runner.stop_background()
         if self._client is not None:
             await self._client.close()
             self._client = None
+        await self._llm_planner.shutdown()
         if self._catgirl_llm is not None:
             await self._catgirl_llm.shutdown()
         self._state.transport_state = "disconnected"
@@ -221,6 +364,7 @@ class STS2AutoplayService:
         # "插件在等、mod 照投"这种自相矛盾的局面。失败是良性的（mod 自己的默认也是 wait）。
         map_sync = await self.sync_map_policy_to_mod()
         control_sync = await self.sync_control_mode_to_mod()
+        name_sync = await self.sync_catgirl_name_to_mod()
         self._emit_status()
         message = self.t("status.connected", default="STS2-Agent 已连接: {base_url}", base_url=self._state.base_url)
         return {
@@ -230,6 +374,7 @@ class STS2AutoplayService:
             "health": health,
             "map_policy_sync": map_sync,
             "control_mode_sync": control_sync,
+            "catgirl_name_sync": name_sync,
         }
 
     # 正式联机流程（与 mod 自身一致）：
@@ -284,12 +429,7 @@ class STS2AutoplayService:
         return self._catgirl_base_url
 
     async def switch_active_instance(self, target: str, *, reason: str = "") -> dict[str, Any]:
-        """把"当前活动实例"切到主机或猫娘。切换后 `self._client` 即指向它，下游全部跟随。
-
-        切到猫娘时会顺手给那个实例推 `coop_control_mode="hold"`：让它自己的 mod 驱动在
-        除"进局流程"外的界面停手，否则两个驱动会抢着下同一个动作。进局流程（主菜单 →
-        组队大厅 → 选角色）mod 仍会自己做——那正是插件够不着的部分。
-        """
+        """只切换管理对象；同伴的认知与执行始终绑定猫娘，切换本身不改控制状态。"""
         wanted = self._normalize_instance(target)
         if wanted == self.INSTANCE_CATGIRL:
             if self._catgirl_client is None:
@@ -298,14 +438,14 @@ class STS2AutoplayService:
                     return {"switched": False, "instance": self._state.active_instance, "reason": "catgirl_address_unknown"}
                 self._catgirl_client = self._build_client(address)
             self._client = self._catgirl_client
-            standdown = await self._push_driver_standdown(self._catgirl_client)
+            standdown = {"applied": False}
         else:
             if self._host_client is None:
                 self._host_client = self._build_client(self._host_base_url)
             self._client = self._host_client
             standdown = {"applied": False}
         self._state.active_instance = wanted
-        self._state.catgirl_base_url = self._catgirl_base_url if wanted == self.INSTANCE_CATGIRL else ""
+        self._state.catgirl_base_url = self._catgirl_base_url
         self._instance_failures = 0
         self.logger.info(f"[sts2] active instance -> {wanted} ({reason or 'manual'})")
         self._emit_status()
@@ -316,11 +456,553 @@ class STS2AutoplayService:
             "mod_standdown": standdown,
         }
 
-    async def _push_driver_standdown(self, client: STS2TransportClient) -> dict[str, Any]:
-        """让该实例上 mod 自己的驱动停手（保留进局流程）。失败是良性的：插件仍会照常驱动。"""
+    def _companion_client(self) -> STS2TransportClient:
+        """猫娘是固定的决策、查询和执行对象；单人局才使用配置中的唯一进程。"""
+        if self._catgirl_client is not None:
+            return self._catgirl_client
+        return self._require_client()
+
+    async def _ensure_companion_client(self) -> STS2TransportClient:
+        if self._catgirl_client is not None:
+            return self._catgirl_client
+        host = self._host_client or self._require_client()
+        config = await host.get_config()
+        if config.get("coop_enabled"):
+            address = await self.resolve_catgirl_base_url()
+            if not address:
+                raise STS2TransportError("联机已启用，但未取得猫娘进程地址；不操作主机。")
+            self._catgirl_client = self._build_client(address)
+            self._state.catgirl_base_url = address
+            # 只读发现客户端不改变驱动归属；startup/动作循环负责明确接管。
+            return self._catgirl_client
+        return host
+
+    async def _read_companion_dialogue(self) -> None:
+        if self._ingress_enabled:
+            await self._sync_companion_ingress()
+            if self._ingress_active:
+                return
+        records: list[Any] = []
+        # memory 总线保留真人原话和精确时间；分钟级近期转录不能放行战斗回合。
+        if self._sdk_bus is not None and hasattr(self._sdk_bus, "memory"):
+            memory_client = self._sdk_bus.memory
+            character_name = self._catgirl_llm.character_name()
+            for bucket_id in dict.fromkeys((character_name, "default")):
+                try:
+                    # 当前 SDK 的 get_async() 仍在事件循环内执行同步 IPC。
+                    # 在线程池读取，避免消息读取阻塞状态刷新和当前回合控制。
+                    result = await asyncio.to_thread(
+                        memory_client.get, bucket_id=bucket_id, limit=32, timeout=5.0,
+                    )
+                    if inspect.isawaitable(result):
+                        result = await result
+                    if hasattr(result, "unwrap"):
+                        result = result.unwrap()
+                    for item in result.items:
+                        if item.type == "user_message" and item.content and item.timestamp:
+                            records.append(type("DialogueRecord", (), {"timestamp": item.timestamp,
+                                "lanlan_name": character_name, "turn_type": "user_message",
+                                "content": item.content})())
+                except Exception as exc:
+                    self.logger.warning("[sts2_dialogue] 用户原话读取失败 bucket=%s：%s", bucket_id, exc)
+        if self._sdk_bus is not None and hasattr(self._sdk_bus, "conversations"):
+            try:
+                result = self._sdk_bus.conversations.get(
+                    max_count=32, since_ts=self._companion_session.started_at, timeout=5.0,
+                )
+                if inspect.isawaitable(result):
+                    result = await result
+                if hasattr(result, "unwrap"):
+                    result = result.unwrap()
+                records.extend(result.items)
+            except Exception as exc:
+                self.logger.debug("[sts2_dialogue] conversations unavailable: %s", exc)
+        verified_messages = [(item.timestamp, item.content.strip()[:3000]) for item in records
+                             if item.turn_type == "user_message" and item.timestamp and item.content]
+        self._verified_user_messages = list(dict.fromkeys(sorted(verified_messages, key=lambda item: item[0])))
+        # 运行版 conversations 目前只回 assistant。官方近期转录仍含带时间的 user 行；
+        # 只在缺少 user 记录时补读，避免把导入时刻冒充发言时刻。
+        if not any(getattr(item, "turn_type", "") == "user_message" for item in records):
+            try:
+                port = self._main_server_port()
+                async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+                    response = await client.get(f"http://127.0.0.1:{port}/get_recent_history/{self._catgirl_llm.character_name()}")
+                    response.raise_for_status()
+                    history = response.json()
+                if isinstance(history, str):
+                    pattern = re.compile(r"^([^|]+) \|(?: \[(\d{8}) \w+ (\d{2}:\d{2})\])?\s*(.*)$")
+                    for line in history.splitlines():
+                        match = pattern.match(line.strip())
+                        if not match or not match.group(4) or not match.group(2):
+                            continue
+                        prefix, date, clock, content = match.groups()
+                        stamp = datetime.strptime(f"{date} {clock}", "%Y%m%d %H:%M").timestamp()
+                        role = "assistant_message" if prefix.strip() == self._catgirl_llm.character_name() else "user_message"
+                        records.append(type("DialogueRecord", (), {
+                            "timestamp": stamp, "lanlan_name": self._catgirl_llm.character_name(),
+                            "turn_type": role, "content": content,
+                        })())
+            except Exception as exc:
+                self.logger.debug("[sts2_dialogue] recent history unavailable: %s", exc)
+        if not records:
+            warning = "宿主 conversations/近期转录未提供可读取的对话记录；显式聊天仍进入决策上下文。"
+            if self._state.input_warning != warning:
+                self.logger.warning("[sts2_dialogue] %s", warning)
+            self._state.input_warning = warning
+            return
+        self._state.input_warning = ""
+        self._dialogue_record_types = {}
+        for record in records:
+            kind = str(record.turn_type)
+            self._dialogue_record_types[kind] = self._dialogue_record_types.get(kind, 0) + 1
+        self._companion_session.import_dialogue(
+            records, character_name=self._catgirl_llm.character_name(),
+        )
+
+    async def _companion_host_request(self, path: str, payload: dict) -> dict:
+        origin = f"http://127.0.0.1:{self._main_server_port()}"
+        async with httpx.AsyncClient(timeout=70 if path == "output" else 5, trust_env=False) as client:
+            if not self._ingress_csrf:
+                response = await client.get(origin + "/api/config/page_config")
+                response.raise_for_status()
+                self._ingress_csrf = response.json()["autostart_csrf_token"]
+            body = {"name": self._ingress_character or self._catgirl_llm.character_name(), "instance": self._ingress_instance, **payload}
+            headers = {"Origin": origin, "X-CSRF-Token": self._ingress_csrf}
+            response = await client.post(origin + "/api/sts2-companion/" + path, headers=headers, json=body)
+            if response.status_code == 409 and path == "output":
+                self.logger.warning("[sts2_ownership_lost] instance=%s run=%s output_id=%s reason=%s",
+                                    self._ingress_instance, self._companion_session.facts.get("run_id"),
+                                    payload.get("output_id"), response.json().get("detail"))
+                self._ingress_active = False
+                self._ingress_checkpoint_key = None
+                # poll恢复既有租约规则；不强占别的实例。输出ID不变，已送文本仍去重。
+                await self._sync_companion_ingress(restore_state=False)
+                if not self._ingress_active:
+                    raise DecisionContextChanged("同伴输出所有权已失效，等待重新接管后投递")
+                response = await client.post(origin + "/api/sts2-companion/" + path, headers=headers, json=body)
+                if response.status_code == 409:
+                    self._ingress_active = False
+                    raise DecisionContextChanged("同伴输出所有权再次变化，等待重新接管后投递")
+            if response.status_code == 403:
+                self._ingress_csrf = ""
+            response.raise_for_status()
+            result = response.json()
+            if not result.get("ok") and path != "output":
+                raise RuntimeError("同伴会话接口失败：" + str(result.get("reason")))
+            return result
+
+    async def _sync_companion_ingress(self, *, receive_only: bool = False, restore_state: bool = True) -> None:
+        if not self._ingress_enabled:
+            return
+        if receive_only and not self._ingress_active:
+            return
+        name = self._catgirl_llm.character_name()
+        if self._ingress_character and self._ingress_character != name:
+            await self._release_companion_ingress()
+            self._ingress_instance = str(uuid4())
+            self._ingress_claim = True
+            self._ingress_checkpoint_key = None
+            self._ingress_seen.clear()
+            self._ingress_ack.clear()
+            self._ingress_callbacks.clear()
+            self._host_background = self._host_persona = ""
+            self._conversation_seed.clear()
+            journal = self._companion_session.journal
+            self._companion_session = CompanionSession()
+            self._companion_session.journal.directory = journal.directory
+            self._companion_session.journal.logger = self.logger
+            self._companion_session.on_action = self._record_action_learning
+            self._companion_session.journal.on_turn = self._record_turn_learning
+            self._companion_session.observe(self._agent_view(self._state.snapshot))
+            self._state.pending_guidance.clear()
+            self._invalidate_companion_plan("切换角色，重新建立同伴会话")
+            self._llm_planner.reset_history()
+        self._ingress_character = name
+        view = self._agent_view(self._state.snapshot)
+        if not view and self._companion_session.journal.directory:
+            # 断线期间重载：只为尚未处理/送达的原输入恢复最后观察，不恢复动作。
+            files = sorted(Path(self._companion_session.journal.directory).glob("*.checkpoint.json"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+            if files:
+                saved = json.loads(files[0].read_text(encoding="utf-8"))
+                previous = saved.get("session") or {}
+                facts = previous.get("current_run") or {}
+                outstanding = previous.get("pending_inputs") or any(not r["text_sent"] for r in previous.get("input_results", []))
+                if saved.get("character_name") == name and facts.get("run_id") and outstanding:
+                    self._companion_session.journal.activate(facts["run_id"])
+                    self._companion_session.facts = deepcopy(facts)
+                    self._companion_session._run_id = facts["run_id"]
+                    self._companion_session.epoch += 1
+                    view = {k: facts.get(k) for k in ("screen", "run_id", "turn")}
+                    view.update(actions=[], available_actions=[], run={"floor": facts.get("floor"), "hp": facts.get("hp"), "character": facts.get("character")})
+                    self._state.snapshot = {"agent_view": view, "raw_state": {}}
+                    self.pause_autoplay(reason="decision_failure")
+                    self._decision_failure_run_id = facts["run_id"]
+        # 主菜单/局末可以交回普通聊天，但必须先把已生成、尚未送达的回复发完；
+        # 否则先release会让_publish_companion_reply永远拿不到输出所有权（2026-10-17 20:24 卡死）。
+        pending_reply = any(not record.get("text_sent") for record in self._companion_session.input_results)
+        if not self._companion_mode_active() or (view.get("screen") in {None, "MAIN_MENU"}
+                                                and not self._catgirl_memory.pending_review()
+                                                and not pending_reply):
+            await self._release_companion_ingress(reset_run=view.get("screen") == "MAIN_MENU")
+            return
+        if not self._ingress_lock.acquire(blocking=False):
+            return
         try:
-            await client.set_config(coop_control_mode="hold")
-            return {"applied": True}
+            checkpoint_key = (self._companion_session.epoch, self._companion_session.action_sequence,
+                              self._companion_session.dialogue_revision, self._companion_session.generation,
+                               self._companion_session.requirements_revision,
+                               self._state.autoplay_state, self._state.control_generation,
+                               self._state.pause_reason, self._state.decision_failed_revision,
+                              self._llm_planner.metrics.get("model_calls", 0), self._decision_failure_notice,
+                              self._companion_session.delivery_revision)
+            sent_ack = [] if receive_only else list(self._ingress_ack)
+            payload = {"anchor": self._companion_session.anchor(), "ack": sent_ack,
+                       "claim": self._ingress_claim, "restore": not self._ingress_active and restore_state}
+            if not receive_only and self._ingress_active and checkpoint_key != self._ingress_checkpoint_key:
+                payload["checkpoint"] = {"session": self._companion_session.context(), "character_name": name, "saved_at": time()}
+                payload["checkpoint"]["control_state"] = {
+                    "state": self._state.autoplay_state, "pause_reason": self._state.pause_reason,
+                    "stop_reason": self._state.stop_reason}
+                payload["checkpoint"]["failure_pause"] = {
+                    "revision": self._state.decision_failed_revision if self._state.decision_failed_revision >= 0
+                        else self._companion_session.dialogue_revision,
+                    "errors": self._state.decision_errors, "reason": self._state.decision_error,
+                    "notice": self._decision_failure_notice,
+                    "input_ids": [m["request_id"] for m in self._companion_session.user_requests if m.get("request_id")]
+                } if self._state.decision_failed_revision >= 0 or self._state.pause_reason == "decision_failure" else None
+                if self._ingress_checkpoint_key is None or checkpoint_key[-3] != self._ingress_checkpoint_key[-3]:
+                    payload["checkpoint"].update(model_history=self._llm_planner._history, prefix=self._llm_planner._last_prefix)
+                # 与过程记录同局存储，输入ack前先原子落盘；宿主重启仍能恢复已处理结果。
+                self._companion_session.journal.save_checkpoint(payload["checkpoint"])
+            result = await self._companion_host_request("poll", payload)
+            restoring = not self._ingress_active and restore_state
+            self._ingress_active = True
+            self._ingress_claim = False
+            self._ingress_ack = [i for i in self._ingress_ack if i not in sent_ack]
+            if not receive_only:
+                self._ingress_checkpoint_key = checkpoint_key
+            self._notice_delivery_ready = result.get("frontend_connected", True)
+            connection = result.get("frontend_connection", "")
+            if connection != self._notice_connection:
+                self._notice_connection = connection
+                self._failure_notice_attempts = 0
+                self._failure_notice_retry_at = 0.0
+            self._host_persona = result["persona"]
+            self._host_background = result.get("background") or ""
+            if restoring:
+                self._conversation_seed = result.get("dialogue_seed") or []
+            saved = result.get("checkpoint") or {} if restoring else {}
+            if restoring:
+                local_checkpoint = self._companion_session.journal.load_checkpoint()
+                if (local_checkpoint.get("character_name") == name
+                        and (local_checkpoint.get("session", {}).get("current_run") or {}).get("run_id") == self._companion_session.facts.get("run_id")
+                        and (not saved or local_checkpoint.get("saved_at", 0) > saved.get("saved_at", 0))):
+                    saved = local_checkpoint
+            previous = saved.get("session") or {}
+            if restoring and (previous.get("current_run") or {}).get("run_id") == self._companion_session.facts.get("run_id"):
+                self._companion_session.terminal_reply_run_id = previous.get("terminal_reply_run_id")
+                self._companion_session.input_results = deepcopy(previous.get("input_results") or [])
+                self._companion_session.delivery_revision += 1
+                self._companion_session.messages.extend(previous.get("recent_dialogue") or [])
+                restored_requests = [*(previous.get("player_messages") or []), *(previous.get("pending_inputs", previous.get("local_pending_messages")) or [])]
+                self._companion_session.user_requests.extend(deepcopy(restored_requests))
+                self._ingress_seen.update(m["request_id"] for m in restored_requests if m.get("request_id"))
+                for record in self._companion_session.input_results:
+                    for message in record["messages"]:
+                        request_id = message.get("request_id")
+                        if request_id:
+                            self._ingress_seen.add(request_id)
+                            self._ingress_ack.append(request_id)
+                self._companion_session.generation += len(restored_requests)
+                self._companion_session.dialogue_revision = max(
+                    [int(m.get("id") or 0) for m in [*(previous.get("recent_dialogue") or []), *restored_requests,
+                     *[m for r in self._companion_session.input_results for m in r["messages"]]]] or [0])
+                self._companion_session.actions.extend(previous.get("recent_actions") or [])
+                saved_actions = {a["id"]: a for t in self._companion_session.journal.data.get("turns", []) for a in t["actions"]}
+                for action in self._companion_session.actions:
+                    if action.get("id") in saved_actions:
+                        action.update(deepcopy(saved_actions[action["id"]]))
+                self._companion_session.restore_requirements(previous)
+                self._companion_session.refresh_requirements(self._state.snapshot)
+                control = saved.get("control_state") or {}
+                if control.get("state") == "paused" and control.get("pause_reason") != "decision_failure":
+                    self.pause_autoplay(reason=control.get("pause_reason") or "user")
+                elif control.get("state") == "idle" and control.get("stop_reason"):
+                    self.stop_autoplay(reason=control["stop_reason"])
+                for message in [*(previous.get("recent_dialogue") or []), *restored_requests]:
+                    request_id = message.get("request_id")
+                    if request_id and message.get("kind") in {"chat", "query", "guidance", "immediate"}:
+                        self._ingress_seen.add(request_id)
+                        if request_id not in self._ingress_ack:
+                            self._ingress_ack.append(request_id)
+                self.logger.info("[sts2_session_restored] requests=%s dialogue_revision=%s history_messages=%s control=%s requirements=%s",
+                                 [m["id"] for m in restored_requests], self._companion_session.dialogue_revision,
+                                 len(saved.get("model_history") or []), control, self._companion_session.requirements_revision)
+                self._llm_planner._history = saved.get("model_history") or []
+                self._llm_planner._last_prefix = saved.get("prefix") or ""
+                self._llm_planner._history_owner = f"{self._ingress_instance}:{self._companion_session.epoch}"
+                failure_pause = saved.get("failure_pause")
+                if failure_pause:
+                    self.pause_autoplay(reason="decision_failure")
+                    self._decision_failure_run_id = self._companion_session.facts.get("run_id")
+                    self._state.decision_failed_revision = failure_pause["revision"]
+                    self._state.decision_errors = failure_pause["errors"]
+                    self._state.decision_error = failure_pause["reason"]
+                    self._decision_failure_notice = failure_pause.get("notice", "")
+            self._state.input_warning = ""
+            for callback in result.get("callbacks") or []:
+                if callback.get("kind") == "proactive_material":
+                    # 素材更新供下次交流使用，不单独触发一次游戏重判。
+                    self._ingress_material = callback
+                else:
+                    self._ingress_callbacks.append(callback)
+            restored_new_input = False
+            for item in result["inputs"]:
+                request_id = item["request_id"]
+                if request_id in self._ingress_seen:
+                    continue
+                if len(self._companion_session.pending_messages()) >= 20:
+                    break  # 未处理输入留在宿主队列，不因本地有界历史淘汰而丢失。
+                self._companion_session.remember("user", item["content"], timestamp=item["timestamp"])
+                message = self._companion_session.user_requests[-1]
+                message.update(request_id=request_id, **item.get("anchor", {}))
+                self.logger.info("[sts2_input_received] %s", json.dumps({
+                    "id": message["id"], "request_id": request_id, "timestamp": message["timestamp"],
+                    "screen": view.get("screen"), "anchor": item.get("anchor"), "content": message["content"],
+                }, ensure_ascii=False, separators=(",", ":")))
+                self._ingress_seen.add(request_id)
+                self._verified_user_messages.append((message["timestamp"], message["content"]))
+                if restoring and saved.get("failure_pause") and request_id not in saved["failure_pause"]["input_ids"]:
+                    restored_new_input = True
+            if restoring and saved.get("failure_pause") and not restored_new_input:
+                # 未ack的旧消息恢复时会分配本地新id，不能因此被当作新的恢复指令。
+                self._state.decision_failed_revision = self._companion_session.dialogue_revision
+        except (httpx.HTTPError, RuntimeError, OSError, ValueError) as exc:
+            warning = "统一会话入口连接失败：" + str(exc)
+            if warning != self._state.input_warning:
+                self.logger.warning("[sts2_ingress] %s", warning)
+            self._state.input_warning = warning
+            self._ingress_active = False
+        finally:
+            self._ingress_lock.release()
+
+    async def _plan_with_input(self, context: dict, **kwargs: Any) -> Any:
+        generation = (self._companion_session.generation, self._state.control_generation,
+                      self._state.guidance_generation, self._ingress_instance, self._companion_session.dialogue_revision,
+                      self._companion_session.epoch)
+        task = asyncio.create_task(self._llm_planner.plan(context, **kwargs))
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=0.25)
+                if done:
+                    return task.result()
+                await self._sync_companion_ingress(receive_only=True)
+                current = (self._companion_session.generation, self._state.control_generation,
+                           self._state.guidance_generation, self._ingress_instance, self._companion_session.dialogue_revision,
+                           self._companion_session.epoch)
+                if generation == current:
+                    continue
+                # 决策收尾时 route_messages 会把本轮消息从pending改成guidance/immediate并推进generation；
+                # 这是本次决策自己产生的变化，不能反过来丢掉它刚算好的回复和要求
+                # （2026-10-17 21:34:03 现场：营火不回血指令被误判stale，回复、要求、长期经验一起丢失）。
+                if (generation[0] != current[0] and generation[1:] == current[1:]
+                        and not self._companion_session.pending_messages()):
+                    await asyncio.wait({task}, timeout=1.0)
+                    if task.done():
+                        return task.result()
+                self.logger.info("[sts2_input_interrupt] pending=%s，取消旧决策并保留输入", len(self._companion_session.pending_messages()))
+                raise DecisionContextChanged("决策期间收到新输入或控制变化，刷新后重判")
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def _release_companion_ingress(self, *, reset_run: bool = False) -> None:
+        if not self._ingress_active:
+            return
+        try:
+            await self._companion_host_request("release", {"reset_run": reset_run})
+        except (httpx.HTTPError, RuntimeError) as exc:
+            self.logger.warning("[sts2_ingress_release] %s", exc)
+        self._ingress_active = False
+        self._push_host_context("刚才同伴会话的实际交流与行动：" + json.dumps({
+            "dialogue": [{"role": m["role"], "text": m["content"][:120]} for m in list(self._companion_session.messages)[-4:]],
+            "actions": [{"action": a["action_type"], "card": ((a.get("card") or {}).get("name") or (a.get("card") or {}).get("line") or "").split("：", 1)[0][:30],
+                         "target": (a.get("target") or {}).get("name", "")[:30], "status": a["status"]}
+                        for a in list(self._companion_session.actions)[-4:]]}, ensure_ascii=False),
+            coalesce_key="sts2:conversation_handoff")
+
+    async def _publish_companion_reply(self, text: str, messages: list[dict], *, wait_audio: bool = False,
+                                       anchor: dict | None = None, system_notice: bool = False,
+                                       media_requests: list[dict] | None = None, speech_kind: str = "chat",
+                                       output_id: str | None = None, remember_reply: bool = True) -> dict:
+        text = public_companion_text(text)
+        terminal = (self._companion_session.facts.get("screen") in {"GAME_OVER", "VICTORY", "DEFEAT"}
+                    and not messages and not wait_audio and not system_notice)
+        run_id = self._companion_session.facts.get("run_id")
+        if terminal and self._companion_session.terminal_reply_run_id == run_id:
+            return {"status": "already_published"}
+        if self._ingress_enabled and not self._ingress_active:
+            raise RuntimeError("等待统一会话重新取得输出所有权")
+        if not self._ingress_active:
+            await self._push_catgirl(text, fetch_avatar=False)
+            result = await speak_current_turn(self._main_server_port(), self._catgirl_llm.character_name(),
+                                               text, {**(anchor or self._companion_session.anchor()),
+                                                      "speech_kind": "tactical" if wait_audio else speech_kind})
+        else:
+            ids = [m.get("request_id") for m in messages if m.get("request_id")]
+            result = await self._companion_host_request("output", {"line": text, "wait_audio": wait_audio,
+                "media_requests": media_requests or [],
+                "media_explicit": bool(messages),
+                "system_notice": system_notice,
+                "output_id": output_id or (":".join(ids) + ":" + sha1(text.encode()).hexdigest() if ids else
+                    f"failure:{run_id}:" + sha1(text.encode()).hexdigest() if system_notice else f"run_end:{run_id}" if terminal else str(uuid4())),
+                "anchor": {**(anchor or self._companion_session.anchor()),
+                           "speech_kind": "tactical" if wait_audio else speech_kind}})
+            if result.get("text_sent") is not True:
+                raise RuntimeError("回复尚未送达聊天框：" + str(result.get("reason") or "text_not_sent"))
+            if media_requests and result.get("reason") == "frontend_disconnected":
+                raise RuntimeError("聊天窗口未连接，保留媒体请求等待重试")
+            if wait_audio and result.get("audio_completed") is not True:
+                raise CompanionAudioPending(result)
+            self._ingress_ack.extend(ids)
+        if remember_reply:
+            self._companion_session.remember("assistant", text)
+        self._record_input_timing(messages, "input_to_reply_ms")
+        if terminal:
+            self._companion_session.terminal_reply_run_id = run_id
+            self._catgirl_memory.attach_process(str(run_id), self._companion_session.journal.run_context())
+            self._write_history_view()
+        return result
+
+    async def _flush_companion_replies(self) -> bool:
+        session = self._companion_session
+        for record in session.input_results:
+            audio_retry = record.get("audio_retry", False) and record.get("audio_attempts", 0) < 3
+            if (record["text_sent"] and not audio_retry) or not record["reply"]:
+                continue
+            if time() < record.get("retry_at", 0):
+                if record["text_sent"]:
+                    continue
+                return False
+            had_text = record["text_sent"]
+            try:
+                # 入队就开始下一段会使TTS切换sid、取消尚未合成的回复；先送完用户回复音频。
+                receipt = await self._publish_companion_reply(record["reply"], record["messages"],
+                    media_requests=record["media"], speech_kind=record["kind"], wait_audio=True,
+                    output_id=record["output_id"], anchor=record["anchor"], remember_reply=not had_text)
+            except CompanionAudioPending as exc:
+                receipt = exc.receipt
+                if not had_text:
+                    session.remember("assistant", record["reply"])
+                record.update(text_sent=True, receipt=deepcopy(receipt), audio_completed=False,
+                    audio_retry=True, audio_attempts=record.get("audio_attempts", 0) + 1,
+                    retry_at=time() + self._autoplay_retry_backoff(), delivered_at=time())
+                session.delivery_revision += 1
+                self.logger.warning("[sts2_reply_audio_pending] output_id=%s attempts=%s reason=%s", record["output_id"], record["audio_attempts"], receipt.get("reason"))
+                continue
+            except (httpx.HTTPError, RuntimeError) as exc:
+                record["delivery_error"] = str(exc)
+                record["retry_at"] = time() + self._autoplay_retry_backoff()
+                session.delivery_revision += 1
+                self.logger.warning("[sts2_reply_pending] output_id=%s error=%s", record["output_id"], exc)
+                return False
+            record.update(text_sent=True, receipt=deepcopy(receipt),
+                          audio_completed=receipt.get("audio_completed"), audio_retry=False, delivered_at=time())
+            session.delivery_revision += 1
+            self.logger.info("[sts2_reply_delivered] output_id=%s receipt=%s", record["output_id"], receipt)
+        return True
+
+    def _resolve_dispatch(self, operation: dict) -> tuple[dict | None, str]:
+        snapshot = self._state.snapshot
+        resolved, invalid = resolve_action(operation, snapshot)
+        if invalid:
+            return None, json.dumps(invalid, ensure_ascii=False)
+        expected = operation.get("observation_guard")
+        if expected is None:
+            changed = view_signature(self._agent_view(snapshot)) != operation.get("view_signature")
+        else:
+            current = observation_guard(snapshot)
+            # 队友击杀未选中的敌人不影响自身资源；目标存活由身份检查。
+            expected = deepcopy(expected)
+            if operation.get("action_type") == "choose_map_node" and current.get("screen") == expected.get("screen") == "MAP":
+                planned_map, current_map = expected.get("map") or {}, current.get("map") or {}
+                option = next((item for item in planned_map.get("options") or []
+                               if item.get("i") == resolved["kwargs"].get("option_index")), {})
+                coord = re.search(r"\((\d+),(\d+)\)", option.get("line", ""))
+                votes = current_map.get("votes") or []
+                if coord and votes and all(vote.get("coord") == coord[1] + "," + coord[2] for vote in votes):
+                    planned_map["votes"] = deepcopy(votes)
+            if "enemy_effects" in expected:
+                alive = {e["entity_id"] for e in current.get("enemy_effects", [])}
+                expected["enemy_effects"] = [e for e in expected["enemy_effects"] if e["entity_id"] in alive]
+                target_id = ((operation.get("bindings") or {}).get("target") or {}).get("entity_id")
+                for effects in (expected.get("enemy_effects", []), current.get("enemy_effects", [])):
+                    for enemy in effects:
+                        if enemy["entity_id"] != target_id:
+                            enemy.pop("powers", None)
+                before_player = (expected.get("combat") or {}).get("player") or {}
+                after_player = (current.get("combat") or {}).get("player") or {}
+                if (type(before_player.get("block")) in {int, float} and type(after_player.get("block")) in {int, float}
+                        and after_player["block"] >= before_player["block"]):
+                    before_player["block"] = after_player["block"]
+                if current.get("screen") == expected.get("screen") == "COMBAT":
+                    for key in ("actions", "available_actions"):
+                        if key in current:
+                            expected[key] = deepcopy(current[key])
+            changed = current != expected
+        if changed:
+            changes = []
+            if expected is not None:
+                def compare(before, after, path):
+                    if before == after or len(changes) >= 6:
+                        return
+                    if isinstance(before, dict) and isinstance(after, dict):
+                        for key in sorted(before.keys() | after.keys()):
+                            compare(before.get(key), after.get(key), f"{path}.{key}" if path else key)
+                    elif isinstance(before, list) and isinstance(after, list):
+                        for i in range(max(len(before), len(after))):
+                            compare(before[i] if i < len(before) else None, after[i] if i < len(after) else None, f"{path}[{i}]")
+                    else:
+                        changes.append({"field": path, "before": str(before)[:120], "after": str(after)[:120]})
+                compare(expected, current, "")
+            self.logger.info("[sts2_observation_changed] revision=%s step=%s changes=%s",
+                             operation.get("plan_revision"), operation.get("step_id"), json.dumps(changes, ensure_ascii=False))
+            fields = ", ".join(change["field"] for change in changes)
+            return None, "观察中的自身资源、界面或敌人效果已变化" + (f"：{fields}" if fields else "")
+        return resolved, ""
+
+    def _combat_window_closed(self, operation: dict) -> bool:
+        view = self._agent_view(self._state.snapshot)
+        names = {a if isinstance(a, str) else a.get("name") or a.get("type") for a in
+                 view.get("available_actions", view.get("actions", []))}
+        return (view.get("screen") == "COMBAT" and operation["action_type"] in {"play_card", "end_turn"}
+                and not names.intersection({"play_card", "end_turn"}))
+
+    def _current_turn_message(self) -> dict[str, Any] | None:
+        anchor = self._companion_session.anchor()
+        if anchor != self._turn_message_anchor:
+            self._turn_message_anchor = dict(anchor)
+            self._turn_message_since = time()
+            self._turn_message = None
+        for item in self._companion_session.user_requests:
+            if (all(item.get(key) == value for key, value in anchor.items())
+                    and item["timestamp"] >= self._turn_message_since
+                    and (item["timestamp"], item["content"]) in self._verified_user_messages):
+                self._turn_message = dict(item)
+        return self._turn_message
+
+    def _agent_view(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        view = snapshot.get("agent_view") if isinstance(snapshot.get("agent_view"), dict) else {}
+        return view
+
+    async def _push_driver_standdown(self, client: STS2TransportClient) -> dict[str, Any]:
+        """接管时停住 Mod 自主驱动；动作循环仍须检查确认回执。"""
+        try:
+            response = await client.set_config(coop_control_mode="hold", coop_manual_character_selection=True)
+            echoed = str(response.get("coop_control_mode") or "").strip().lower()
+            return {"applied": echoed == "hold", "mode": "hold", "echoed_mode": echoed or None}
         except Exception as exc:
             self.logger.debug(f"[sts2] pushing driver stand-down failed (non-fatal): {exc}")
             return {"applied": False}
@@ -345,19 +1027,18 @@ class STS2AutoplayService:
                 await asyncio.sleep(1.5)
                 continue
             self._catgirl_client = probe
+            standdown = await self._push_driver_standdown(probe)
             result = await self.switch_active_instance(self.INSTANCE_CATGIRL, reason="coop_room_opened")
+            result["mod_standdown"] = standdown
+            # 猫娘进程刚起来："真人 vs 猫娘"两个客户端现在都在了，把显示名推给两边。
+            result["name_sync"] = await self.sync_catgirl_name_to_mod()
             return {"adopted": bool(result.get("switched")), "base_url": address, "wait_error": last_error, **result}
         return {"adopted": False, "reason": "catgirl_not_reachable", "base_url": address, "last_error": last_error}
 
     async def _note_transport_failure(self) -> None:
-        """活动实例读不通时的兜底：连续失败够多次就把活动实例退回主机，别把插件卡在死地址上。"""
-        if self._state.active_instance != self.INSTANCE_CATGIRL:
-            return
+        self._mod_gate_key = None
+        # 猫娘断线时等待重连，绝不把决策和动作转给真人主机。
         self._instance_failures += 1
-        if self._instance_failures < 3:
-            return
-        self.logger.warning("[sts2] catgirl instance unreachable; falling back to the host instance")
-        await self.switch_active_instance(self.INSTANCE_HOST, reason="catgirl_unreachable")
 
     async def set_instance(self, instance: str) -> dict[str, Any]:
         """显式切活动实例（host / catgirl），供玩家或排障用。"""
@@ -388,6 +1069,9 @@ class STS2AutoplayService:
                 key="coop.session_unavailable",
                 default="{action} 不可用（screen={screen}，可用动作: {actions}）—— mod 可能没重启到含该动作的版本。",
             )
+            config = await client.set_config(coop_manual_character_selection=True)
+            if config.get("coop_manual_character_selection") is not True:
+                raise STS2TransportError("当前 Mod 不支持手动选人确认，请更新 Mod 后再开房。")
             await client.execute_action(self.COOP_SESSION_ACTION)
             action = self.COOP_SESSION_ACTION
         else:
@@ -400,6 +1084,8 @@ class STS2AutoplayService:
             # 并让那个实例上 mod 自己的驱动停手（否则两个驱动抢着下同一个动作）。
             # 等不到就停在主机实例上，不影响单人流程。
             result["catgirl_adoption"] = await self.adopt_coop_catgirl()
+            if result["catgirl_adoption"].get("adopted"):
+                result["autoplay"] = self.start_autoplay()
         return result
 
     async def _join_coop_room(self, client: STS2TransportClient) -> str:
@@ -505,18 +1191,24 @@ class STS2AutoplayService:
             request_timeout=float(self._cfg.get("request_timeout_seconds", 15) or 15),
         )
 
-    async def refresh_state(self, *, trigger_sync: bool = False) -> dict[str, Any]:
+    async def refresh_state(self, *, trigger_sync: bool = False, plan_combat: bool = False) -> dict[str, Any]:
         previous_snapshot = self._state.snapshot if isinstance(self._state.snapshot, dict) else {}
         try:
-            tick_result = await self._loop_runner.tick()
+            tick_result = await self._loop_runner.tick() if plan_combat else await self._loop_runner.tick(plan_combat=False)
         except Exception:
-            # 活动实例读不通：连败若干次就退回主机，别把插件卡在一个死地址上。
+            # 记录猫娘读失败；不会切回真人主机接着出牌。
             await self._note_transport_failure()
             raise
         self._instance_failures = 0
         self._state.raw_state = tick_result["raw_state"]
         self._state.raw_actions = tick_result["raw_actions"]
         self._state.snapshot = tick_result["snapshot"]
+        self._restore_journal_pending(self._state.snapshot)
+        if self._companion_session.refresh_requirements(self._state.snapshot):
+            self._last_decision_key = ""
+            self._last_step_result = {}
+        if self._wait_for_turn_message:
+            self._current_turn_message()
         player_operation_observation = self._observe_companion_player_operation(previous_snapshot, self._state.snapshot)
         if player_operation_observation:
             self._state.latest_player_operation_observation = dict(player_operation_observation)
@@ -529,10 +1221,14 @@ class STS2AutoplayService:
         self._state.touch_poll()
         self._state.touch_success()
         self._remember_snapshot_metadata()
+        if self._pending_action is not None:
+            self._resolve_pending_action(self._state.snapshot)
         self._update_run_intent()
+        await self._update_companion_feedback(self._state.snapshot)
         if trigger_sync:
             self._deliver_catgirl_sync(self._state.snapshot)
         self._emit_status()
+        await self._sync_execution_status()
         message = self.t("status.refreshed", default="已刷新状态，screen={screen}", screen=self._state.snapshot.get("screen", "unknown"))
         return {
             "status": "ok",
@@ -576,95 +1272,1037 @@ class STS2AutoplayService:
         snapshot["catgirl_sync"] = self._catgirl_bridge.build_sync_packet(snapshot, standby=self._state.standby)
 
     async def run_autoplay_step(self, *, force: bool = False) -> dict[str, Any]:
-        """自动玩循环的一步：拿当前计划并执行。
-
-        ``force=True`` 是"我点头了"的显式授权（``sts2_execute_planned_operation``）：它既绕开
-        "听安排"档位的停手闸门，**也不受游玩模式扰动影响**——那是玩家亲口点的，不能被换成别的。
-        自动循环调用时不传，于是两件事都会生效。
-        """
-        if self._state.standby:
-            message = self.t("autoplay.standby_blocked", default="当前处于 standby 模式，不执行动作。")
-            return {"status": "idle", "message": message, "summary": message}
-        snapshot = self._state.snapshot if isinstance(self._state.snapshot, dict) else {}
-        if not force and self._should_hold_for_orders(snapshot):
-            state_name = self._snapshot_state_name(snapshot)
-            message = self.t(
-                "advise.holding",
-                default="现在听你安排：{screen} 这一步我先不动，你说一声我再走。",
-                screen=state_name or "当前界面",
-            )
-            return {"status": "idle", "message": message, "summary": message, "held": True, "state_name": state_name}
-        if self._should_rebuild_operation(snapshot):
-            await self.refresh_state(trigger_sync=True)
-            snapshot = self._state.snapshot if isinstance(self._state.snapshot, dict) else {}
-            # 强制重算的请求到此已兑现，清掉，免得以后每一步都多刷一次 /state。
-            self._state.force_replan_requested = False
-        operation = snapshot.get("agent_operation") if isinstance(snapshot.get("agent_operation"), dict) else None
-        if operation is None:
-            # 跨屏切换（如 reward->map / 战斗结束->奖励 等）时 /state 可能尚未切到下一屏，导致
-            # choose_map_node 等动作还没出现在 available_actions。短延迟后再刷一次，捕捉切换。
-            await asyncio.sleep(0.6)
-            await self.refresh_state(trigger_sync=True)
-            snapshot = self._state.snapshot if isinstance(self._state.snapshot, dict) else {}
-            operation = snapshot.get("agent_operation") if isinstance(snapshot.get("agent_operation"), dict) else None
-        perturbation: dict[str, Any] = {}
-        # 玩家口径（2026-10-07）：「还有每次对战如果损血大于8就鼓励使用药水」。这条是**硬规则**：
-        #   - 放在游玩模式扰动**之前**算 —— 捣蛋/笨蛋档也不许把"该喝药保命"扰掉（保命优先压过其它考虑）；
-        #   - **不依赖规划器给出动作** —— 战斗里偶尔规划不出动作时，该保命还是要保命；
-        #   - 只在这一步真的能派发 `use_potion`（动作在册 = 在战斗里且手里有能用的药水）时才会 override。
-        potion_operation = None if force else self._combat_potion_override(snapshot)
-        if potion_operation is not None:
-            operation = potion_operation
-        elif operation is None:
-            message = self.t("autoplay.no_planned_operation", default="当前没有可执行的规划动作。")
-            # 别静默空转：持续拿不到动作就记一次日志 + 写进状态 + 告诉本体（**不改 autoplay 意图**）。
-            self._note_no_operation(snapshot)
-            return {"status": "idle", "message": message, "summary": message}
-        elif not force:
-            operation, perturbation = self._apply_play_style(snapshot, operation)
-        # 自定义事件屏（水晶球占卜）上按下标依次试，别死盯一个下标空点。
-        operation = self._advance_custom_event_cursor(snapshot, operation)
-        result = await self.execute_operation(operation)
-        if perturbation.get("applied"):
-            result["perturbation"] = perturbation
-        if result.get("status") == "ok":
-            self._state.step_count += 1
-            self._clear_stuck()
-            self._note_step_progress(snapshot, operation)
+        result = await self._run_autoplay_step(force=force)
+        if result.get("status") != "busy":
+            self._last_step_result = result
+        await self._sync_execution_status()
         return result
 
-    def _advance_custom_event_cursor(self, snapshot: dict[str, Any], operation: dict[str, Any]) -> dict[str, Any]:
-        """**自动占卜**：自定义事件屏上把 `option_index` 换成"下一个没试过的下标"。
+    async def _run_autoplay_step(self, *, force: bool = False) -> dict[str, Any]:
+        if (self._decision_failure_notice and self._notice_delivery_ready
+                and self._failure_notice_attempts < 3 and time() >= self._failure_notice_retry_at):
+            self._failure_notice_attempts += 1
+            try:
+                await self._publish_companion_reply(self._decision_failure_notice, [], system_notice=True)
+            except (httpx.HTTPError, RuntimeError) as exc:
+                self._failure_notice_retry_at = time() + 5
+                self.logger.warning("[sts2_failure_notice] 原因通知投递失败，暂停状态保留：%s", exc)
+            else:
+                self._decision_failure_notice = ""
+                self._failure_notice_retry_at = 0.0
+                self.logger.info("[sts2_failure_notice] 暂停原因已送达")
+        if self._state.decision_failed_revision >= 0:
+            transport_blocked_input = (self._state.transport_state in {"error", "disconnected"} and self._state.decision_error == self._state.last_error
+                                       and bool(self._companion_session.pending_messages()))
+            if self._companion_session.dialogue_revision <= self._state.decision_failed_revision and not transport_blocked_input:
+                return {"status": "paused", "executed": False, "message": self._state.decision_error}
+            # 新输入可以获得有限次数的回应；动作仍等明确恢复指令。
+            self._note_decision_success()
+        if not await self._flush_companion_replies():
+            return {"status": "reply_pending", "executed": False, "message": "等待回复送达后继续。"}
+        has_input = bool(self._companion_session.pending_messages() or self._ingress_callbacks)
+        actions_paused = (self._state.standby or self._state.discussion_active or self._state.autoplay_state == "paused"
+                          or self._ingress_active and self._state.autoplay_state != "running" and not force)
+        if actions_paused and not has_input:
+            return {"status": "idle", "executed": False, "message": "已暂停动作，仍可聊天。"}
+        if time() < self._state.retry_at:
+            return {"status": "retrying", "executed": False, "message": self._state.decision_error or self._state.last_error,
+                    "retry_at": self._state.retry_at}
+        if not self._decision_lock.acquire(blocking=False):
+            return {"status": "busy", "executed": False, "message": "正在判断当前局面。"}
+        started = perf_counter()
+        self._step_timing = {}
+        metrics_before = deepcopy({**self._state.decision_metrics, **self._llm_planner.metrics})
+        self._latency_baseline = dict(metrics_before)
+        path = "model"
+        operation = None
+        action_anchor = self._companion_session.anchor()
+        view = self._agent_view(self._state.snapshot)
+        try:
+            phase = perf_counter()
+            game_connection = {"connected": True}
+            try:
+                await self.refresh_state(plan_combat=False)
+            except STS2TransportError as exc:
+                if not has_input or not self._ingress_active:
+                    raise
+                game_connection = {"connected": False, "error": str(exc), "observation": "last_known"}
+                actions_paused = True
+                self.logger.info("[sts2_disconnected_chat] pending=%s error=%s", len(self._companion_session.pending_messages()), exc)
+            self._step_timing["refresh_ms"] = (perf_counter() - phase) * 1000
+            snapshot = self._state.snapshot
+            view = self._agent_view(snapshot)
+            if self._pending_action is not None and game_connection["connected"]:
+                return self._resolve_pending_action(snapshot)
+            if not view:
+                self._note_no_operation(snapshot)
+                raise RuntimeError("猫娘 /state 未返回 agent_view；等待有效视图后重试，不派发动作。")
+            signature = view_signature(view)
+            if signature != self._last_observed_view:
+                self._clear_stuck()
+                self._state.progress_repeat = 0
+                self._state.progress_reported = False
+                self._last_observed_view = signature
+            if self._state.force_replan_requested or self._state.interrupt_requested:
+                self._invalidate_companion_plan(self._state.interrupt_reason or "玩家要求重新判断")
+                self._state.force_replan_requested = False
+                self._state.interrupt_requested = False
+                self._state.interrupt_reason = ""
+            if self._companion_session.facts.get("run_id") is not None:
+                self._state.pending_guidance = [item for item in self._state.pending_guidance
+                    if (item.get("anchor") or {}).get("run_id") in {None, self._companion_session.facts["run_id"]}]
+            raw = snapshot.get("raw_state") or {}
+            multiplayer = raw.get("multiplayer") or {}
+            if multiplayer.get("is_multiplayer") and str(multiplayer.get("net_game_type") or "").lower() == "host":
+                return {"status": "idle", "executed": False, "message": "尚未连接猫娘进程，不操作真人主机。"}
+            gate = await self._sync_mod_gate("hold", discussion=bool(actions_paused)) if game_connection["connected"] else {}
+            if not actions_paused and not (gate.get("applied") and gate.get("settled")):
+                return {"status": "idle", "executed": False, "message": "等待 Mod 驱动停手确认。", "mod_sync": gate}
+            if view.get("screen") == "MAIN_MENU" and self._catgirl_client is not None and not has_input:
+                return {"status": "idle", "executed": False, "message": "等待 Mod 完成进房。"}
+            if view.get("screen") == "MAIN_MENU":
+                actions_paused = True
+            if view.get("screen") in {"CHARACTER_SELECT", "MULTIPLAYER_LOBBY"} and not has_input:
+                return {"status": "idle", "executed": False, "message": "等待玩家选择角色并手动确认开局。"}
+            phase = perf_counter()
+            await self._read_companion_dialogue()
+            self._step_timing["input_ms"] = (perf_counter() - phase) * 1000
+            unresolved_options = [option.get("i") for option in (view.get("event") or {}).get("options") or []
+                                  if not option.get("locked") and not option.get("proceed")
+                                  and re.search(r"\{[^{}]+\}", option.get("line") or "")]
+            if view.get("screen") == "EVENT" and unresolved_options:
+                wait_key = json.dumps([view.get("run_id"), (view.get("event") or {}).get("id"), unresolved_options])
+                if self._event_data_wait_key != wait_key:
+                    self._event_data_wait_key, self._event_data_wait_at = wait_key, time()
+                    self.logger.info("[sts2_event_data_wait] options=%s，等待事件动态值就绪", unresolved_options)
+                actions_paused = True
+                if not (self._companion_session.pending_messages() or self._ingress_callbacks):
+                    elapsed = time() - self._event_data_wait_at
+                    return {"status": "waiting_for_data", "executed": False,
+                            "message": "事件选项动态值尚未就绪，继续刷新；仍可聊天。" if elapsed < 10 else
+                                       "事件选项动态值持续未解析，暂缓选择并继续刷新；仍可聊天。"}
+            else:
+                self._event_data_wait_key = ""
+            if self._ingress_enabled and not self._ingress_active:
+                return {"status": "idle", "executed": False, "message": self._state.input_warning or "等待统一同伴会话建立。"}
+            generation = self._companion_session.generation
+            if generation != self._last_dialogue_generation:
+                self._invalidate_companion_plan("收到新的玩家发言")
+                self._last_dialogue_generation = generation
+            mode = self._state.control_mode
+            control_generation = self._state.control_generation
+            guidance_generation = self._state.guidance_generation
+            action_anchor = self._companion_session.anchor()
+            turn_message = self._current_turn_message() if self._wait_for_turn_message else None
+            if (self._wait_for_turn_message and action_anchor.get("battle_id") and turn_message is None
+                    and (not self._ingress_active or not self._companion_session.pending_messages())):
+                self._invalidate_companion_plan()
+                return {"status": "waiting_for_message", "executed": False,
+                        "message": "本回合等待你说一句话，再根据这句话决策。", "anchor": action_anchor}
+            plan_generation = (generation, control_generation, guidance_generation)
+            dialogue_revision = self._companion_session.dialogue_revision
+            new_messages = self._companion_session.pending_messages()
+            if (view.get("screen") in {"GAME_OVER", "VICTORY", "DEFEAT"} and not new_messages
+                    and self._companion_session.terminal_reply_run_id == view.get("run_id")):
+                self._ingress_callbacks.clear()
+                return {"status": "idle", "executed": False, "message": "本局结算已说过，等待玩家。"}
+            local = next((p for p in (raw.get("combat") or {}).get("players") or [] if p.get("is_local")), {}) if view.get("screen") == "COMBAT" else {}
+            if local.get("ready_to_end_turn") is True and not new_messages:
+                return {"status": "waiting_for_teammate", "executed": False, "message": "我已结束回合，等待队友。"}
+            event = view.get("event") or {}
+            if (view.get("screen") == "EVENT" and event.get("is_shared") and not event.get("finished")
+                    and event.get("local_vote") is not None
+                    and not new_messages and not self._ingress_callbacks and not force):
+                self._clear_stuck()
+                return {"status": "waiting_for_teammate", "executed": False,
+                        "message": "共享事件投票已确认，等待队友投票或事件结算。"}
+            if view.get("screen") == "MAP" and (view.get("map") or {}).get("local_vote") is not None:
+                wait_key = view_signature({"run": view.get("run_id"), "floor": (view.get("run") or {}).get("floor"),
+                    "map": view["map"], "requirements": self._companion_session.requirements_revision,
+                    "control": self._state.control_generation})
+                unchanged_wait = self._map_wait_key in {"", wait_key}
+                self._map_wait_key = wait_key
+                if unchanged_wait and not new_messages and not self._ingress_callbacks and not force:
+                    return {"status": "waiting_for_teammate", "executed": False,
+                            "message": "地图投票已确认，等待队友投票或地图变化。"}
+            else:
+                self._map_wait_key = ""
+            action_names = {a if isinstance(a, str) else a.get("name") or a.get("type") for a in view.get("available_actions") or view.get("actions") or []}
+            combat_ready = view.get("screen") != "COMBAT" or bool({"play_card", "end_turn"} & action_names)
+            if combat_ready and not actions_paused and not self._requirement_wait():
+                window_key = (view.get("run_id"), action_anchor.get("battle_id"), action_anchor.get("turn"))
+                if self._action_window.get("key") != window_key:
+                    self._action_window = {"key": window_key, "at": time(), "confirmed": False}
+            if not combat_ready and not new_messages and not self._ingress_callbacks:
+                # 手牌移走已能确认出牌，但动画和200ms稳定闸尚未结束；保留续步，等待下次观察。
+                return {"status": "waiting_for_actions", "executed": False, "message": "等待战斗动作就绪。"}
+            decision_key = view_signature({"view": view, "dialogue_generation": generation,
+                                           "play_style": self._state.play_style, "mode": mode,
+                                           "control_generation": control_generation, "guidance_generation": guidance_generation})
+            raw_hand = {card.get("index", i): card for i, card in enumerate((raw.get("combat") or {}).get("hand") or [])}
+            energy = ((view.get("combat") or {}).get("player") or {}).get("energy")
 
-        水晶球那一页（`screen_progress` 非空即为这类界面）把 2 个占卜按钮 + 15 个图块都暴露成
-        选项，但**不是每个下标都有用**：实测点 [3] 回 pending、局面毫无变化，点 [4] 才 completed、
-        图块揭开。所以死盯一个下标（规划器默认多半就是 0）只会一直空点 —— 这正是那条
-        `[sts2_stuck] 动作没生效（无进展）… repeat=8` 的来源。
+            def _affordable(card: dict) -> bool:
+                source = raw_hand.get(card["index"]) or {}
+                cost = source.get("energy_cost")
+                if not source.get("playable") or source.get("blocked_by_hook"):
+                    return False
+                if cost == 0:
+                    return True
+                if type(cost) not in {int, float} or type(energy) not in {int, float}:
+                    return False
+                return cost <= energy
 
-        这里的做法最简单也最稳：**每次派发都往前推一格**（到尾部回绕），于是它会把所有下标扫一遍，
-        图块逐个被揭开，直到 `items` 归零、这一页结束（那时屏幕换了，游标自然重置）。
+            # 结束回合前要比较的是"还能打且付得起"的全部牌；旧范围只有0费牌，漏掉1费充电+（Q06）。
+            playable = [{"card_ref": card["ref"], "name": card["name"], "line": card["line"],
+                         "card_type": card["card_type"], "energy_cost": (raw_hand.get(card["index"]) or {}).get("energy_cost")}
+                        for card in action_refs(snapshot)["cards"] if _affordable(card)]
+            zero_cost = [card for card in playable if card["energy_cost"] == 0]
+            turn_end_check = {"energy": energy, "playable_cards": playable, "playable_zero_cost_cards": zero_cost}
+            end_turn_key = view_signature({"anchor": action_anchor, "progress": self._companion_session.progress_sequence,
+                                           "check": turn_end_check})
+            if (self._selected_steps and self._selected_steps[0]["action_type"] == "end_turn"
+                    and playable and self._end_turn_review_key != end_turn_key):
+                self.logger.info("[sts2_end_turn_review] check=%s", json.dumps(turn_end_check, ensure_ascii=False))
+                self._invalidate_companion_plan("结束回合前复核剩余可负担的牌")
+            operation = None
+            if (self._last_operation and self._last_operation.get("auto_divination")
+                    and not new_messages
+                    and self._selected_generation == plan_generation
+                    and self._state.event_option_screen == self._event_screen_key(snapshot)):
+                operation = {"action_type": "choose_event_option", "kwargs": dict(self._last_operation["kwargs"]),
+                             "source": "llm", "reason": "继续已选占卜的图块操作"}
+                path = "divination"
+            if self._selected_steps and not new_messages and combat_ready:
+                step = self._selected_steps[0]
+                resolved, invalid = resolve_action(step, snapshot)
+                if resolved is not None:
+                    step = resolved
+                if self._selected_generation == plan_generation and self._continuation_step_matches(step, view):
+                    candidate = {**step, "action_type": step["action_type"], "kwargs": step["kwargs"],
+                                 "source": "llm", "reason": step.get("reason") or "继续已选计划",
+                                 "plan_revision": self._companion_session.active_plan.get("revision"),
+                                 "step_id": step.get("step_id")}
+                    if invalid is None and candidate.get("observation_guard"):
+                        _, guard_error = self._resolve_dispatch(candidate)
+                        if guard_error:
+                            invalid = {"code": "observation_changed", "message": guard_error}
+                    if (invalid is None and self._action_engine.validate(snapshot, candidate) is not None
+                            and self._companion_session.requirement_blocker(candidate, snapshot) is None):
+                        operation = candidate
+                        path = "selected_plan"
+                        self._state.decision_metrics["continuation_reused"] = self._state.decision_metrics.get("continuation_reused", 0) + 1
+                        self.logger.info("[sts2_continuation] 复用续步 action=%s kwargs=%s 剩余=%s",
+                                         step.get("action_type"), step.get("kwargs"), len(self._selected_steps))
+                    else:
+                        self.logger.info("[sts2_continuation] 续步已被现场校验拒绝 action=%s kwargs=%s",
+                                         step.get("action_type"), step.get("kwargs"))
+                if operation is None:
+                    invalid = invalid or {"code": "context_changed" if self._selected_generation != plan_generation
+                                         or not self._continuation_step_matches(step, view) else "action_illegal",
+                                         "feedback": self._action_engine.validate_with_feedback(snapshot, {**step, "source": "llm"})[1]}
+                    metrics = self._state.decision_metrics
+                    metrics["continuation_cancelled"] = metrics.get("continuation_cancelled", 0) + 1
+                    causes = metrics.setdefault("continuation_cancel_causes", {})
+                    causes[invalid["code"]] = causes.get(invalid["code"], 0) + 1
+                    self._invalidate_companion_plan(json.dumps(invalid, ensure_ascii=False))
+            if operation is None and not new_messages and not self._ingress_callbacks and not actions_paused:
+                operation = self._flow_followup(snapshot)
+                if operation is not None:
+                    path = "flow_followup"
+            if decision_key == self._last_decision_key and not force and operation is None and not new_messages and not self._ingress_callbacks:
+                if not self._requirement_wait():
+                    self._note_no_operation(snapshot)
+                if (self._state.stuck_reported and self._stuck_recheck_key != decision_key
+                        and not self._waiting_for_teammate(snapshot)):
+                    # 卡住后给模型一次含无进展事实的重判机会，不无限复用 null 决策。
+                    self._stuck_recheck_key = decision_key
+                    self._last_decision_key = ""
+                return {"status": "idle", "executed": False, "message": "等待局面或对话变化。"}
+            if operation is None:
+                if self._state.stuck_reported:
+                    self._stuck_recheck_key = decision_key
+                conversation_plan_valid = False
+                if self._selected_steps and self._selected_generation == plan_generation:
+                    existing, invalid = resolve_action(self._selected_steps[0], snapshot)
+                    if existing is not None and invalid is None and self._continuation_step_matches(existing, view):
+                        conversation_plan_valid = self._action_engine.validate(snapshot, {**existing, "source": "llm"}) is not None
+                if view.get("screen") == "COMBAT":
+                    facts = build_agent_facts(snapshot.get("raw_state"))
+                    self.logger.info("[sts2_decision_observation] run=%s turn=%s enemies=%s facts=%s incoming=%s orbs=%s",
+                                     view.get("run_id"), view.get("turn"),
+                                     json.dumps([{"entity_id": e.get("entity_id"), "name": e.get("name"),
+                                                  "hp": e.get("current_hp"), "intent": e.get("intent"),
+                                                  "intents": e.get("intents")} for e in
+                                                 ((snapshot.get("raw_state") or {}).get("combat") or {}).get("enemies") or []
+                                                 if e.get("is_alive", True)], ensure_ascii=False),
+                                     json.dumps(facts.get("enemies", []), ensure_ascii=False), facts.get("incoming_damage"),
+                                     json.dumps(facts.get("orbs", []), ensure_ascii=False))
+                self._execution_phase = {"state": "deciding", "text": "正在决策", "detail": "结合当前局面与有效要求选择行动"}
+                await self._sync_execution_status()
+                decision_facts = build_agent_facts(snapshot.get("raw_state"))
+                historical_question = any(re.search(r"上(?:一)?局|以前|那局|跨局|历史|经验|记忆|记住|依据|来源|哪来|怎么.*(?:总结|学|记)", m["content"]) for m in new_messages)
+                experience_context = self._catgirl_memory.decision_context(view, decision_facts, include_history=historical_question)
+                strategy_knowledge = self._strategy_repository.decision_knowledge(view, decision_facts)
+                report_requested = any(re.search(r"效果|统计|速度|耗时|采用次数|学到了", m["content"]) for m in new_messages)
+                effect_report = self._companion_session.journal.report() if report_requested else {}
+                if effect_report:
+                    effect_report.pop("outcomes", None)
+                    effect_report["latency"] = effect_report["latency"][-8:]
+                learning_report = self._catgirl_memory.learning_report() if report_requested else {}
+                pending_review = self._catgirl_memory.pending_review()
+                if pending_review and new_messages:
+                    pending_review["process"] = CompanionJournal.reflection_context(
+                        self._review_journal({"kind": "run_feedback", "run_id": pending_review["run_id"]}).data)
+                if learning_report:
+                    learning_report["experiences"] = learning_report["experiences"][:6]
+                    learning_report.pop("events", None)
+                self._learning_available = experience_context.get("experiences", [])
+                self._latency_baseline = dict(metrics_before)
+                # 交流提示：选项页是"问一句"最有价值的节点；战斗里按主人要求覆盖两类：
+                # 多敌先问集火、怪接近斩杀/要不要用药水。每场战斗每类只提示一次，避免频繁问。
+                screen = view.get("screen")
+                self._decision_seq += 1
+                if screen in {"REWARD", "SELECTION", "SHOP", "REST", "EVENT", "CHEST"}:
+                    ask_cue = ("本页有多个可选：默认先用ask问一句自己的倾向再定（一次只问一个点）；"
+                               "单选项、明显唯一或同一话题已问过就直接做。")
+                elif screen == "MAP":
+                    ask_cue = "地图分支：路线取舍值得商量时（精英/Boss/营火/商店）用ask问一句；明显最优就直接走。"
+                elif screen == "COMBAT":
+                    battle = str(action_anchor.get("battle_id") or view.get("battle_id") or view.get("run_id") or "")
+                    state = self._combat_ask_state
+                    if state.get("battle") != battle:
+                        state = {"battle": battle, "focus": False, "lethal": False}
+                        self._combat_ask_state = state
+                    enemies = [item for item in (decision_facts.get("enemies") or [])
+                               if isinstance(item.get("hp"), (int, float)) and item["hp"] > 0]
+                    cues = []
+                    if len(enemies) >= 2 and not state.get("focus"):
+                        cues.append("多敌：先问主人一句先集火谁（用ask），一次只问一个点。")
+                    # 斩杀视野按主人口径：30 血或 30% 最大生命，两者都算；不再硬绑"无来伤/格挡够"。
+                    near = [item for item in enemies
+                            if item["hp"] <= 30
+                            or (isinstance(item.get("max_hp"), (int, float)) and item["max_hp"] > 0
+                                and item["hp"] <= item["max_hp"] * 0.3)]
+                    if near and not state.get("lethal"):
+                        cues.append("有怪进入斩杀视野（30血或30%最大生命）：先算这回合全攻打完能不能击杀；"
+                                    "能击杀就用ask问主人要不要放弃防御全攻斩杀，打不死就正常防御、不全攻。")
+                    ask_cue = "".join(cues)
+                else:
+                    ask_cue = ""
+                # 情绪吐槽按决策次数冷却，避免每回合都来一句。
+                banter_allowed = (self._decision_seq - self._banter_last_seq) >= 5
+                operation = await self._plan_with_input(
+                    {"agent_view": {**view, "available_actions": [], "actions": []} if actions_paused or not combat_ready or local.get("ready_to_end_turn") else view,
+                     "actions_enabled": not actions_paused and combat_ready and not local.get("ready_to_end_turn", False),
+                     "game_connection": game_connection,
+                     "control_state": {"autoplay": self._state.autoplay_state, "mode": mode,
+                                       "pause_reason": self._state.pause_reason},
+                     "action_refs": action_refs(snapshot),
+                     "turn_end_check": turn_end_check,
+                     "conversation_owner": f"{self._ingress_instance}:{self._companion_session.epoch}" if self._ingress_active else None,
+                     "host_callbacks": deepcopy(self._ingress_callbacks + ([self._ingress_material] if self._ingress_material else [])),
+                     "host_background": self._host_background,
+                     "conversation_seed": self._conversation_seed,
+                     "selected_plan_valid": conversation_plan_valid,
+                     "session": self._companion_session.context(),
+                     "new_player_messages": new_messages, "selected_plan": [
+                         {key: step[key] for key in ("action_type", "kwargs", "reason", "description", "assumptions") if key in step} for step in self._selected_steps],
+                     "play_style": self._state.play_style, "map_policy": self._map_policy,
+                     "player_requests": list(self._state.pending_guidance),
+                      "active_requirements": self._companion_session.active_requirements(),
+                     "requirement_states": self._companion_session.requirement_states(),
+                      "execution_status": self.execution_status(),
+                     "ask_cue": ask_cue,
+                     "banter_allowed": banter_allowed,
+                     "current_turn_message": turn_message,
+                     "turn_speech_required": view.get("screen") == "COMBAT" and self._communicated_turn != action_anchor,
+                     "potion_speech_allowed": (self._ingress_active or not self._companion_session.awaiting_chat_reply()) and (self._state.host_digest_enabled or self._danmaku_enabled),
+                     "speech_allowed": (self._ingress_active or not self._companion_session.awaiting_chat_reply()) and (self._state.host_digest_enabled or self._danmaku_enabled),
+                     "past_experience": experience_context,
+                     "strategy_knowledge": strategy_knowledge,
+                     "experience_catalog": self._catgirl_memory.experience_catalog(new_messages) if new_messages else [],
+                     "recent_turn_review": self._companion_session.journal.review_context(new_messages) if new_messages else {},
+                     "run_review": self._companion_session.journal.reflection_context(self._companion_session.journal.data) if view.get("screen") in {"GAME_OVER", "VICTORY", "DEFEAT"} else {},
+                     "pending_run_review": pending_review,
+                     "terminal_review_required": bool(self._state.run_reflection_enabled
+                         and view.get("screen") in {"GAME_OVER", "VICTORY", "DEFEAT"}
+                         and any(t.get("battle_id") and t.get("actions") for t in self._companion_session.journal.data.get("turns", []))
+                         and not any(r.get("kind") == "run_end" for r in self._companion_session.journal.data.get("reviews", []))),
+                     "learning_report": learning_report,
+                     "effect_report": effect_report,
+                     # 补齐 agent_view 被裁掉的意图/buff/遗物药水效果；由 raw_state 抽取，随局内事实一起给模型。
+                     "agent_facts": decision_facts,
+                     "no_progress": self._state.stuck_reason,
+                     "divination_invalid_indices": list(self._state.event_invalid_indices)},
+                    validate=lambda op: self._validate_companion_action(snapshot, op),
+                    solver=lambda: self._solve_for_companion(view, plan_generation),
+                    route_messages=self._companion_session.resolve_messages,
+                )
+                self._ingress_callbacks.clear()
+                self._execution_phase = {}
+                self._ingress_material = {}
+                if operation is not None:
+                    if getattr(operation, "banter_used", False):
+                        self._banter_last_seq = self._decision_seq
+                    if screen == "COMBAT" and getattr(operation, "asked", False):
+                        state = self._combat_ask_state
+                        if "集火" in ask_cue:
+                            state["focus"] = True
+                        if "斩杀" in ask_cue:
+                            state["lethal"] = True
+                decision = operation
+                if decision is not None:
+                    journal = self._review_journal(decision.review)
+                    self._catgirl_memory.record_exposure(self._learning_available, view.get("run_id"),
+                                                        (journal.data.get("latest") or {}).get("id", ""))
+                    self._catgirl_memory.apply_learning(decision.learning_updates, messages=new_messages, journal=journal)
+                    revised = {u["id"] for u in decision.learning_updates if u["op"] in {"replace", "revoke"}}
+                    if any(u["id"] in revised for step in self._selected_steps for u in step.get("experience_uses") or []):
+                        self._invalidate_companion_plan("采用的经验已修改或撤销，重新判断剩余步骤")
+                    if decision.review:
+                        journal.review(decision.review, decision.reply, new_messages)
+                        if decision.review.get("kind") == "run_end":
+                            self._catgirl_memory.stage_review(decision.review, decision.reply, journal)
+                        elif decision.review.get("kind") == "run_feedback":
+                            self._catgirl_memory.finish_review(decision.review, new_messages)
+                            self._catgirl_memory.attach_process(journal.data["run_id"], journal.run_context())
+                    if decision.learning_updates or decision.review:
+                        self._write_history_view()
+                if decision is not None and getattr(decision, "requirement_updates", None):
+                    self._companion_session.apply_requirement_updates(decision.requirement_updates, snapshot, decision.as_dict(),
+                                                                     messages=new_messages)
+                    self._record_input_timing(new_messages, "input_to_requirement_applied_ms")
+                    self._last_decision_key = ""
+                    self._invalidate_companion_plan("玩家要求已更新")
+                    self.logger.info("[sts2_requirements_updated] revision=%s active=%s",
+                                     self._companion_session.requirements_revision,
+                                     json.dumps(self._companion_session.active_requirements(), ensure_ascii=False))
+                update = getattr(decision, "plan_update", "replace")
+                reply = getattr(decision, "reply", "")
+                control = getattr(decision, "control", "")
+                if control == "pause":
+                    self.pause_autoplay(reason="user")
+                    actions_paused = True
+                elif control == "stop":
+                    self.stop_autoplay(reason="user")
+                    actions_paused = True
+                elif control == "resume":
+                    self.resume_autoplay()
+                    # 本轮仍用暂停时的观察回答；下一轮刷新后才恢复动作。
+                if reply:
+                    if new_messages:
+                        self._companion_session.save_input_result(new_messages, reply,
+                            media=decision.media_requests, kind=decision.reply_kind)
+                        # 先保存处理结果和待送达回复，输入随后可ack；动作取消不重做学习。
+                        self._ingress_ack.extend(m["request_id"] for m in new_messages if m.get("request_id"))
+                        await self._read_companion_dialogue()
+                        if not await self._flush_companion_replies():
+                            return {"status": "reply_pending", "executed": False, "message": "回复已保存，等待送达。"}
+                    else:
+                        await self._publish_companion_reply(reply, new_messages, media_requests=decision.media_requests,
+                                                            speech_kind=decision.reply_kind)
+                elif new_messages and self._ingress_active and not getattr(decision, "speech", ""):
+                    kinds = {m["id"]: m["kind"] for m in self._companion_session.user_requests}
+                    if not (getattr(decision, "action_type", "") and update == "replace"
+                            and all(kinds.get(m["id"]) in {"guidance", "immediate"} for m in new_messages)):
+                        raise RuntimeError("统一会话未回答新消息；保留输入等待重试")
+                    self.logger.warning("[sts2_guidance_speech_deferred] 游戏要求已分类并更新动作；发言修正失败不阻塞执行")
+                if decision is not None and not decision.action_type:
+                    operation = None
+                if update == "wait" or actions_paused or not combat_ready:
+                    self._note_decision_success()
+                    self._last_decision_key = decision_key
+                    return {"status": "idle", "executed": False, "message": reply or "暂时等待，仍可聊天。"}
+                updated_generation = self._companion_session.generation
+                if updated_generation != generation:
+                    self._invalidate_companion_plan("收到新的游戏要求")
+                    generation = updated_generation
+                    self._last_dialogue_generation = generation
+                    plan_generation = (generation, control_generation, guidance_generation)
+                elif new_messages and (update == "keep" or not self._ingress_active) and self._selected_steps and self._selected_generation == plan_generation:
+                    step = self._selected_steps[0]
+                    step, invalid = resolve_action(step, snapshot)
+                    if step is not None and self._continuation_step_matches(step, view):
+                        candidate = {**step, "action_type": step["action_type"], "kwargs": step["kwargs"], "source": "llm",
+                                     "reason": step.get("reason") or "继续已选计划", "plan_revision": self._companion_session.active_plan.get("revision"),
+                                     "step_id": step["step_id"]}
+                        if self._action_engine.validate(snapshot, candidate) is not None:
+                            operation, path = candidate, "selected_plan"
+                if operation is not None:
+                    if path != "selected_plan":
+                        operation = operation.as_dict()
+            if operation is None:
+                self._note_decision_success()
+                self._last_decision_key = decision_key
+                if not self._requirement_wait():
+                    self._note_no_operation(snapshot)
+                return {"status": "idle", "executed": False, "message": "等待当前界面可行动。"}
+            blocker = self._companion_session.requirement_blocker(operation, snapshot)
+            if blocker:
+                self._invalidate_companion_plan(blocker["reason"])
+                self._note_decision_success()
+                self._last_decision_key = ""
+                return {"status": "waiting_for_condition", "executed": False, "message": blocker["reason"],
+                        "requirement_id": blocker.get("requirement_id")}
+            if operation["action_type"] == "end_turn" and playable and path != "selected_plan":
+                self._end_turn_review_key = end_turn_key
+            operation = self._advance_custom_event_cursor(snapshot, operation)
+            operation["view_signature"] = signature
+            operation["observation_guard"] = observation_guard(snapshot)
+            operation["session_generation"] = generation
+            operation["dialogue_revision"] = dialogue_revision
+            operation["control_mode"] = mode
+            operation["control_generation"] = control_generation
+            operation["guidance_generation"] = guidance_generation
+            operation["consumed_guidance_generation"] = guidance_generation
+            if path != "selected_plan":
+                operation["flow_anchor"] = {"run_id": view.get("run_id"), "floor": (view.get("run") or {}).get("floor"),
+                                            "event_id": (view.get("event") or {}).get("id")}
+                guidance_ids = {m["id"] for m in self._companion_session.user_requests if m.get("kind") in {"guidance", "immediate"}}
+                guidance_messages = [m for m in new_messages if m["id"] in guidance_ids]
+                if guidance_messages:
+                    operation["input_received_at"] = min(m["timestamp"] for m in guidance_messages)
+                uses = list(operation.get("experience_uses") or [])
+                for i, candidate in enumerate([operation, *operation.get("continuation", [])]):
+                    candidate["experience_uses"] = [deepcopy(u) for u in uses if i in u.get("steps", [])]
+                cached_solver = self._solver_cache[1] if self._solver_cache else {}
+                solver_result = cached_solver.get("solver_result") or {}
+                operation["solver_summary"] = {k: deepcopy(v) for k, v in solver_result.items()
+                                               if k in {"score", "scores", "coverage", "warnings", "confidence", "win_prob", "mode"}}
+                planned_intents = enemy_intents(snapshot)
+                operation["enemy_intents"] = planned_intents
+                for step in operation.get("continuation") or []:
+                    step["enemy_intents"] = planned_intents
+                self._companion_session.accept_plan(operation, view)
+                if guidance_messages and reply and not operation.get("speech"):
+                    self._companion_session.announce_plan({**operation, "speech_step_ids": [0]}, reply, "guidance")
+                operation["input_ids"] = [m.get("request_id") for m in new_messages if m.get("request_id")]
+                self._selected_generation = plan_generation
+                self.logger.info("[sts2_plan_selected] revision=%s step=%s solver_used=%s solver_adopted=%s reason=%s remaining=%s",
+                                 operation["plan_revision"], operation["step_id"], operation.get("solver_used", False),
+                                 operation.get("solver_adopted", False), operation.get("reason"), [s["description"] for s in self._selected_steps])
+            self._deliver_host_context(snapshot)
+            snapshot["planned_operation"] = operation
+            snapshot["agent_operation"] = operation
+            snapshot["executable_operation"] = self._action_engine.validate(snapshot, operation)
+            # 没有执行权限也可以思考；仅 program 自动执行，force 仍不能绕过讨论暂停。
+            if mode != "program" and not force:
+                self._note_decision_success()
+                self._last_decision_key = decision_key
+                return {"status": "idle", "executed": False, "planned_operation": operation,
+                        "message": operation.get("reason") or "已判断，当前暂停执行。"}
+            phase = perf_counter()
+            result = await self.execute_operation(operation)
+            self._step_timing["dispatch_and_confirmation_ms"] = (perf_counter() - phase) * 1000
+            self.logger.info("[sts2_llm_action] action=%s%s status=%s executed=%s message=%s revision=%s step=%s",
+                             operation["action_type"], self._action_card_hint(operation, view),
+                             result.get("status"), result.get("executed"), result.get("message"),
+                             operation.get("plan_revision"), operation.get("step_id"))
+            if result.get("executed"):
+                self._note_decision_success()
+                self._last_decision_key = decision_key
+                self._state.step_count += 1
+                self._last_operation = operation
+                plan_still_current = plan_generation == (self._companion_session.generation,
+                    self._state.control_generation, self._state.guidance_generation)
+                if plan_still_current:
+                    self._companion_session.complete_step(operation)
+                if path != "selected_plan" and plan_still_current:
+                    if self._selected_steps:
+                        self.logger.info("[sts2_continuation] 模型返回续步 n=%s，下次可省一次模型调用", len(self._selected_steps))
+                    else:
+                        self.logger.info("[sts2_continuation] 模型未返回续步，本步仍需单独决策")
+                if path == "model" and plan_still_current and operation.get("future_plan") is not None:
+                    # 执行前锚点，不能把 end_turn 后的新回合当成计划起点。
+                    future = operation.get("future_plan") or {}
+                    if self._companion_session.facts.get("battle_id") == action_anchor.get("battle_id"):
+                        self._companion_session.select_plan(future, anchor=action_anchor)
+                if self._agent_view(self._state.snapshot) != view:
+                    self._clear_stuck()
+                    self._state.progress_repeat = 0
+                elif operation.get("auto_divination"):
+                    index = (operation.get("kwargs") or {}).get("option_index")
+                    if index not in self._state.event_invalid_indices:
+                        self._state.event_invalid_indices.append(index)
+                    self.logger.info("[sts2_divination] 无变化选项 index=%s", index)
+                    self._last_decision_key = ""
+                else:
+                    self._note_step_progress(snapshot, operation)
+            elif result.get("status") == "error":
+                raise RuntimeError(result.get("message") or "动作未被接收")
+            elif result.get("status") == "waiting_for_actions":
+                if self._selected_steps and self._selected_steps[0].get("step_id") == operation.get("step_id"):
+                    self._selected_steps[0]["observation_guard"] = deepcopy(operation.get("observation_guard"))
+                self._execution_phase = {"state": "waiting", "text": "等待界面就绪", "detail": "保留已选计划，等待动作窗口恢复"}
+                self.logger.info("[sts2_plan_waiting] revision=%s step=%s", operation.get("plan_revision"), operation.get("step_id"))
+            elif result.get("status") == "waiting_for_input":
+                # 已问主人、窗口内收到回答：丢弃当前动作，保留回答输入等下一轮重判。
+                self._invalidate_companion_plan("已问主人，收到回答后重新判断")
+                self._note_decision_success()
+                self._execution_phase = {"state": "waiting", "text": "等主人回答", "detail": "已提出问题，收到回答后重新判断"}
+                self.logger.info("[sts2_ask_window] 保留回答输入，等待重判 revision=%s", operation.get("plan_revision"))
+            elif result.get("status") in {"stale", "unconfirmed"}:
+                self._companion_session.record_action(operation, anchor=action_anchor, before=view,
+                    after=self._agent_view(self._state.snapshot), result=result)
+                dialogue_only = (result.get("status") == "stale" and self._companion_session.pending_messages()
+                    and self._companion_session.generation == generation
+                    and view_signature(self._agent_view(self._state.snapshot)) == signature
+                    and self._state.control_generation == control_generation
+                    and self._state.guidance_generation == guidance_generation)
+                if not dialogue_only:
+                    self._invalidate_companion_plan(result.get("message") or "动作未确认")
+            elif result.get("status") == "idle":
+                self._note_no_operation(snapshot)
+            self._deliver_host_context(self._state.snapshot)
+            return result
+        except SolverPhaseWait as exc:
+            # 过渡帧不是失败：保留原计划、不记错误、不重判，等下一次观察拿到可行动现场。
+            self.logger.info("[sts2_solver_phase_wait] %s", exc)
+            return {"status": "waiting_for_actions", "executed": False, "message": str(exc)}
+        except DecisionContextChanged as exc:
+            self._invalidate_companion_plan(str(exc))
+            self._last_decision_key = ""
+            result = {"status": "stale", "executed": False, "message": str(exc)}
+            self.logger.info("[sts2_decision_stale] %s", exc)
+            return result
+        except STS2ActionRejected as exc:
+            result = {"status": "rejected", "executed": False, "message": str(exc)}
+            if operation is not None:
+                self._companion_session.record_action(operation, anchor=action_anchor, before=view,
+                    after=self._agent_view(self._state.snapshot),
+                    result={"status": "rejected", "executed": False, "message": str(exc)})
+            await self.refresh_state(plan_combat=False)
+            fresh = self._agent_view(self._state.snapshot)
+            names = {a if isinstance(a, str) else a.get("name") or a.get("type") for a in
+                     fresh.get("available_actions", fresh.get("actions", []))}
+            if (operation and view.get("screen") == fresh.get("screen") == "COMBAT"
+                    and view.get("run_id") == fresh.get("run_id") and view.get("turn") == fresh.get("turn")
+                    and operation["action_type"] not in names):
+                result = {"status": "waiting_for_actions", "executed": False, "message": "动作窗口暂时关闭，等待新现场恢复。"}
+                return result
+            self._invalidate_companion_plan(str(exc))
+            self._deliver_host_context(self._state.snapshot)
+            raise
+        except STS2TransportError:
+            result = {"status": "transport_error", "executed": False}
+            raise
+        except Exception as exc:
+            result = {"status": "error", "executed": False, "message": str(exc) or type(exc).__name__}
+            for message in locals().get("new_messages", []):
+                if any((message.get("request_id") or message["id"]) in r["ids"]
+                       for r in self._companion_session.input_results):
+                    continue
+                if message.get("request_id") and message["request_id"] not in self._ingress_ack:
+                    for pending in self._companion_session.user_requests:
+                        if pending["id"] == message["id"]:
+                            pending["kind"] = "pending"
+            self._invalidate_companion_plan()
+            self._state.decision_error = str(exc) or "LLM 决策超时"
+            self._state.decision_errors += 1
+            paused = self._pause_after_decision_failures()
+            if not paused:
+                self._state.retry_at = time() + self._autoplay_retry_backoff()
+            self.logger.warning("[sts2_llm_decision] 自主决策失败 count=%s paused=%s：%s",
+                                self._state.decision_errors, paused, self._state.decision_error)
+            self._emit_status()
+            return {"status": "paused" if paused else "error", "executed": False,
+                    "message": self._state.decision_error, "retry_at": self._state.retry_at}
+        finally:
+            self._step_timing["model_ms"] = self._llm_planner.metrics.get("model_ms", 0) - metrics_before.get("model_ms", 0)
+            self._step_timing["solver_ms"] = self._state.decision_metrics.get("solver_ms", 0) - metrics_before.get("solver_ms", 0)
+            if operation is not None or self._llm_planner.metrics.get("model_calls", 0) != metrics_before.get("model_calls", 0):
+                self._record_latency(started, path, locals().get("result", {}))
+            self._state.decision_metrics.update(self._llm_planner.metrics)
+            if locals().get("result", {}).get("status") in {"waiting_for_condition", "waiting_for_teammate", "waiting_for_message", "waiting_for_actions", "paused"}:
+                self._action_window = {}
+                self._last_confirmed = {}
+            self._execution_phase = {}
+            self._decision_lock.release()
+
+    def _note_decision_success(self) -> None:
+        self._state.decision_errors = 0
+        self._state.decision_error = ""
+        self._state.retry_at = 0.0
+        self._state.decision_failed_revision = -1
+
+    def _pause_after_decision_failures(self) -> bool:
+        if self._state.decision_errors < 3:
+            return False
+        if self._state.decision_failed_revision >= 0:
+            return True
+        self._state.decision_failed_revision = self._companion_session.dialogue_revision
+        self._decision_failure_run_id = self._companion_session.facts.get("run_id")
+        self._state.retry_at = 0.0
+        if self._state.autoplay_state == "running":
+            self.pause_autoplay(reason="decision_failure")
+        self._decision_failure_notice = (
+            f"连续{self._state.decision_errors}轮失败，已暂停自动行动。原因：{self._state.decision_error}。"
+            "等主人说继续，或排查后再恢复。")
+        self._failure_notice_retry_at = 0.0
+        self._failure_notice_attempts = 0
+        self.logger.warning("[sts2_decision_paused] count=%s reason=%s",
+                            self._state.decision_errors, self._state.decision_error)
+        return True
+
+    def _invalidate_companion_plan(self, reason: str = "局面或控制状态改变，重新判断") -> None:
+        self._last_decision_key = ""
+        if self._selected_steps:
+            self.logger.info("[sts2_plan_cancelled] revision=%s reason=%s",
+                             self._companion_session.active_plan.get("revision"), reason)
+        self._companion_session.invalidate_plan(reason)
+        self._selected_generation = None
+        self._companion_session.future_plan.clear()
+        for key in ("planned_operation", "agent_operation", "executable_operation"):
+            self._state.snapshot.pop(key, None)
+
+    def _clear_previous_run_failure(self) -> None:
+        run_id = self._companion_session.facts.get("run_id")
+        if run_id and run_id != "run_unknown" and self._decision_failure_run_id and run_id != self._decision_failure_run_id:
+            if self._state.pause_reason == "decision_failure":
+                self._state.autoplay_state = "idle"
+                self._state.pause_reason = ""
+            self._note_decision_success()
+            self._decision_failure_notice = ""
+            self._failure_notice_attempts = 0
+            self._failure_notice_retry_at = 0.0
+            self._decision_failure_run_id = None
+
+    def _reset_companion_run_context(self) -> None:
+        self._clear_previous_run_failure()
+        self._map_wait_key = ""
+        self._solver_cache = None
+        self._llm_planner.reset_history()
+        self._conversation_seed.clear()
+        self._ingress_callbacks.clear()
+        self._ingress_seen.clear()
+        self._invalidate_companion_plan()
+        self._last_operation = None
+        self._last_observed_view = ""
+        self._companion_push_keys.clear()
+        self._proactive_observation = {}
+        self._communicated_turn = {}
+        self._speech_state = {}
+        self._execution_phase = {}
+        self._last_step_result = {}
+        self._pending_action = None
+        self._unconfirmed_action = None
+        self._feedback_observation = {}
+        self._state.pending_guidance.clear()
+        self._state.latest_action_frame = {}
+        self._state.recent_action_frames.clear()
+        self._state.latest_snapshot_summary = {}
+        self._state.latest_continuous_delta = {}
+        self._state.recent_continuous_deltas.clear()
+        self._state.latest_player_operation_observation = {}
+        self._state.last_host_context_key = ""
+        self._state.recent_companion_player_ops.clear()
+        self._state.recent_decision_memory.clear()
+        self._state.hp_trail.clear()
+        self._state.hp_trail_run_id = ""
+        self._state.route_log.clear()
+        self._state.route_room_key = ""
+        self._state.route_start = {}
+        self._state.route_last = {}
+        self._state.event_option_screen = ""
+        self._state.event_invalid_indices.clear()
+        self._state.event_option_cursor = 0
+        self._state.progress_repeat = 0
+        self._state.progress_reported = False
+        self._clear_stuck()
+
+    async def _solve_for_companion(self, view: dict[str, Any], generation: tuple[int, int, int]) -> dict[str, Any]:
+        if view.get("screen") != "COMBAT":
+            return {"status": "unavailable", "error": "当前不是战斗界面，请直接处理现场合法选项"}
+        combat = ((self._state.snapshot or {}).get("raw_state") or {}).get("combat") or {}
+        local = next((p for p in combat.get("players") or [] if p.get("is_local")), {})
+        if local.get("is_action_phase") is False or local.get("ready_to_end_turn") is True:
+            # 出牌动画/结算/已按结束等待期间调用必然失败；旧实现把它当普通错误交给模型，模型转手算23秒。
+            return {"status": "not_ready", "error": "当前不在玩家可行动阶段，等新鲜现场后再求解"}
+        client = await self._ensure_companion_client()
+        observed = await client.get_state()
+        fresh = observed.get("agent_view") or {}
+        current_generation = (self._companion_session.generation, self._state.control_generation, self._state.guidance_generation)
+        if (observation_guard({"agent_view": fresh}) != observation_guard({"agent_view": view})
+                or current_generation != generation or self._state.discussion_active or self._state.standby):
+            return {"status": "stale", "error": "局面、对话或控制状态改变，请重新判断"}
+        key = view_signature({"view": fresh, "generation": generation})
+        metrics = self._state.decision_metrics
+        if self._solver_cache and self._solver_cache[0] == key:
+            metrics["solver_cache_hits"] = metrics.get("solver_cache_hits", 0) + 1
+            return self._solver_cache[1]
+        started = perf_counter()
+        metrics["solver_calls"] = metrics.get("solver_calls", 0) + 1
+        try:
+            plan = await client.get_combat_plan(companion=True)
+        except STS2TransportError as exc:
+            result = {"status": "error", "error": str(exc)}
+            self._solver_cache = (key, result)
+            return result
+        finally:
+            metrics["solver_ms"] = metrics.get("solver_ms", 0.0) + (perf_counter() - started) * 1000
+        after = (await client.get_state()).get("agent_view") or {}
+        if (observation_guard({"agent_view": after}) != observation_guard({"agent_view": fresh})
+                or current_generation != (self._companion_session.generation, self._state.control_generation, self._state.guidance_generation)):
+            return {"status": "stale", "error": "求解期间局面或要求改变，结果作废"}
+        if plan.get("search_status") == "phase_not_ready":
+            return {"status": "not_ready", "error": "求解器判定尚未进入玩家出牌阶段，等新鲜现场后再求解"}
+        if not plan.get("in_combat") or not plan.get("line"):
+            result = {"status": "error", "error": "现有求解器未产出战斗方案", "solver_result": plan}
+            self._solver_cache = (key, result) if fresh == after else None
+            return result
+        result = {"status": "ok", "solver_result": plan, "observation_version": view_signature(fresh),
+                  "scores_current": fresh == after, "current_view": after,
+                  "solver_refs": {k: [{key: value for key, value in r.items() if key != "entity_id"} for r in values]
+                                  for k, values in action_refs({"agent_view": fresh, "raw_state": observed}).items()},
+                  "interpretation": "自己进程原有模拟输出；保留原信息。未来抽牌/行为为预测；win_prob 是启发式代理值，confidence/coverage/warnings 表示能力限制。无参数，不支持用户约束。"}
+        self._solver_cache = (key, result) if fresh == after else None
+        return result
+
+    def _latency_configuration(self) -> str:
+        key = getattr(self._llm_planner, "_llm_key", None) or [None, None]
+        return sha1(json.dumps({"endpoint": key[0], "model": key[1], "limit": self._llm_planner._max_tokens,
+            "style": self._state.play_style, "speech": self._state.host_digest_enabled,
+            "wait_for_turn": self._wait_for_turn_message, "persona": self._host_persona,
+            "character": self._ingress_character, "danmaku": self._danmaku_enabled},
+            sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:12]
+
+    def _record_input_timing(self, messages: list[dict], measure: str) -> None:
+        journal = self._companion_session.journal
+        if not journal.data:
+            return
+        recorded = journal.data.setdefault("input_timings", {})
+        for item in messages:
+            source = next((m for m in self._companion_session.user_requests
+                           if item.get("request_id") and item.get("request_id") == m.get("request_id")
+                           or item.get("id") and item["id"] == m["id"]), item)
+            if not source.get("timestamp"):
+                continue
+            key = f"{source.get('request_id') or source['id']}:{measure}"
+            if key not in recorded:
+                value = max(0, (time() - source["timestamp"]) * 1000)
+                recorded[key] = value
+                journal.latency({"timestamp": time(), "configuration": self._latency_configuration(),
+                    "path": "input", "measures": {measure: value}, "model_calls": 0, "solver_calls": 0})
+
+    def _record_action_learning(self, record: dict) -> None:
+        record.setdefault("id", str(uuid4()))
+        self._catgirl_memory.record_experience_result(record)
+        if not record.get("executed"):
+            return
+        now = time()
+        key = tuple(record.get(k) for k in ("run_id", "battle_id", "turn"))
+        measures = {}
+        if self._action_window.get("key") == key and not self._action_window.get("confirmed"):
+            measures["first_action_confirmation_ms"] = (now - self._action_window["at"]) * 1000
+            self._action_window["confirmed"] = True
+        if self._last_confirmed.get("key") == key and self._last_confirmed.get("id") != record["id"]:
+            measures["continuation_interval_ms"] = (now - self._last_confirmed["at"]) * 1000
+        self._last_confirmed = {"key": key, "at": now, "id": record["id"]}
+        if record.get("input_received_at"):
+            measures["input_to_action_ms"] = (now - record["input_received_at"]) * 1000
+        self._companion_session.journal.latency({"timestamp": now, "configuration": self._latency_configuration(),
+            "path": "action_confirmed", "measures": measures, "model_calls": 0, "solver_calls": 0})
+
+    def _record_turn_learning(self, turn: dict) -> None:
+        self._catgirl_memory.record_turn_result(turn)
+
+    def _restore_journal_pending(self, snapshot: dict) -> None:
+        journal = self._companion_session.journal
+        if not journal.restored:
+            return
+        journal.restored = False
+        telemetry = journal.data.get("telemetry") or {}
+        for name in ("hp_trail", "combat_room_id", "route_log", "route_room_key", "route_start", "route_last"):
+            if name in telemetry:
+                setattr(self._state, name, deepcopy(telemetry[name]))
+        if telemetry:
+            self._state.hp_trail_run_id = journal.data["run_id"]
+            self._telemetry_gap = True
+        raw, view = snapshot.get("raw_state") or {}, self._agent_view(snapshot)
+        combat = raw.get("combat") or {}
+        for turn in journal.data.get("turns", []):
+            for record in list(turn["actions"]):
+                if record["status"] != "pending":
+                    continue
+                same_turn = raw.get("turn") == record.get("turn")
+                local = next((p for p in combat.get("players") or [] if p.get("is_local")), {})
+                completed = record["action_type"] == "end_turn" and (
+                    local.get("ready_to_end_turn") is True or raw.get("turn") is not None
+                    and record.get("turn") is not None and raw["turn"] > record["turn"])
+                if record["action_type"] == "play_card" and same_turn and record.get("card_entity_id"):
+                    completed = isinstance(combat.get("hand"), list) and all(c.get("entity_id") != record["card_entity_id"] for c in combat["hand"])
+                record.update(status="completed" if completed else "unconfirmed", executed=bool(completed),
+                    message="重载后现场确认完成。" if completed else "重载后保留未确认结果，停止原动作重发。",
+                    outcome={"screen": view.get("screen"), "turn": view.get("turn"),
+                             "player": deepcopy((view.get("combat") or {}).get("player")), "hp": (view.get("run") or {}).get("hp")})
+                journal.confirm_action(record, view)
+                self._catgirl_memory.record_experience_result(record)
+                if not completed:
+                    self._unconfirmed_action = (view_signature(view), record["action_type"], public_kwargs(record.get("kwargs")))
+
+    def _record_latency(self, started: float, path: str, result: dict | None = None) -> None:
+        metrics = {**self._state.decision_metrics, **self._llm_planner.metrics}
+        self._state.decision_metrics = metrics
+        sample = {"timestamp": time(), "path": path, "perception_to_action_ms": (perf_counter() - started) * 1000,
+                  "stages": dict(getattr(self, "_step_timing", {})),
+                  "model_calls": metrics.get("model_calls", 0), "solver_calls": metrics.get("solver_calls", 0)}
+        sample["model_calls"] -= getattr(self, "_latency_baseline", {}).get("model_calls", sample["model_calls"])
+        sample["solver_calls"] -= getattr(self, "_latency_baseline", {}).get("solver_calls", sample["solver_calls"])
+        sample["configuration"] = self._latency_configuration()
+        sample["outcome"] = (result or {}).get("status", "reply_or_wait")
+        sample["measures"] = {"decision_step_ms": sample["perception_to_action_ms"]}
+        baseline = getattr(self, "_latency_baseline", {})
+        sample["counts"] = {key: max(0, metrics.get(key, 0) - baseline.get(key, 0)) for key in
+                            ("continuation_reused", "continuation_cancelled", "solver_cache_hits", "prompt_tokens", "cached_tokens")}
+        causes = metrics.get("continuation_cancel_causes", {})
+        sample["cancellation_causes"] = {key: value - baseline.get("continuation_cancel_causes", {}).get(key, 0)
+                                         for key, value in causes.items() if value > baseline.get("continuation_cancel_causes", {}).get(key, 0)}
+        self._state.latency_samples.append(sample)
+        self._state.latency_samples = self._state.latency_samples[-20:]
+        self.logger.info("[sts2_latency] %s", json.dumps(sample, ensure_ascii=False))
+        self._companion_session.journal.latency(sample)
+
+    def _map_vote_candidates(self, snapshot: dict, session: Any = None) -> list[dict]:
+        view = self._agent_view(snapshot)
+        route = view.get("map") or {}
+        if view.get("screen") != "MAP" or "local_vote" not in route or route["local_vote"] is not None:
+            return []
+        session = session or self._companion_session
+        candidates = []
+        for option in route.get("options") or []:
+            candidate = {"action_type": "choose_map_node", "kwargs": {"option_index": option["i"]},
+                         "source": "llm", "reason": "完成自己的地图投票"}
+            if (self._action_engine.validate(snapshot, candidate) is not None
+                    and session.requirement_blocker(candidate, snapshot) is None):
+                candidates.append(candidate)
+        return candidates
+
+    def _flow_followup(self, snapshot: dict) -> dict | None:
+        """仅推进已完成选择后的无取舍流程，仍经过同一派发校验。"""
+        view = self._agent_view(snapshot)
+        if (len((view.get("map") or {}).get("options") or []) == 1
+                and (candidates := self._map_vote_candidates(snapshot))):
+            return {**candidates[0], "reason": "地图只有一个合法选项，完成自己的投票"}
+        if (view.get("screen") == "MAP" and self._map_policy == MAP_POLICY_FOLLOW
+                and not self._companion_session.active_requirements() and (view.get("map") or {}).get("local_vote") is None):
+            index = self._planner._other_player_vote_index(snapshot.get("summary_context") or {})
+            if index is not None:
+                candidate = {"action_type": "choose_map_node", "kwargs": {"option_index": index},
+                             "source": "llm", "reason": "按已设定的跟票方式投票"}
+                if self._action_engine.validate(snapshot, candidate) is not None:
+                    return candidate
+        previous = self._last_operation or {}
+        anchor = previous.get("flow_anchor") or {}
+        if (not anchor or anchor.get("run_id") != view.get("run_id")
+                or anchor.get("floor") != (view.get("run") or {}).get("floor")):
+            return None
+        names = {a if isinstance(a, str) else a.get("name") or a.get("type") for a in
+                 view.get("available_actions", view.get("actions", []))}
+        kind = previous.get("action_type")
+        action = None
+        if (view.get("screen") == "EVENT" and kind in {"choose_event_option", "advance_event_dialogue"}
+                and anchor.get("event_id") == (view.get("event") or {}).get("id")):
+            action = "advance_event_dialogue" if "advance_event_dialogue" in names else "proceed" if "proceed" in names and "choose_event_option" not in names else None
+        elif kind in {"claim_reward", "choose_reward_card", "skip_reward_cards", "resolve_rewards", "collect_rewards_and_proceed", "choose_rest_option", "choose_treasure_relic"}:
+            reward = view.get("reward") or {}
+            if not any(r.get("claimable") for r in reward.get("rewards") or []) and not reward.get("pending_card_choice"):
+                action = next((a for a in ("collect_rewards_and_proceed", "proceed") if a in names), None)
+        if action is None:
+            return None
+        candidate = {"action_type": action, "kwargs": {}, "source": "llm", "reason": "继续已选方案的界面收尾"}
+        return candidate if self._action_engine.validate(snapshot, candidate) is not None else None
+
+    def _event_screen_key(self, snapshot: dict[str, Any]) -> str:
+        event = self._agent_view(snapshot).get("event") or (snapshot.get("raw_state") or {}).get("event") or {}
+        return f"{snapshot.get('run_id')}|{snapshot.get('screen')}|{snapshot.get('floor')}|{event.get('id', event.get('event_id'))}"
+
+    # 续步匹配只看这些稳定字段：同一屏、同一局、同一回合。
+    # 战斗里 hand/energy/cards_played_this_turn/牌堆每打一张就变，模型无法预测出完整视图逐字段相等，
+    # 旧判据 step["expected_view"] == view 因此永远命中不了（现场 51 条延迟样本 path 全为 model）。
+    # 现在只比模型**明确给出**的稳定字段，其余交给 self._action_engine.validate 按现场兜底，
+    # 与求解器复用的 _plan_step_is_executable 同一套保守思路。
+    _CONTINUATION_CONTEXT_KEYS = ("screen", "run_id", "turn")
+
+    def _continuation_context(self, view: dict[str, Any], *, keys: tuple[str, ...]) -> dict[str, Any]:
+        if not isinstance(view, dict):
+            return {}
+        return {key: view.get(key) for key in keys if key in view}
+
+    def _continuation_step_matches(self, step: dict[str, Any], view: dict[str, Any]) -> bool:
+        """续步在当前现场还该不该走。
+
+        判据（与求解器一致，保守：拿不准就走，让动作层拒绝）：
+        - 模型在 expected_view 里明确给出的稳定字段（screen/run_id/turn/actions/敌人）必须与现场一致；
+          没给的字段不参与比较（不同回合号、不同屏幕一定作废）。
+        - play_card 额外按下标比对手牌 `line`：出牌会让手牌位置漂移，下标可能指到别的牌上。
         """
+        expected = step.get("expected_view") if isinstance(step.get("expected_view"), dict) else {}
+        if expected:
+            keys = [key for key in self._CONTINUATION_CONTEXT_KEYS if key in expected]
+            if keys and self._continuation_context(expected, keys=tuple(keys)) != \
+                    self._continuation_context(view, keys=tuple(keys)):
+                return False
+        if str(step.get("action_type") or "") == "play_card":
+            return self._play_card_continuation_intact(step, view)
+        return True
+
+    def _play_card_continuation_intact(self, step: dict[str, Any], view: dict[str, Any]) -> bool:
+        """续步要打的牌，下标处仍是同一张牌吗？按 `line` 比对（位置会漂，牌面不会）。"""
+        if step.get("bindings"):
+            return True  # 实体和条件已在 resolve_action 检查。
+        kwargs = step.get("kwargs") if isinstance(step.get("kwargs"), dict) else {}
+        index = kwargs.get("card_index")
+        if type(index) is not int or index < 0:
+            return False
+        combat = view.get("combat") if isinstance(view.get("combat"), dict) else {}
+        hand = combat.get("hand") if isinstance(combat.get("hand"), list) else []
+        if index >= len(hand) or not isinstance(hand[index], dict):
+            return False
+        expected_view = step.get("expected_view") if isinstance(step.get("expected_view"), dict) else {}
+        expected_hand = (expected_view.get("combat") or {}).get("hand") if isinstance(expected_view.get("combat"), dict) else None
+        if not isinstance(expected_hand, list) or index >= len(expected_hand) or not isinstance(expected_hand[index], dict):
+            # 没有可对比的预期牌面：交给动作引擎按现场校验，不在这里否决。
+            return True
+        return str(hand[index].get("line") or "") == str(expected_hand[index].get("line") or "")
+
+    def _advance_custom_event_cursor(self, snapshot: dict[str, Any], operation: dict[str, Any]) -> dict[str, Any]:
+        """模型选择继续自定义占卜后，仅推进接口实际暴露的合法图块下标。"""
         if str(operation.get("action_type") or "") != "choose_event_option":
             return operation
         raw = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
-        event = raw.get("event") if isinstance(raw.get("event"), dict) else {}
+        event = self._agent_view(snapshot).get("event") or raw.get("event") or {}
+        progress = event.get("screen_progress") or (raw.get("event") or {}).get("screen_progress")
         # 只有自定义事件屏才有 screen_progress；常规事件屏（NEventRoom）照旧听规划器的。
-        if not str(event.get("screen_progress") or ""):
+        if not progress:
+            self._state.event_option_screen = ""
+            self._state.event_invalid_indices.clear()
             return operation
         options = event.get("options") if isinstance(event.get("options"), list) else []
-        count = len(options)
-        if count <= 0:
+        chosen = (operation.get("kwargs") or {}).get("option_index")
+        if any(item.get("i", item.get("index")) == chosen and item.get("proceed", item.get("is_proceed")) for item in options):
             return operation
-        screen_key = f"{snapshot.get('screen')}|{snapshot.get('floor')}"
+        indices = [item.get("i", item.get("index")) for item in options
+                   if not item.get("locked", item.get("is_locked", False))
+                   and not item.get("proceed", item.get("is_proceed", False))
+                   and not item.get("revealed", False) and type(item.get("i", item.get("index"))) is int]
+        if not indices:
+            return operation
+        screen_key = self._event_screen_key(snapshot)
         if screen_key != self._state.event_option_screen:
             self._state.event_option_screen = screen_key
             self._state.event_option_cursor = 0
-        index = self._state.event_option_cursor % count
-        self._state.event_option_cursor = index + 1
+            self._state.event_invalid_indices.clear()
+        candidates = [index for index in indices if index not in self._state.event_invalid_indices]
+        if not candidates:
+            raise RuntimeError("占卜当前合法选项均已尝试且未推进；等待界面或玩家操作变化")
+        index = candidates[self._state.event_option_cursor % len(candidates)]
+        self._state.event_option_cursor += 1
         kwargs = dict(operation.get("kwargs")) if isinstance(operation.get("kwargs"), dict) else {}
         kwargs["option_index"] = index
         advanced = dict(operation)
         advanced["kwargs"] = kwargs
+        advanced["auto_divination"] = True
         return advanced
 
     def _note_step_progress(self, snapshot: dict[str, Any], operation: dict[str, Any]) -> None:
@@ -676,8 +2314,10 @@ class STS2AutoplayService:
         同一个动作 + 同一个局面指纹，重复 :data:`NO_PROGRESS_REPEAT_LIMIT` 次就按"卡住"上报
         （同样**不动 autoplay 意图**：玩家没喊停就不许自己停）。
         """
+        if self._waiting_for_teammate(snapshot):
+            return
         action_key = f"{operation.get('action_type')}|{sorted((operation.get('kwargs') or {}).items())}"
-        state_key = str(snapshot.get("state_signature") or "")
+        state_key = view_signature(self._agent_view(snapshot)) if self._agent_view(snapshot) else str(snapshot.get("state_signature") or "")
         if not state_key:
             state_key = f"{snapshot.get('screen')}|{snapshot.get('floor')}|{snapshot.get('turn')}"
         if action_key != self._state.progress_action_key or state_key != self._state.progress_signature:
@@ -699,7 +2339,7 @@ class STS2AutoplayService:
                 "[sts2_stuck] 动作没生效（无进展）：%s action=%s repeat=%s state=%s（autoplay 意图保持 %s）"
                 % (screen, action_type, self._state.progress_repeat, state_key, self._state.autoplay_state)
             ),
-            host_text=f"我卡住了：在{detail}，我推不动，你手动推一下喵。",
+            host_text=f"我卡住了：在{detail}，我推不动，你手动推一下。",
         )
 
     def _no_operation_signature(self, snapshot: dict[str, Any]) -> str:
@@ -708,9 +2348,29 @@ class STS2AutoplayService:
         screen = str(snapshot.get("screen") or raw.get("screen") or "")
         unknown = str(raw.get("unknown_screen_type") or "")
         actions = raw.get("available_actions") if isinstance(raw.get("available_actions"), list) else []
-        return f"{screen}|{unknown}|{','.join(sorted(str(action) for action in actions))}"
+        return f"{screen}|{unknown}|{view_signature(self._agent_view(snapshot))}|{','.join(sorted(str(action) for action in actions))}"
+
+    def _waiting_for_teammate(self, snapshot: dict[str, Any]) -> bool:
+        view = self._agent_view(snapshot)
+        local = next((p for p in ((snapshot.get("raw_state") or {}).get("combat") or {}).get("players") or []
+                      if p.get("is_local")), {})
+        if view.get("screen") == "COMBAT" and local.get("ready_to_end_turn") is True:
+            return True
+        if view.get("screen") == "MAP" and (view.get("map") or {}).get("local_vote") is not None:
+            return True
+        event = view.get("event") or {}
+        if (view.get("screen") == "EVENT" and event.get("is_shared") and not event.get("finished")
+                and event.get("local_vote") is not None):
+            return True
+        raw = snapshot.get("raw_state") or {}
+        combat = raw.get("combat") or {}
+        actions = view.get("available_actions") or view.get("actions") or []
+        names = {item if isinstance(item, str) else item.get("name") or item.get("type") for item in actions}
+        return bool(snapshot.get("in_combat") or view.get("screen") == "COMBAT") and (combat.get("is_player_turn") is False
+                or not names.intersection({"play_card", "end_turn", "use_potion", "select_deck_card"}))
 
     def _clear_stuck(self) -> None:
+        self._stuck_recheck_key = ""
         if self._state.stuck_signature or self._state.stuck_reason or self._state.stuck_reported:
             self._state.stuck_signature = ""
             self._state.stuck_since = 0.0
@@ -733,6 +2393,8 @@ class STS2AutoplayService:
         那种情况已经由 ``last_error`` 表达，不该再让猫娘去问玩家"我卡住了"。
         """
         raw = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        if self._waiting_for_teammate(snapshot):
+            return
         screen = str(snapshot.get("screen") or raw.get("screen") or "")
         if not screen or self._state.transport_state != "connected":
             self._clear_stuck()
@@ -754,13 +2416,15 @@ class STS2AutoplayService:
         actions = raw.get("available_actions") if isinstance(raw.get("available_actions"), list) else []
         waited = int(now - self._state.stuck_since)
         detail = screen + (f"（未识别界面类型 {unknown}）" if unknown else "")
+        has_actions = bool(self._agent_view(snapshot).get("actions") or self._agent_view(snapshot).get("available_actions"))
+        activity = "尚未选出下一步操作" if has_actions else "界面里没有可执行动作"
         self._emit_stuck_report(
-            reason=f"{detail} 界面里没有可执行动作，已等 {waited} 秒",
+            reason=f"{detail} {activity}，已等 {waited} 秒",
             log_line=(
-                "[sts2_stuck] 界面里没有可执行动作：screen=%s unknown=%s actions=%s 已等 %s 秒（autoplay 意图保持 %s）"
-                % (screen, unknown or "-", sorted(str(action) for action in actions), waited, self._state.autoplay_state)
+                "[sts2_stuck] %s：screen=%s unknown=%s actions=%s 已等 %s 秒（autoplay 意图保持 %s）"
+                % (activity, screen, unknown or "-", sorted(str(action) for action in actions), waited, self._state.autoplay_state)
             ),
-            host_text=f"我卡在{detail}这个界面上了，这里没有我能做的事，你手动推一下喵。",
+            host_text="当前界面仍可操作，请结合现场与玩家消息重新选择下一步；不要复述计时或系统调度提示。" if has_actions else f"我卡在{detail}这个界面上了，这里没有我能做的事，你手动推一下。",
         )
 
     def _emit_stuck_report(self, *, reason: str, log_line: str, host_text: str) -> None:
@@ -768,6 +2432,10 @@ class STS2AutoplayService:
 
         两道闸（拿不到动作 / 动作没生效）共用这一份出口，避免两处各写一遍还写歪。
         """
+        if self._state.stuck_reason:
+            return
+        self._state.stuck_signature = self._no_operation_signature(self._state.snapshot)
+        self._state.stuck_reported = True
         self._state.stuck_reason = reason
         try:
             self.logger.warning(log_line)
@@ -845,6 +2513,8 @@ class STS2AutoplayService:
         return kwargs.get(self._planner.index_key_for(action_type))
 
     def set_play_style(self, style: str) -> dict[str, Any]:
+        self._state.control_generation += 1
+        self._invalidate_companion_plan()
         """切换游玩模式：认真（默认）/ 捣蛋 / 笨蛋。"""
         normalized = normalize_play_style(style)
         self._state.play_style = normalized
@@ -859,12 +2529,238 @@ class STS2AutoplayService:
 
 
     async def execute_operation(self, operation: dict[str, Any] | None) -> dict[str, Any]:
+        if not self._action_dispatch_lock.acquire(blocking=False):
+            return {"status": "busy", "message": "已有动作正在完成，未发送新的动作。", "summary": "动作正在完成。", "executed": False}
+        try:
+            if self._state.discussion_active or self._state.standby or self._state.autoplay_state == "paused":
+                return {"status": "idle", "message": "暂停期间不执行动作，仍可聊天。", "executed": False}
+            if self._pending_action is not None:
+                return {"status": "pending", "executed": False, "message": "上一动作尚未确认完成，不重复派发。"}
+            if operation and operation.get("source") == "llm":
+                await self.refresh_state(plan_combat=False)
+                # 模型判断期间可能有新发言；派发前重新导入，不按旧要求继续出牌。
+                await self._read_companion_dialogue()
+                if self._ingress_enabled and not self._ingress_active:
+                    return {"status": "stale", "executed": False, "message": "统一会话所有权已失效，停止旧实例动作。"}
+                resolved, invalid = self._resolve_dispatch(operation)
+                if (invalid
+                        or self._companion_session.generation != operation.get("session_generation")
+                        or self._companion_session.dialogue_revision != operation.get("dialogue_revision", self._companion_session.dialogue_revision)
+                        or self._state.control_mode != operation.get("control_mode")
+                        or self._state.control_generation != operation.get("control_generation", self._state.control_generation)
+                        or self._state.guidance_generation != operation.get("guidance_generation", self._state.guidance_generation)):
+                    return {"status": "stale", "executed": False, "message": invalid or "对话或控制已变化，重新判断。"}
+                operation.update(resolved)
+                active = self._companion_session.active_plan
+                if operation.get("plan_revision") is not None and (
+                        operation["plan_revision"] != active.get("revision") or active.get("status") != "selected"):
+                    return {"status": "stale", "executed": False, "message": "该版本计划已失效，重新判断。"}
+                if self._combat_window_closed(operation):
+                    return {"status": "waiting_for_actions", "executed": False, "message": "等待战斗动作窗口恢复。"}
+                if self._state.discussion_active or self._state.standby or self._state.autoplay_state == "paused":
+                    return {"status": "idle", "executed": False, "message": "已暂停动作。"}
+                anchor = self._companion_session.anchor()
+                if self._wait_for_turn_message and anchor.get("battle_id") and self._current_turn_message() is None:
+                    return {"status": "waiting_for_message", "executed": False, "message": "新回合尚未收到你的话。"}
+                if self._unconfirmed_action == (view_signature(self._agent_view(self._state.snapshot)),
+                                               operation["action_type"], public_kwargs(operation.get("kwargs"))):
+                    return {"status": "unconfirmed", "executed": False, "message": "同一局面下该动作的上次结果未确认，不重复派发。"}
+                if operation.get("plan_revision") is None:
+                    self._companion_session.accept_plan(operation, self._agent_view(self._state.snapshot))
+                kind = self._companion_session.speech_kind()
+                speech = operation.get("speech") or ""
+                if operation["action_type"] == "end_turn":
+                    danger = end_turn_danger((self._state.snapshot.get("raw_state") or {}).get("combat") or {})
+                    if danger and danger not in (operation.get("reply") or ""):
+                        speech = danger
+                        operation.update(speech=speech, speech_scope="intent", speech_step_ids=[0])
+                if operation["action_type"] == "use_potion":
+                    potion = next(p for p in (self._state.snapshot["raw_state"].get("run") or {}).get("potions") or []
+                                  if p["index"] == operation["kwargs"]["option_index"])
+                    announced = self._companion_session.announced_plan
+                    already_said = (potion["name"] in announced.get("text", "") and any(
+                        step["action_type"] == "use_potion" and step["kwargs"] == public_kwargs(operation["kwargs"])
+                        for step in announced.get("remaining_steps", [])))
+                    if not already_said or speech:
+                        kind = "potion"
+                        if not speech:
+                            combat = self._state.snapshot["raw_state"].get("combat") or {}
+                            target_index = operation["kwargs"].get("target_index")
+                            if potion.get("target_index_space") == "players":
+                                target = combat["players"][target_index]
+                                speech = f"我用这瓶{potion['name']}。" if target["is_local"] else f"这瓶{potion['name']}给你用。"
+                            elif potion.get("target_index_space") == "enemies":
+                                speech = f"这瓶{potion['name']}用在{combat['enemies'][target_index]['name']}身上。"
+                            else:
+                                speech = f"我用这瓶{potion['name']}。"
+                            operation.update(speech=speech, speech_scope="steps", speech_step_ids=[0])
+                    else:
+                        speech = ""
+                    self.logger.info("[sts2_potion_speech] potion=%s target_space=%s target_index=%s already_said=%s text=%s",
+                                     potion["name"], potion.get("target_index_space"), operation["kwargs"].get("target_index"), already_said, speech)
+                if kind == "correction" and not speech:
+                    step = self._selected_steps[0]["description"]
+                    label = step["card"] or {"end_turn": "结束回合", "use_potion": "使用药水", "discard_potion": "丢弃药水",
+                                              "select_deck_card": "重新选牌", "confirm_selection": "确认选牌"}.get(step["action_type"], "调整下一步")
+                    speech = f"改一下，我先{label.split('：', 1)[0][:70]}。"
+                    operation.update(speech=speech, speech_scope="steps", speech_step_ids=[0])
+                explicit_reply = bool(operation.get("input_ids"))
+                speech = public_companion_text(speech)
+                allowed = explicit_reply or ((self._ingress_active or not self._companion_session.awaiting_chat_reply())
+                                             and (self._state.host_digest_enabled or self._danmaku_enabled))
+                if speech and allowed:
+                    speech_started = perf_counter()
+                    self._speech_state = {**anchor, "plan_revision": operation["plan_revision"], "kind": kind,
+                                          "text": speech, "state": "speaking", "started_at": time()}
+                    await self._sync_execution_status()
+                    self.logger.info("[sts2_turn_speech] start anchor=%s revision=%s kind=%s text=%s",
+                                     anchor, operation["plan_revision"], kind, speech)
+                    await self._push_catgirl(speech, fetch_avatar=False)
+                    wait_audio = self._agent_view(self._state.snapshot).get("screen") == "COMBAT" and operation["action_type"] != "end_turn"
+                    if self._state.host_digest_enabled or self._ingress_active and explicit_reply:
+                        if self._ingress_active:
+                            try:
+                                spoken = await self._publish_companion_reply(speech,
+                                    [{"request_id": i} for i in operation.get("input_ids") or []], wait_audio=wait_audio,
+                                    media_requests=operation.get("media_requests") or [],
+                                    output_id=f"speech:{anchor.get('run_id')}:{operation['step_id']}",
+                                    speech_kind="tactical",
+                                    anchor={**anchor, "plan_revision": operation["plan_revision"], "kind": kind})
+                            except CompanionAudioPending as exc:
+                                self._speech_state.update(state="audio_failed", receipt=exc.receipt)
+                                self._step_timing["speech_ms"] = (perf_counter() - speech_started) * 1000
+                                self._selected_steps[0].update(speech=speech, speech_scope=operation.get("speech_scope"),
+                                    speech_step_ids=operation.get("speech_step_ids"), input_ids=operation.get("input_ids", []))
+                                self._state.retry_at = time() + self._autoplay_retry_backoff()
+                                return {"status": "audio_timeout" if exc.receipt.get("reason") == "audio_completion_timeout" else "audio_failed",
+                                        "executed": False, "message": str(exc), "receipt": exc.receipt}
+                        else:
+                            spoken = await speak_current_turn(self._main_server_port(), self._catgirl_llm.character_name(),
+                                                              speech, {**anchor, "plan_revision": operation["plan_revision"], "kind": kind, "speech_kind": "tactical"})
+                        self._speech_state["speech_id"] = spoken.get("speech_id")
+                    self._speech_state.update(state="completed" if wait_audio else "queued",
+                        **({"completed_at": time()} if wait_audio else {"queued_at": time()}))
+                    if hasattr(self, "_step_timing"):
+                        self._step_timing["speech_ms"] = (perf_counter() - speech_started) * 1000
+                    self._companion_session.announce_plan(operation, speech, kind)
+                    if not self._ingress_active:
+                        self._companion_session.remember("assistant", speech)
+                    self._communicated_turn = anchor
+                    self.logger.info("[sts2_turn_speech] completed anchor=%s speech_id=%s revision=%s kind=%s",
+                                     anchor, self._speech_state.get("speech_id"), operation["plan_revision"], kind)
+                    # 询问窗口：话已经说出去，先等主人回答再派发动作（战斗10s/选项页25s）。
+                    window = self._ask_window_seconds(operation)
+                    if window > 0:
+                        deadline = time() + window
+                        answered = False
+                        while time() < deadline:
+                            await asyncio.sleep(0.5)
+                            await self._read_companion_dialogue()
+                            if self._companion_session.pending_messages():
+                                answered = True
+                                break
+                        if answered:
+                            self.logger.info("[sts2_ask_window] answered，放弃当前动作重判")
+                            return {"status": "waiting_for_input", "executed": False,
+                                    "message": "已问主人，收到回答后重新判断。"}
+                        self.logger.info("[sts2_ask_window] timeout window=%.0fs，按自己倾向执行", window)
+                    # 发言过程中可以暂停、收到新要求或进入另一回合；任何一种都不得派发旧动作。
+                    await self.refresh_state(plan_combat=False)
+                    await self._read_companion_dialogue()
+                    if self._ingress_enabled and not self._ingress_active:
+                        return {"status": "stale", "executed": False, "message": "发言后统一会话所有权已失效。"}
+                    resolved, invalid = self._resolve_dispatch(operation)
+                    if (invalid
+                            or self._companion_session.generation != operation.get("session_generation")
+                            or self._companion_session.dialogue_revision != operation.get("dialogue_revision", self._companion_session.dialogue_revision)
+                            or self._state.control_generation != operation.get("control_generation")
+                            or self._state.guidance_generation != operation.get("guidance_generation")):
+                        return {"status": "stale", "executed": False, "message": invalid or "发言后要求已变化，重新判断。"}
+                    operation.update(resolved)
+                    if self._combat_window_closed(operation):
+                        return {"status": "waiting_for_actions", "executed": False, "message": "发言已完成，保留计划等待战斗动作窗口恢复。"}
+                else:
+                    operation["speech"] = ""
+                if self._state.discussion_active or self._state.standby or self._state.autoplay_state == "paused":
+                    return {"status": "idle", "executed": False, "message": "已暂停动作。"}
+                if self._agent_view(self._state.snapshot).get("screen") == "COMBAT":
+                    self._communicated_turn = anchor
+            snapshot = self._state.snapshot
+            raw = snapshot.get("raw_state") or {}
+            multiplayer = raw.get("multiplayer") or {}
+            if raw.get("in_combat") and multiplayer.get("is_multiplayer") and str(multiplayer.get("net_game_type") or "").lower() == "host":
+                return {"status": "idle", "message": "这是真人主机的战斗界面，未代替你出牌。", "summary": "需要猫娘实例。", "executed": False}
+            if operation and operation.get("source") == "llm" and raw.get("in_combat"):
+                operation = dict(operation)
+                kwargs = dict(operation.get("kwargs") or {})
+                combat = raw.get("combat") or {}
+                player = next((item for item in combat.get("players") or [] if item.get("is_local")), None)
+                player_id = (player or combat.get("player") or {}).get("player_id")
+                if raw.get("turn") is None or player_id is None:
+                    return {"status": "unconfirmed", "executed": False, "message": "无法确认自己的战斗回合和玩家标识。"}
+                kwargs["expected_turn"] = raw["turn"]
+                kwargs["expected_player_id"] = str(player_id)
+                if operation.get("action_type") == "play_card":
+                    card = next((item for item in combat.get("hand") or [] if item.get("index") == kwargs.get("card_index")), None)
+                    if not card or not card.get("entity_id"):
+                        return {"status": "unconfirmed", "executed": False, "message": "无法确认待出牌的稳定标识。"}
+                    kwargs["expected_card_entity_id"] = card["entity_id"]
+                    if card.get("target_index_space") == "enemies" or card.get("target_type") == "AnyEnemy":
+                        enemy = next((item for i, item in enumerate(combat.get("enemies") or [])
+                                      if item.get("index", i) == kwargs.get("target_index")), None)
+                        if not enemy or not enemy.get("entity_id"):
+                            return {"status": "unconfirmed", "executed": False, "message": "无法确认目标敌人的稳定标识。"}
+                        kwargs["expected_enemy_entity_id"] = enemy["entity_id"]
+                operation["kwargs"] = kwargs
+            return await self._execute_operation(operation)
+        finally:
+            if "speech_started" in locals() and self._speech_state.get("state") == "speaking":
+                self._step_timing["speech_ms"] = (perf_counter() - speech_started) * 1000
+                self._speech_state.update(state="failed", failed_at=time())
+            self._action_dispatch_lock.release()
+
+    def _ask_window_seconds(self, operation: dict[str, Any]) -> float:
+        """本轮真的问了主人时，派发动作前等待回答的窗口；战斗短、选项页长。"""
+        if not isinstance(operation, dict) or not operation.get("asked"):
+            return 0.0
+        screen = self._agent_view(self._state.snapshot).get("screen")
+        return self._ask_window_combat if screen == "COMBAT" else self._ask_window_page
+
+    async def _execute_operation(self, operation: dict[str, Any] | None) -> dict[str, Any]:
         snapshot = self._state.snapshot if isinstance(self._state.snapshot, dict) else {}
+        blocker = self._companion_session.requirement_blocker(operation, snapshot) if operation else None
+        if blocker:
+            self._invalidate_companion_plan(blocker["reason"])
+            return {"status": "waiting_for_condition", "executed": False, "message": blocker["reason"],
+                    "requirement_id": blocker.get("requirement_id")}
+        before_view = self._agent_view(snapshot)
+        if operation:
+            self._companion_session.bind_requirement_completions(operation)
+            operation["_execution_effects"] = build_agent_facts(snapshot.get("raw_state"))
+        action_anchor = self._companion_session.anchor()
         before_summary = self._summary_builder.build_snapshot_summary(snapshot) if snapshot else {}
-        client = self._require_client()
+        client = self._companion_client()
+        dispatch_started = perf_counter()
         result = await self._action_engine.execute(client, snapshot, operation)
+        accepted_at = time()
+        if hasattr(self, "_step_timing"):
+            self._step_timing["dispatch_ms"] = (perf_counter() - dispatch_started) * 1000
+        if result.get("status") == "pending":
+            self._remember_plugin_action_marker(operation, snapshot)
+            await self.refresh_state(plan_combat=False)
+            self._companion_session.record_action(operation, anchor=action_anchor, before=before_view,
+                after=self._agent_view(self._state.snapshot), result=result)
+            self._pending_action = {"operation": deepcopy(operation), "anchor": action_anchor,
+                                    "before": deepcopy(snapshot), "record": self._companion_session.actions[-1],
+                                    "submitted_at": time(), "accepted_at": accepted_at}
+            self._resolve_pending_action(self._state.snapshot)
+            self._deliver_host_context(self._state.snapshot)
+            return result
         if result.get("status") == "ok":
             self._state.touch_action()
+            self._companion_session.facts["last_action"] = {
+                "action_type": operation.get("action_type"), "reason": operation.get("reason"),
+            }
             op = result.get("operation") if isinstance(result.get("operation"), dict) else {}
             if op.get("action_type") == "select_deck_card":
                 # 选牌光标由"这一下真的按下去了"推动。plan() 是每 tick 都跑的（事件流约 1 次/秒），
@@ -881,6 +2777,8 @@ class STS2AutoplayService:
                 # 选人界面的「随机」同样只按一次：按过就转入 embark，避免"选中后再选一次"的死循环。
                 kwargs = op.get("kwargs") if isinstance(op.get("kwargs"), dict) else {}
                 self._planner.note_character_select_dispatched(kwargs.get("option_index"))
+                self._companion_session.character_choice_made = True
+                self._companion_session.generation += 1
             if op.get("action_type") == "use_potion":
                 # 战斗用药水的记账："同一回合只喝一瓶"（规格「八、节流」）。只在**真的喝下去之后**记，
                 # 与选牌光标/奖励领取同一个道理：规划每 tick 都跑，用规划记账会把机会白白耗光。
@@ -894,16 +2792,27 @@ class STS2AutoplayService:
             self._remember_plugin_action_marker(op, snapshot)
             action_seed = {
                 "action_type": str(op.get("action_type") or ""),
-                "action_kwargs": dict(op.get("kwargs") if isinstance(op.get("kwargs"), dict) else {}),
+                # 剥离执行期专用键（expected_turn 等）：latest_action_frame 会经行动反馈
+                # 上下文喂给宿主 LLM，带上这些内部键会被复述回来。
+                "action_kwargs": public_kwargs(op.get("kwargs")),
                 "decision_source": self._state.last_decision_source,
                 "decision_reason": self._state.last_decision_reason,
                 "created_at": time(),
             }
             self._state.latest_action_frame = dict(action_seed)
+            self._companion_session.complete_step(operation)
             await self.refresh_state(trigger_sync=True)
             after_snapshot = self._state.snapshot if isinstance(self._state.snapshot, dict) else {}
             after_summary = self._summary_builder.build_snapshot_summary(after_snapshot) if after_snapshot else {}
             action_delta = self._summary_engine.compute_delta(before_summary, after_summary, source="action_paired")
+            after_view = self._agent_view(after_snapshot)
+            self._companion_session.facts["last_outcome"] = {
+                "screen": after_view.get("screen"), "turn": after_view.get("turn"),
+                "hp": (after_view.get("run") or {}).get("hp"),
+                "player": (after_view.get("combat") or {}).get("player"),
+            }
+            self._companion_session.record_action(operation, anchor=action_anchor, before=before_view,
+                                                  after=after_view, result=result)
             action_frame = {
                 "before": dict(before_summary),
                 "after": dict(after_summary),
@@ -920,12 +2829,258 @@ class STS2AutoplayService:
                     "decision_source": action_frame["decision_source"],
                     "delta": dict(action_delta),
                     "step_count": action_frame["step_count"],
+                    **action_anchor,
+                    "created_at": action_seed["created_at"],
+                    "current_hp": (after_summary.get("player") or {}).get("current_hp"),
+                    "max_hp": (after_summary.get("player") or {}).get("max_hp"),
                 }
             )
             summary_context = self._summary_builder.build(after_snapshot, runtime_state=self._state)
             self._state.snapshot["summary_context"] = summary_context
             self._state.snapshot["situation_summary"] = self._summary_engine.summarize(summary_context)
         return result
+
+    def _resolve_pending_action(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        pending = self._pending_action
+        operation = pending["operation"]
+        before = pending["before"]
+        raw = snapshot.get("raw_state") or {}
+        old_raw = before.get("raw_state") or {}
+        view = self._agent_view(snapshot)
+        kwargs = operation.get("kwargs") or {}
+        action_type = operation["action_type"]
+        record = pending["record"]
+        if view.get("run_id") != pending["anchor"].get("run_id"):
+            self._pending_action = None
+            return {"status": "cancelled", "executed": False, "message": "已进入另一局，停止等待旧动作。"}
+        combat = raw.get("combat") or {}
+        old_combat = old_raw.get("combat") or {}
+        completed = False
+        if action_type == "play_card":
+            entity = kwargs.get("expected_card_entity_id")
+            completed = bool(entity and raw.get("in_combat") and isinstance(combat.get("hand"), list)
+                             and all(c.get("entity_id") != entity for c in combat["hand"]))
+            played = (combat.get("player") or {}).get("cards_played_this_turn")
+            old_played = (old_combat.get("player") or {}).get("cards_played_this_turn")
+            completed = completed or (raw.get("turn") == old_raw.get("turn")
+                and type(played) is int and type(old_played) is int and played > old_played)
+        elif action_type == "end_turn":
+            local = next((p for p in combat.get("players") or [] if p.get("is_local")), {})
+            completed = (raw.get("in_combat") is False
+                         or (type(raw.get("turn")) is int and raw["turn"] != old_raw.get("turn"))
+                         or local.get("is_action_phase") is False or local.get("ready_to_end_turn") is True)
+        elif action_type in {"use_potion", "discard_potion"}:
+            old_potions = (old_raw.get("run") or {}).get("potions")
+            potions = (raw.get("run") or {}).get("potions")
+            completed = old_potions is not None and potions is not None and old_potions != potions
+        elif action_type == "choose_event_option":
+            old_event = old_raw.get("event") or self._agent_view(before).get("event")
+            event = raw.get("event") or view.get("event")
+            same_page = bool(old_event and event
+                and (old_event.get("event_id") or old_event.get("id")) == (event.get("event_id") or event.get("id"))
+                and old_event.get("page_index") == event.get("page_index"))
+            vote_registered = bool(same_page and event.get("is_shared")
+                and event.get("local_vote") == kwargs.get("option_index"))
+            event_changed = bool(old_event and event and
+                {k: v for k, v in event.items() if k not in {"local_vote", "player_votes"}} !=
+                {k: v for k, v in old_event.items() if k not in {"local_vote", "player_votes"}})
+            completed = bool(old_event and (view.get("screen") != "EVENT" or vote_registered or event_changed))
+        elif action_type in {"select_deck_card", "confirm_selection"}:
+            old_selection = old_raw.get("selection") or {}
+            selection = raw.get("selection") or {}
+            old_card = next((c for c in old_selection.get("cards", []) if c["index"] == kwargs.get("option_index")), {})
+            card = next((c for c in selection.get("cards", []) if old_card.get("entity_id")
+                         and c.get("entity_id") == old_card["entity_id"]), {})
+            selected = action_type == "select_deck_card" and not old_card.get("selected") and card.get("selected") is True
+            deck_changed = (old_raw.get("run") or {}).get("deck") is not None and (raw.get("run") or {}).get("deck") is not None and old_raw["run"]["deck"] != raw["run"]["deck"]
+            hand_changed = old_combat.get("hand") is not None and combat.get("hand") is not None and old_combat["hand"] != combat["hand"]
+            submitted = bool(old_selection and not selection and (deck_changed or hand_changed))
+            completed = bool(selected or submitted)
+        changed = view != self._agent_view(before)
+        waiting_in_combat = (action_type in {"play_card", "end_turn", "use_potion", "discard_potion"}
+                             and raw.get("in_combat") and raw.get("turn") == old_raw.get("turn"))
+        selection_action = action_type in {"select_deck_card", "confirm_selection"}
+        if not completed and (not changed or waiting_in_combat or selection_action or action_type == "choose_event_option") and time() - pending["submitted_at"] < 10:
+            return {"status": "pending", "executed": False, "message": "动作仍在等待确认，不重复派发。"}
+        # 局面变化不足以证明任意动作已完成；没有上述动作证据时保留未知结果并重判。
+        status = "completed" if completed else "unconfirmed"
+        message = "现场确认动作完成。" if completed else "原动作结果未确认，重新判断并选择其他操作。"
+        record.update(status=status, executed=completed, changed=changed,
+                      message=message,
+                      outcome={"screen": view.get("screen"), "turn": view.get("turn"),
+                               "player": deepcopy((view.get("combat") or {}).get("player")),
+                               **({"selection": deepcopy(raw.get("selection")), "selection_submitted": submitted} if selection_action else {}),
+                               "hp": (view.get("run") or {}).get("hp")})
+        if action_type == "choose_event_option":
+            record["outcome"]["event"] = deepcopy(event)
+            record["outcome"]["event_vote_registered"] = vote_registered
+        self._companion_session.action_sequence += 1
+        self._companion_session.journal.confirm_action(record, view)
+        self._record_action_learning(record)
+        accepted_at = pending.get("accepted_at", pending.get("submitted_at"))
+        if accepted_at is not None:
+            self._companion_session.journal.latency({"timestamp": time(), "configuration": self._latency_configuration(),
+                "path": "confirmation", "outcome": status,
+                "measures": {"confirmation_wait_ms": (time() - accepted_at) * 1000},
+                "model_calls": 0, "solver_calls": 0})
+        self._pending_action = None
+        if completed:
+            self._companion_session.complete_step(operation)
+            self._companion_session.confirm_requirement_action(record)
+            self._companion_session.refresh_requirements(snapshot)
+            self._state.step_count += 1
+            self._last_operation = operation
+            self._consume_guidance(operation)
+            self._note_decision_success()
+        else:
+            self._unconfirmed_action = self._action_confirmation_key(snapshot, action_type, kwargs)
+            self._invalidate_companion_plan("动作已派发，但未观察到明确完成结果")
+        self.logger.info("[sts2_action_confirmation] revision=%s step=%s status=%s",
+                         operation.get("plan_revision"), operation.get("step_id"), status)
+        return {"status": "ok" if completed else "unconfirmed", "executed": completed,
+                "message": message}
+
+    def _action_confirmation_key(self, snapshot: dict, action_type: str, kwargs: dict) -> tuple:
+        view = self._agent_view(snapshot)
+        if action_type in {"select_deck_card", "confirm_selection"}:
+            raw = snapshot.get("raw_state") or {}
+            selection = raw.get("selection") or {}
+            evidence = {k: selection.get(k) for k in ("selection_id", "kind", "min_select", "max_select", "selected_count", "can_confirm")}
+            evidence["cards"] = [{k: c.get(k) for k in ("index", "entity_id", "card_id", "selected")} for c in selection.get("cards", [])]
+            evidence.update(run_id=view.get("run_id"), screen=view.get("screen"), floor=(view.get("run") or {}).get("floor"))
+            return view_signature(evidence), action_type, public_kwargs(kwargs)
+        return view_signature(view), action_type, public_kwargs(kwargs)
+
+    def _review_journal(self, review: dict) -> CompanionJournal:
+        current = self._companion_session.journal
+        if review.get("kind") != "run_feedback":
+            return current
+        pending = self._catgirl_memory.pending_review()
+        if not pending or review.get("run_id") != pending["run_id"]:
+            raise ValueError("复盘反馈必须关联当前待讨论的局")
+        if current.data.get("run_id") == pending["run_id"]:
+            return current
+        journal = CompanionJournal(current.directory, self.logger)
+        journal.activate(pending["run_id"])
+        return journal
+
+    def _validate_companion_action(self, snapshot: dict[str, Any], operation: Any) -> tuple[Any, str]:
+        planned = operation.as_dict() if hasattr(operation, "as_dict") else operation
+        session = self._companion_session
+        if planned.get("learning_updates") or planned.get("experience_uses") or planned.get("review"):
+            try:
+                self._catgirl_memory.validate_learning(planned.get("learning_updates", []), planned.get("experience_uses", []),
+                    planned.get("review", {}), messages=session.pending_messages(), journal=self._review_journal(planned.get("review", {})),
+                    available=self._learning_available,
+                    terminal=self._agent_view(snapshot).get("screen") in {"GAME_OVER", "VICTORY", "DEFEAT"},
+                    step_count=1 + len(planned.get("continuation") or []) if planned.get("action_type") else 0)
+            except ValueError as exc:
+                return None, str(exc)
+        if planned.get("requirement_updates"):
+            session = copy(session)
+            session.requirements = deepcopy(session.requirements)
+            session.apply_requirement_updates(planned["requirement_updates"], snapshot, planned)
+        if not planned.get("action_type"):
+            if (self._state.autoplay_state == "running" and self._state.control_mode == "program"
+                    and not self._state.discussion_active and planned.get("control") not in {"pause", "stop"}
+                    and not self._selected_steps and not session.pending_messages()
+                    and self._map_vote_candidates(snapshot, session)):
+                return None, "自己的地图票尚未投出，当前有合法选项；队友的票不等于自己的票，请choose_map_node选择路线，不能空等投票生效。"
+            return operation, ""
+        if planned["action_type"] == "select_deck_card":
+            cards = ((snapshot.get("raw_state") or {}).get("selection") or {}).get("cards", [])
+            if any(c.get("selected") for c in cards if c["index"] == planned["kwargs"].get("option_index")):
+                return None, "这张牌已经选中；继续选择其余未选牌，或选够后confirm_selection，勿再次点击反选。"
+        blocker = session.requirement_blocker(planned, snapshot)
+        if blocker:
+            return None, blocker["reason"] + "；请选择不受限制的合法动作，或action_type=null、plan_update=wait并回复当前等待原因。"
+        if planned["action_type"] == "claim_reward":
+            raw = snapshot.get("raw_state") or {}
+            reward = next((r for r in (raw.get("reward") or {}).get("rewards") or []
+                           if r["index"] == planned["kwargs"].get("option_index")), {})
+            potions = (raw.get("run") or {}).get("potions") or []
+            if reward.get("reward_type") == "Potion" and potions and all(p.get("occupied") for p in potions):
+                return None, "药水栏已满，不能直接领取；比较新旧药水，先discard_potion再领取，或resolve_rewards离开。"
+        if self._unconfirmed_action == self._action_confirmation_key(snapshot, planned["action_type"], planned.get("kwargs") or {}):
+            return None, "该动作已派发但结果未确认，局面尚未改变；请选择其他操作或等待。"
+        return self._action_engine.validate_with_feedback(snapshot, operation)
+
+    def _requirement_wait(self) -> list[dict[str, Any]]:
+        return [item for item in self._companion_session.active_requirements() if item.get("status") == "waiting"]
+
+    def execution_status(self) -> dict[str, Any]:
+        snapshot = self._state.snapshot or {}
+        view = self._agent_view(snapshot)
+        state, text, detail = "running", "正在行动", ""
+        waiting = self._requirement_wait()
+        if self._state.autoplay_state == "paused":
+            state, text = "paused", "已暂停"
+            detail = (self._state.decision_error or self._state.last_error) if self._state.pause_reason == "decision_failure" else "按你的要求暂停，仍可聊天"
+        elif self._state.standby or self._state.control_mode != "program":
+            state, text, detail = "standby", "自主行动已关闭", "仍可聊天与查看当前要求"
+        elif self._state.autoplay_state != "running" and self._state.stop_reason:
+            state, text, detail = "stopped", "已停止", "等待你恢复自主行动"
+        elif self._state.transport_state != "connected":
+            state, text, detail = "disconnected", "等待游戏连接", self._state.last_error or "正在恢复局面观测"
+        elif self._state.input_warning:
+            state, text, detail = "disconnected", "同伴会话连接异常", self._state.input_warning
+        elif self._ingress_enabled and not self._ingress_active:
+            state, text, detail = "restoring", "正在恢复会话", "读取有效要求与运行状态"
+        elif self._state.decision_error and time() < self._state.retry_at:
+            state, text, detail = "error", "行动遇到问题", self._state.decision_error
+        elif self._speech_state.get("state") == "speaking" and self._decision_lock.locked():
+            state, text, detail = "speaking", "正在说明打法", self._speech_state.get("text", "")
+        elif self._execution_phase:
+            state, text, detail = (self._execution_phase[k] for k in ("state", "text", "detail"))
+        elif self._pending_action:
+            state, text, detail = "confirming", "等待动作完成", "已派发，正在确认实际结果"
+        elif view.get("screen") in {"MAIN_MENU", "CHARACTER_SELECT", "MULTIPLAYER_LOBBY"}:
+            state, text, detail = "waiting_for_game", "等待开局", "请选择角色并确认开始"
+        elif self._waiting_for_teammate(snapshot):
+            state, text, detail = "waiting_for_teammate", "等待队友", "等待你结束回合或完成当前界面"
+            if view.get("screen") == "EVENT":
+                detail = "共享事件投票已确认，等待队友投票或事件结算"
+        elif waiting:
+            state, text = "waiting_for_condition", "等待配合"
+            detail = "；".join(item.get("wait_reason") or item.get("text", "") for item in waiting)
+            missing = [check["missing"] for item in waiting for check in (item.get("evidence") or {}).get("checks", [])
+                       if check.get("missing")]
+            if missing:
+                state, text, detail = "observation_missing", "协作条件缺少现场信息", "等待恢复观测：" + "、".join(dict.fromkeys(missing))
+        elif self._last_step_result.get("status") in {"waiting_for_message", "waiting_for_actions", "waiting_for_condition", "waiting_for_data"}:
+            state = self._last_step_result["status"]
+            text = {"waiting_for_message": "等待你的回合要求", "waiting_for_actions": "等待界面就绪",
+                    "waiting_for_condition": "等待配合", "waiting_for_data": "等待事件信息"}[state]
+            detail = self._last_step_result.get("message", "")
+        elif self._state.autoplay_state != "running":
+            state, text = "idle", "等待开始"
+        elif self._last_step_result.get("status") == "idle" and self._last_step_result.get("message"):
+            state, text, detail = "waiting", "等待下一步", self._last_step_result["message"]
+        return {"state": state, "text": text, "detail": detail[:500],
+                "session_id": f"{self._ingress_instance}:{self._companion_session.epoch}",
+                "requirement_ids": [item["id"] for item in waiting],
+                "requirements_revision": self._companion_session.requirements_revision}
+
+    async def _sync_execution_status(self) -> None:
+        client = self._host_client
+        if client is None or not self._status_push_lock.acquire(blocking=False):
+            return
+        try:
+            status = self.execution_status()
+            key = json.dumps(status, ensure_ascii=False, sort_keys=True)
+            if key == self._status_push_key and time() - self._status_push_at < 3:
+                return
+            self._status_revision = max(time_ns(), self._status_revision + 1)
+            payload = {**status, "revision": self._status_revision, "ttl_seconds": 15}
+            await client.set_companion_status(payload)
+            self._status_push_key, self._status_push_at = key, time()
+        except STS2TransportError as exc:
+            # 展示失败不重发游戏动作；下一次状态心跳重试。
+            if time() - self._status_push_at >= 3:
+                self.logger.debug("[sts2_status_push] %s", exc)
+                self._status_push_at = time()
+        finally:
+            self._status_push_lock.release()
 
     async def get_status(self) -> dict[str, Any]:
         snapshot = self._state.snapshot if isinstance(self._state.snapshot, dict) else {}
@@ -948,14 +3103,21 @@ class STS2AutoplayService:
         )
         return {
             "summary": summary,
+            "execution_status": self.execution_status(),
+            "active_requirements": self._companion_session.active_requirements(),
             "message": summary,
             "server": {
                 "state": self._state.transport_state,
                 "base_url": self._state.base_url,
-                "last_error": self._state.last_error,
+                "last_error": self._state.decision_error or self._state.last_error,
                 "last_success_at": self._state.last_success_at,
                 "last_poll_at": self._state.last_poll_at,
                 "consecutive_errors": self._state.consecutive_errors,
+                "decision_errors": self._state.decision_errors,
+                "decision_error": self._state.decision_error,
+                "input_warning": self._state.input_warning,
+                "dialogue_record_types": dict(self._dialogue_record_types),
+                "retry_at": self._state.retry_at,
             },
             "run": {
                 "screen": snapshot.get("screen", "unknown"),
@@ -973,12 +3135,30 @@ class STS2AutoplayService:
                 "stop_reason": self._state.stop_reason,
                 "is_polling": self._loop_runner.is_polling(),
                 "is_autoplaying": self._loop_runner.is_autoplaying(),
+                "sse_connected": self._loop_runner._sse_connected,
+                "mod_gate": dict(self._mod_gate),
+                "speech": dict(self._speech_state),
+                "wait_for_turn_message": self._wait_for_turn_message,
+                "turn_message_anchor": dict(self._turn_message_anchor),
+                "current_turn_message": self._turn_message,
+                "waiting_for_message": bool(self._wait_for_turn_message and self._companion_session.anchor().get("battle_id") and self._current_turn_message() is None),
                 "last_action_at": self._state.last_action_at,
                 "guidance_generation": self._state.guidance_generation,
                 "pending_guidance": list(self._state.pending_guidance),
                 "interrupt_requested": self._state.interrupt_requested,
                 "interrupt_reason": self._state.interrupt_reason,
             },
+            "discussion": {
+                "active": self._state.discussion_active,
+                "status": self._state.discussion_status,
+            },
+            "companion_session": self._companion_session.context(),
+            "decision_metrics": {**self._state.decision_metrics, **self._llm_planner.metrics},
+            "latency_samples": list(self._state.latency_samples),
+            "effect_report": self._companion_session.journal.report(),
+            "learning_report": self._catgirl_memory.learning_report(),
+            "decision_source": "llm",
+            "companion_feedback": dict(self._feedback_result),
             "companion_mode": {
                 "enabled": bool(self._cfg.get("companion_mode_enabled", self._cfg.get("neko_commentary_enabled", True))),
                 "reporting_enabled": bool(self._cfg.get("neko_reporting_enabled", True)),
@@ -1032,6 +3212,194 @@ class STS2AutoplayService:
         message = self.t("status.snapshot", default="当前快照：screen={screen}", screen=screen)
         return {"status": "ok", "message": message, "summary": message, "snapshot": snapshot}
 
+    @staticmethod
+    def _combat_fingerprint(snapshot: dict[str, Any]) -> str:
+        raw = snapshot.get("raw_state") or {}
+        payload = {
+            "run_id": raw.get("run_id"), "floor": snapshot.get("floor"),
+            "screen": snapshot.get("screen"), "session": raw.get("session"),
+            "turn": raw.get("turn"), "in_combat": raw.get("in_combat"),
+            "multiplayer": raw.get("multiplayer"), "combat": raw.get("combat"),
+            "selection": raw.get("selection"), "potions": (raw.get("run") or {}).get("potions"),
+            "actions": snapshot.get("available_actions"),
+        }
+        return sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _combat_power(power: dict[str, Any]) -> dict[str, Any]:
+        from .agent_facts import clean_effect_text
+
+        # 效果文本（易伤=受到的攻击伤害提高50% 等）随 buff 一起给，模型据此理解实际
+        # 作用，不靠 buff 名猜数值。Mod 端已解析占位符，这里只做清理。
+        description = clean_effect_text(power.get("description"))
+        result = {
+            "id": power.get("power_id") or power.get("id") or "",
+            "name": power.get("name") or power.get("power_id") or "",
+            "amount": power.get("amount"), "is_debuff": bool(power.get("is_debuff", False)),
+        }
+        if description:
+            result["effect"] = description
+        return result
+
+    @staticmethod
+    def _action_card_hint(operation: dict[str, Any], view: dict[str, Any]) -> str:
+        """动作日志里附上"打的是哪张牌/选的是哪个选项"。
+
+        此前 `[sts2_llm_action] action=play_card` 只记动作名，玩家反馈"说的和打的不一样"
+        时无法从日志判定到底出了哪张。取 agent_view 里对应下标的 `line`（含牌名）。
+        """
+        try:
+            kwargs = operation.get("kwargs") if isinstance(operation.get("kwargs"), dict) else {}
+            action_type = str(operation.get("action_type") or "")
+            combat = view.get("combat") if isinstance(view.get("combat"), dict) else {}
+            if action_type == "play_card":
+                hand = combat.get("hand") if isinstance(combat.get("hand"), list) else []
+                index = kwargs.get("card_index")
+                card = next((c for c in hand if isinstance(c, dict)
+                             and c.get("i", c.get("index")) == index), None)
+                if isinstance(card, dict):
+                    target = kwargs.get("target_index")
+                    return f" card={card.get('line') or card.get('name')}" + (
+                        f" target={target}" if target is not None else "")
+                return f" card_index={index}"
+            if action_type in {"use_potion", "discard_potion"}:
+                return f" option_index={kwargs.get('option_index')}"
+            return ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _combat_card(card: dict[str, Any]) -> dict[str, Any]:
+        text = str(card.get("resolved_rules_text") or card.get("rules_text") or "")
+        dynamic = card.get("dynamic_values") or []
+        effects = {str(item.get("name")): item.get("current_value") for item in dynamic}
+        # 效果来自 Mod 的动态数值和规则文本，不以牌名猜测；条件仍保留在 rules_text 中。
+        weak = any(name.lower() in {"weak", "weakpower"} and float(value or 0) > 0 for name, value in effects.items())
+        vulnerable = any(name.lower() in {"vulnerable", "vulnerablepower"} and float(value or 0) > 0 for name, value in effects.items())
+        return {
+            "index": card.get("index"), "id": card.get("card_id"), "entity_id": card.get("entity_id"),
+            "name": card.get("name") or card.get("card_id"), "card_type": card.get("card_type"),
+            "cost": card.get("energy_cost"), "star_cost": card.get("star_cost"),
+            "playable": bool(card.get("playable")), "unplayable_reason": card.get("unplayable_reason"),
+            "rules_text": text, "effects": effects,
+            "requires_target": bool(card.get("requires_target") or card.get("target_type") in {"AnyEnemy", "AnyAlly"}),
+            "target_type": card.get("target_type"),
+            "target_index_space": card.get("target_index_space") or ({"AnyEnemy": "enemies", "AnyAlly": "players"}.get(card.get("target_type"))),
+            "legal_target_indices": list(card.get("valid_target_indices") or []),
+            "can_apply_weak": weak, "can_apply_vulnerable": vulnerable,
+        }
+
+    async def get_combat_query(self, question: str = "", *, plan_combat: bool = False) -> dict[str, Any]:
+        """只读查询；hand 永远属于 local_player，真人与猫娘不靠‘我方’代称。"""
+        if self._client is None and self._catgirl_client is None:
+            return {"status": "unavailable", "message": "战斗接口尚未连接，无法确认。", "summary": "当前未连接。", "connected": False}
+        try:
+            refreshed = await self.refresh_state(trigger_sync=False, plan_combat=plan_combat)
+        except STS2TransportError as exc:
+            message = f"当前无法读取尖塔战斗状态：{exc}"
+            return {"status": "unavailable", "message": message, "summary": message, "connected": False}
+        snapshot = refreshed["snapshot"]
+        raw = snapshot.get("raw_state") or {}
+        combat = raw.get("combat") or {}
+        if not raw.get("in_combat") or not combat:
+            message = f"当前不在战斗中（screen={snapshot.get('screen', 'unknown')}），无法确认战斗事实。"
+            return {"status": "idle", "message": message, "summary": message, "connected": True}
+        multiplayer = raw.get("multiplayer") or {}
+        net_type = str(multiplayer.get("net_game_type") or "").lower()
+        players = combat.get("players") or []
+        local_stats = combat.get("player") or {}
+        cards = [self._combat_card(card) for card in combat.get("hand") or []]
+        player_views = []
+        for item in players:
+            view = {key: item.get(key) for key in ("player_id", "slot_index", "is_local", "character_id", "character_name", "current_hp", "max_hp", "block", "energy", "is_alive")}
+            # 角色映射只用于已知的双人主机/客户端。未知多人布局不推断谁是真人。
+            role = "unknown"
+            if len(players) == 2 and net_type in {"host", "client"}:
+                role = "human" if bool(item.get("is_local")) == (net_type == "host") else "companion"
+            elif not multiplayer.get("is_multiplayer") and item.get("is_local"):
+                role = "controlled_player"
+            view["role"] = role
+            powers = local_stats.get("powers") if item.get("is_local") else item.get("powers")
+            view["powers"] = [self._combat_power(power) for power in powers] if powers is not None else None
+            view["powers_known"] = powers is not None
+            other_hand = item.get("hand")
+            view["hand"] = cards if item.get("is_local") else ([self._combat_card(card) for card in other_hand] if other_hand is not None else None)
+            player_views.append(view)
+        local = next((item for item in player_views if item.get("is_local")), None)
+        if local is None:
+            local = {**local_stats, "is_local": True, "role": "controlled_player", "hand": cards,
+                     "character_id": (raw.get("run") or {}).get("character_id")}
+            player_views.append(local)
+        enemies = []
+        for index, enemy in enumerate(combat.get("enemies") or []):
+            entity_id = enemy.get("entity_id")
+            enemies.append({
+                "index": enemy.get("index", index), "stable_id": entity_id, "identity_known": bool(entity_id),
+                "id": enemy.get("enemy_id"), "name": enemy.get("name") or enemy.get("enemy_id"),
+                "current_hp": enemy.get("current_hp"), "max_hp": enemy.get("max_hp"), "block": enemy.get("block"),
+                "alive": bool(enemy.get("is_alive", True)), "hittable": bool(enemy.get("is_hittable", True)),
+                "intent": enemy.get("intent"), "intents": list(enemy.get("intents") or []),
+                "powers": [self._combat_power(power) for power in enemy.get("powers") or []],
+            })
+        snapshot_id = self._combat_fingerprint(snapshot)
+        identity = {"active_instance": "catgirl" if self._catgirl_client is not None else "singleplayer", "base_url": self._companion_client().base_url,
+                    "local_player_id": local.get("player_id"), "hand_owner_id": local.get("player_id"), "hand_owner_role": local.get("role"),
+                    "note": "本地是同伴自己的游戏进程；hand 属于同伴。其他玩家数据仅来自该进程 Mod 实际输出。"}
+        message = f"当前读取{local.get('character_name') or local.get('character_id')}（{local.get('role')}）的操作界面，HP {local.get('current_hp')}/{local.get('max_hp')}，能量 {local.get('energy')}；手牌 {len(cards)} 张。"
+        return {
+            "status": "ok", "message": message, "summary": message, "connected": True,
+            "snapshot_id": snapshot_id, "captured_at": snapshot.get("polled_at", time()), "question": question,
+            "turn": raw.get("turn"), "turn_key": self._combat_turn_key(snapshot), "identity": identity,
+            "local_player": local, "players": player_views,
+            "human_player": next((item for item in player_views if item["role"] == "human"), None),
+            "companion_player": next((item for item in player_views if item["role"] == "companion"), None),
+            "enemies": enemies, "hand": cards,
+            "agent_facts": build_agent_facts(raw), "session": self._companion_session.context(),
+            "cards_played_this_turn": local_stats.get("cards_played_this_turn"),
+            "available_actions": [item.get("type") for item in snapshot.get("available_actions") or []],
+            "effect_matches": {"weak_cards": [card["index"] for card in cards if card["can_apply_weak"] and card["playable"]],
+                               "vulnerable_cards": [card["index"] for card in cards if card["can_apply_vulnerable"] and card["playable"]]},
+            "discussion": {"active": self._state.discussion_active, "status": self._state.discussion_status},
+        }
+
+    async def start_discussion(self, reason: str = "user") -> dict[str, Any]:
+        if not self._state.discussion_active:
+            self._state.discussion_previous = {"mode": self._state.control_mode, "autoplay": self._state.autoplay_state,
+                                               "pause_reason": self._state.pause_reason}
+        self._state.control_generation += 1
+        self._invalidate_companion_plan()
+        self._state.discussion_active = True
+        self._state.discussion_status = "pausing"
+        self._state.pause_reason = reason
+        sync = await self._sync_mod_gate("hold", discussion=True)
+        settled = sync.get("applied") and sync.get("settled") and not self._action_dispatch_lock.locked()
+        self._state.discussion_status = "paused" if settled else "pausing"
+        self._sync_background_polling()
+        self._emit_status()
+        return {"status": "ok" if settled else "unconfirmed", "mod_sync": sync,
+                "message": "已暂停新动作，可以继续聊；已提交的动作会完成。",
+                "discussion": {"active": True, "status": self._state.discussion_status}}
+
+    async def end_discussion(self) -> dict[str, Any]:
+        if not self._state.discussion_active:
+            return {"status": "idle", "message": "当前未暂停讨论。", "executed": False}
+        sync = await self._sync_mod_gate("hold", discussion=False)
+        if not (sync.get("applied") and sync.get("settled")):
+            return {"status": "unconfirmed", "message": "控制回执尚未确认，继续暂停动作。", "mod_sync": sync}
+        self._state.discussion_active = False
+        self._state.discussion_status = "inactive"
+        previous = self._state.discussion_previous
+        if self._state.pause_reason in {"user", "discussion"} or self._state.autoplay_state == previous.get("autoplay"):
+            self._state.pause_reason = str(previous.get("pause_reason") or "")
+        self._state.discussion_previous = {}
+        self._state.control_generation += 1
+        self._invalidate_companion_plan()
+        self._sync_background_polling()
+        if self._state.autoplay_state == "running":
+            self._loop_runner.start_autoplay()
+        self._emit_status()
+        return {"status": "ok", "message": "已结束讨论，恢复自主行动。", "mod_sync": sync}
+
     async def execute_planned_operation(self) -> dict[str, Any]:
         # 显式授权：玩家说了"就这个"，所以绕开听安排档位的停手闸门。
         return await self.run_autoplay_step(force=True)
@@ -1043,6 +3411,9 @@ class STS2AutoplayService:
             return {"status": "idle", "message": message, "summary": message}
         # "让它自己玩起来" 同时也意味着退出"听安排"：否则启动了自动玩却仍然每步等发话，很反直觉。
         self._apply_control_mode("program")
+        self._note_decision_success()
+        self._decision_failure_notice = ""
+        self._last_decision_key = ""
         self._state.autoplay_state = "running"
         self._state.pause_reason = ""
         self._state.stop_reason = ""
@@ -1053,6 +3424,10 @@ class STS2AutoplayService:
         return {"status": "ok", "message": message, "summary": message}
 
     def pause_autoplay(self, reason: str = "user") -> dict[str, Any]:
+        self._action_window = {}
+        self._last_confirmed = {}
+        self._state.control_generation += 1
+        self._invalidate_companion_plan()
         self._state.autoplay_state = "paused"
         self._state.pause_reason = reason
         self._sync_background_polling()
@@ -1064,7 +3439,11 @@ class STS2AutoplayService:
         if self._state.standby:
             message = self.t("autoplay.resume_blocked_standby", default="当前处于 standby 模式，不能恢复自动运行。")
             return {"status": "idle", "message": message, "summary": message}
+        self._note_decision_success()
+        self._decision_failure_notice = ""
         self._state.autoplay_state = "running"
+        self._state.control_generation += 1
+        self._last_decision_key = ""
         self._state.pause_reason = ""
         self._sync_background_polling()
         self._loop_runner.start_autoplay()
@@ -1073,6 +3452,8 @@ class STS2AutoplayService:
         return {"status": "ok", "message": message, "summary": message}
 
     def stop_autoplay(self, reason: str = "manual") -> dict[str, Any]:
+        self._state.control_generation += 1
+        self._invalidate_companion_plan()
         self._state.autoplay_state = "standby" if self._state.standby else "idle"
         if self._state.standby:
             # 待机期间玩家明确喊停：这条"停"要活过取消待机（否则一取消待机又自己玩起来了）。
@@ -1105,6 +3486,33 @@ class STS2AutoplayService:
         self._cfg["run_reflection_enabled"] = bool(enabled)
         self._emit_status()
         message = "好，打完我会复盘一局。" if enabled else "好，我不复盘了，只记数据。"
+        return {"status": "ok", "enabled": bool(enabled), "message": message, "summary": message}
+
+    def set_wait_for_turn_message(self, enabled: bool) -> dict[str, Any]:
+        """开关「每回合等主人发言再出牌」。
+
+        - ``enabled=True``（陪玩节奏）：战斗里每个回合**强制**等主人说一句话才决策，没有发言
+          就停手等待。互动感强，但慢。
+        - ``enabled=False``（全自动）：不等发言，自己连续打。**指挥不受影响**——主人中途说的
+          话仍会转成指引塞进下一次决策并立即打断重算（见 `queue_guidance`）。
+
+        关掉后如果本来停在"等待发言"状态，这里顺手把它踢回自主行动，否则要等下一次别的触发
+        才会动，表现为"答应了却不出牌"。
+        """
+        self._wait_for_turn_message = bool(enabled)
+        self._cfg["wait_for_turn_message"] = bool(enabled)
+        if not enabled and not self._state.standby and not self._state.discussion_active \
+                and self._state.control_mode == "program" \
+                and self._state.autoplay_state in {"idle", "paused"} \
+                and self._state.pause_reason in {"", "waiting_for_message"}:
+            self._state.autoplay_state = "running"
+            self._state.pause_reason = ""
+            self._state.stop_reason = ""
+            self._sync_background_polling()
+            self._loop_runner.start_autoplay()
+        self._emit_status()
+        message = ("好，每回合我等你一句话再出牌。" if enabled
+                   else "好，我自己连着打，你随时插话我都听。")
         return {"status": "ok", "enabled": bool(enabled), "message": message, "summary": message}
 
     def set_standby(self, standby: bool) -> dict[str, Any]:
@@ -1179,6 +3587,18 @@ class STS2AutoplayService:
         }[self._map_policy]
         return {"status": "ok", "message": message, "summary": message, "policy": self._map_policy}
 
+    def set_catgirl_name(self, name: str) -> dict[str, Any]:
+        """设置猫娘在联机里的显示名（空串=不改名，回落到 Steam 名）。"""
+        self._catgirl_display_name = str(name or "").strip()
+        self._cfg["coop_catgirl_name"] = self._catgirl_display_name
+        self._emit_status()
+        resolved = self.resolve_catgirl_display_name()
+        message = (
+            f"好，联机里我就叫「{resolved}」。"
+            if resolved else "好，联机名字改回跟 Steam 一样。"
+        )
+        return {"status": "ok", "message": message, "summary": message, "name": self._catgirl_display_name}
+
     async def sync_map_policy_to_mod(self) -> dict[str, Any]:
         """把等待策略写给 mod，让 mod 自己的自动玩循环也别抢路线。
 
@@ -1196,65 +3616,48 @@ class STS2AutoplayService:
             self.logger.debug(f"[sts2] sync map policy to mod failed (non-fatal): {exc}")
             return {"applied": False, "policy": self._map_policy}
 
-    async def set_route(self, *, mode: str = "safe", pick: Any = None, index: Any = None) -> dict[str, Any]:
-        """对话式地图协作：定路线（safe）/ 跟你一样（mirror）/ 指定位置（pick）。
+    def resolve_catgirl_display_name(self) -> str:
+        """猫娘在联机里的显示名：显式配置优先，否则用本体当前角色名。解析不到就返回空串（=不改名）。"""
+        if self._catgirl_display_name:
+            return self._catgirl_display_name
+        try:
+            return str(self._catgirl_llm.character_name() or "").strip()
+        except Exception:
+            return ""
 
-        直接调用 mod 的 choose_map_node，不依赖自动玩循环是否在跑——你说一句就立刻生效。
-        重复调用就是改票（"不对不对我选错了"），只要地图还没推进。
+    async def sync_catgirl_name_to_mod(self) -> dict[str, Any]:
+        """把猫娘的显示名推给两个游戏进程的 mod，让联机名牌能区分"猫娘"和"真人"。
+
+        两个进程跑在同一 Steam 账号上，名牌默认同名。mod 侧 PlayerNamePatch 只在猫娘玩家的名牌上
+        用这个名字（猫娘进程认"自己"、宿主进程认"另一个玩家"），所以两个客户端都要写。
+        失败是良性的：不写就回落到游戏原生的 Steam 名。
         """
-        client = self._require_client()
-        raw_state = await client.get_state()
-        raw_actions = await client.get_available_actions()
-        snapshot = normalize_snapshot(raw_state, raw_actions)
-        classification = self._state_machine.classify(snapshot)
-        snapshot = {**snapshot, "classification": classification}
-        summary_context = self._summary_builder.build(snapshot, runtime_state=self._state)
-        strategy_context = self._strategy_repository.build_context(
-            {**snapshot, "summary_context": summary_context}
-        )
-        preferences = (
-            strategy_context.get("preferences") if isinstance(strategy_context.get("preferences"), dict) else {}
-        )
-        decision = self._planner.resolve_route(
-            summary_context,
-            mode=mode,
-            pick=pick,
-            index=index,
-            preferences=preferences,
-            # 把现场快照带上，"定个路线（safe）"才会走与自动选路同一套链式递推评估，
-            # 而不是退回"只看眼前一步"。见 heuristic_planner.evaluate_map_route。
-            snapshot=snapshot,
-        )
-        base = {
-            "mode": decision.get("mode"),
-            "node_count": decision.get("node_count", 0),
-            "nodes": decision.get("nodes", []),
-        }
-        if not decision.get("ok"):
-            message = str(decision.get("message") or "现在没办法投地图票。")
-            return {"status": "error", "message": message, "summary": message, "error": decision.get("error"), **base}
+        name = self.resolve_catgirl_display_name()
+        result: dict[str, Any] = {"applied": False, "name": name, "host": False, "catgirl": False}
+        targets: list[tuple[str, Any]] = []
+        if self._host_client is not None:
+            targets.append(("host", self._host_client))
+        if self._catgirl_client is not None:
+            targets.append(("catgirl", self._catgirl_client))
+        if not targets and self._client is not None:
+            targets.append(("host", self._client))
+        for label, client in targets:
+            try:
+                await client.set_config(coop_catgirl_name=name)
+                result[label] = True
+                result["applied"] = True
+            except Exception as exc:
+                self.logger.debug(f"[sts2] sync catgirl name to mod ({label}) failed (non-fatal): {exc}")
+        return result
 
-        option_index = decision.get("option_index")
-        await client.execute_action("choose_map_node", option_index=option_index)
-        self._emit_status()
-        message = str(decision.get("message") or f"已投第 {decision.get('position')} 个节点。")
-        self.logger.info(
-            "[sts2_set_route] mode=%s pick=%s index=%s -> option_index=%s node_type=%s",
-            decision.get("mode"),
-            pick,
-            index,
-            option_index,
-            decision.get("node_type"),
-        )
-        return {
-            "status": "ok",
-            "message": message,
-            "summary": message,
-            "option_index": option_index,
-            "position": decision.get("position"),
-            "node_type": decision.get("node_type"),
-            **base,
-        }
+    async def set_route(self, *, mode: str = "safe", pick: Any = None, index: Any = None) -> dict[str, Any]:
+        # 旧入口仅传递本局的路线讨论，不再用启发式替本体投票。
+        instruction = f"路线讨论：mode={mode}, pick={pick}, index={index}"
+        self._queue_guidance(instruction, source="route")
+        context = await self.chat_companion(instruction)
+        context["message"] = "已读取路线局面，由当前角色自主判断，未直接投票。"
+        context["summary"] = context["message"]
+        return context
 
     def set_companion_mode(self, enabled: bool, *, emit_status: bool = True, push_message: bool = True) -> dict[str, Any]:
         if not enabled and self._loop_runner.is_polling() and not self._loop_runner.is_autoplaying() and hasattr(self.logger, "info"):
@@ -1292,35 +3695,23 @@ class STS2AutoplayService:
         }
 
     async def apply_user_override_safely(self, instruction: str, *, source: str = "user") -> dict[str, Any]:
-        was_running = self._state.autoplay_state == "running"
-        was_paused = self._state.autoplay_state == "paused"
-        pause_result: dict[str, Any] | None = None
-        if was_running:
-            pause_result = self.pause_autoplay(reason="apply_user_override")
-            if pause_result.get("status") != "ok":
-                return pause_result
-        result = await self.neko.extract_and_upsert_preference(instruction, source=source)
-        status = str(result.get("status") or "")
-        if status != "ok":
-            if was_running:
-                message = str(result.get("message") or result.get("summary") or "策略更新失败。")
-                result["message"] = message + " 自动游玩已暂停，请确认后再手动恢复。"
-                result["summary"] = result["message"]
-                result["autoplay_paused"] = True
-            return result
-        if was_running:
-            message = str(result.get("message") or result.get("summary") or "策略已更新。")
-            result["message"] = message + " 自动游玩已先暂停；如果要继续，请手动恢复自动游玩。"
-            result["summary"] = result["message"]
-            result["autoplay_paused"] = True
-            result["pause_reason"] = pause_result.get("pause_reason") if isinstance(pause_result, dict) else "apply_user_override"
-            return result
-        if was_paused:
-            message = str(result.get("message") or result.get("summary") or "策略已更新。")
-            result["message"] = message + " 当前自动游玩仍处于暂停状态。"
-            result["summary"] = result["message"]
-            result["autoplay_paused"] = True
-        return result
+        self._companion_session.remember("user", instruction, kind="pending" if self._ingress_enabled else "guidance")
+        self._queue_guidance(instruction, source=source)
+        return await self.chat_companion(instruction)
+
+    async def chat_companion(self, message: str = "") -> dict[str, Any]:
+        # 响应式聊天不经过任何动作/节流闸门，也不调用规划器。
+        await self.refresh_state(plan_combat=False)
+        view = self._agent_view(self._state.snapshot)
+        await self._read_companion_dialogue()
+        # 将游戏上下文交回现有 N.E.K.O 会话，由主人格回应；这里不另调模型生成聊天。
+        return {"status": "ok", "message": "已读取自己进程的游戏状态。", "summary": "已读取当前游戏上下文。",
+                "agent_view": view, "agent_facts": build_agent_facts(self._state.snapshot.get("raw_state")),
+                "session": self._companion_session.context(),
+                "question": message,
+                "context_scope": "当前局面以本次查询为准；回答新的局面问题时重新查询。过去行动依据 session 中的执行记录。",
+                "identity": "catgirl" if self._catgirl_client is not None else "singleplayer",
+                "executed": False}
 
     def _require_client(self) -> STS2TransportClient:
         if self._client is None:
@@ -1391,6 +3782,8 @@ class STS2AutoplayService:
         # 任何档位切换都要打断当前决策：否则 program<->advise 切换后，循环还会按旧档位把
         # 已经算好的那一步执行掉（切到"听安排"却仍然走了一步）。
         if previous_mode != normalized:
+            self._state.control_generation += 1
+            self._invalidate_companion_plan()
             self._state.interrupt_requested = True
             self._state.interrupt_reason = "mode_change"
         return normalized
@@ -1399,15 +3792,27 @@ class STS2AutoplayService:
         """切换猫娘的控制档位。
 
         - ``program``（自己玩）：照常决策并执行。默认。
-        - ``advise``（听安排）：非战斗决策界面只算不做，等玩家发话；战斗照常自动打。
+        - ``advise``：所有界面只判断不自动执行，包括战斗。
         - ``standby``（停手）：连计划都不算，并且会让 mod 一起停手。
         """
         normalized = self._apply_control_mode(mode)
+        # 玩家说“自己玩/继续打”时，切回 program 也必须解除此前的暂停。
+        # 仅更新 control_mode 会留下 autoplay_state=paused，表现为已经答应但永远不出牌。
+        if (normalized == "program" and not self._state.standby
+                and self._state.autoplay_state in {"paused", "idle"}
+                and self._state.pause_reason != "run_reflection"):
+            self._note_decision_success()
+            self._decision_failure_notice = ""
+            self._state.autoplay_state = "running"
+            self._state.pause_reason = ""
+            self._state.stop_reason = ""
+            self._sync_background_polling()
+            self._loop_runner.start_autoplay()
         sync = await self.sync_control_mode_to_mod()
         self._emit_status()
         message = {
             "program": "好，我自己玩，你不用一直盯着。",
-            "advise": "好，我等你发话：每一步先算给你看，你说走我才走。战斗我会照常打。",
+            "advise": "我先判断局面，暂停自动执行；我们可以继续聊。",
             "standby": "好，我彻底停手了。",
         }.get(normalized, "好，收到。")
         return {
@@ -1419,23 +3824,66 @@ class STS2AutoplayService:
         }
 
     async def sync_control_mode_to_mod(self) -> dict[str, Any]:
-        """把档位同步给 mod，让它自己的自动玩驱动一起停手。
+        # Mod 只负责进房；插件作为唯一决策驱动，始终让 Mod 自主驱动 hold。
+        return await self._sync_mod_gate("hold")
 
-        只停插件等于没停：mod 有独立的 `NekoAutoplayDriver`，会照常决策并执行。
-        映射：program→auto（自己玩）、advise→advise（非战斗界面停手）、
-        standby→hold（所有界面停手，含战斗，回合会停住——这是该档位的预期语义）。
-        失败是良性的：插件侧规划器已经停手，最坏情况是 mod 继续自己玩。
+    def _in_active_run(self) -> bool:
+        """当前是否已在**局内**（有 run_id 且不在主菜单/大厅/选人这些玩家手动控制的界面）。"""
+        snapshot = self._state.snapshot if isinstance(self._state.snapshot, dict) else {}
+        run_id = str(snapshot.get("run_id") or "")
+        if not run_id or run_id == "run_unknown":
+            return False
+        screen = str(snapshot.get("screen") or "").upper()
+        return screen not in {"", "UNKNOWN", "MAIN_MENU", "MULTIPLAYER_LOBBY", "CHARACTER_SELECT"}
+
+    async def reconcile_turn_control(self) -> None:
+        """新游戏进程也必须停住 Mod；再按节奏决定何时启动插件决策循环。
+
+        两种节奏：
+        - 等发言（``wait_for_turn_message=True``）：本回合主人说了话才启动自主运行。
+        - 全自动（``False``）：一进局（非主菜单/大厅/选人）就自己开打，不等发言；主人中途插话
+          仍会转成指引立即被采纳。**只在 ``idle`` 时启动**，不碰玩家手动 `paused`/`stop` 的状态。
         """
-        mapped = {"program": "auto", "advise": "advise", "standby": "hold"}.get(
-            self._mode_controller.normalize(self._state.control_mode), "auto"
-        )
+        self._clear_previous_run_failure()
+        sync = await self.sync_control_mode_to_mod()
+        if not (sync.get("applied") and sync.get("settled")):
+            self.logger.warning("[sts2_driver] 等待 Mod 停手确认：%s", sync)
+            return
+        if not self._wait_for_turn_message:
+            if (self._in_active_run() and self._state.autoplay_state == "idle"
+                    and self._state.control_mode == "program"
+                    and not self._state.stop_reason and not self._state.discussion_active
+                    and not self._state.standby):
+                self.start_autoplay()
+            return
+        await self._read_companion_dialogue()
+        if (self._companion_session.anchor().get("battle_id") and self._current_turn_message()
+                and self._state.autoplay_state == "idle" and self._state.control_mode == "program"
+                and not self._state.stop_reason and not self._state.discussion_active and not self._state.standby):
+            self.start_autoplay()
+
+    async def _sync_mod_gate(self, mapped: str, *, discussion: bool | None = None) -> dict[str, Any]:
         try:
-            client = self._require_client()
+            client = await self._ensure_companion_client()
         except Exception:
             return {"applied": False, "mode": mapped}
         try:
-            await client.set_config(coop_control_mode=mapped)
-            return {"applied": True, "mode": mapped}
+            paused = self._state.discussion_active if discussion is None else discussion
+            key = (client.base_url, mapped, paused, self._danmaku_enabled, self._state.control_generation)
+            if key == self._mod_gate_key and self._mod_gate.get("applied") and self._mod_gate.get("settled"):
+                return self._mod_gate
+            response = await client.set_config(coop_control_mode=mapped, coop_discussion_paused=paused,
+                                               llm_enabled=False, coop_manual_character_selection=True,
+                                               danmaku_enabled=False, danmaku_push_enabled=self._danmaku_enabled)
+            echoed = str(response.get("coop_control_mode") or "").strip().lower()
+            # 新版 Mod 回显实际持久化的模式；旧版只返回 updated，不能把它误报成两侧已暂停。
+            applied = echoed == mapped and response.get("coop_discussion_paused") is paused
+            self._mod_gate = {"applied": applied, "mode": mapped, "echoed_mode": echoed or None,
+                    "manual_character_selection": response.get("coop_manual_character_selection") is True,
+                    "settled": response.get("autoplay_action_in_flight") is False,
+                    "persistent": response.get("coop_hold_persistent") is True}
+            self._mod_gate_key = key if applied else None
+            return self._mod_gate
         except Exception as exc:
             self.logger.debug(f"[sts2] sync control mode to mod failed (non-fatal): {exc}")
             return {"applied": False, "mode": mapped}
@@ -1450,10 +3898,12 @@ class STS2AutoplayService:
         guidance["id"] = f"guidance-{self._state.guidance_generation}"
         guidance["generation"] = self._state.guidance_generation
         guidance["origin"]["generation"] = self._state.guidance_generation
+        guidance["anchor"] = {**self._companion_session.anchor(), "timestamp": time()}
         self._state.pending_guidance.append(guidance)
         self._state.pending_guidance = self._state.pending_guidance[-20:]
         self._state.interrupt_requested = True
         self._state.interrupt_reason = "guidance"
+        self._invalidate_companion_plan()
         return guidance
 
     def _consume_guidance(self, operation: dict[str, Any] | None) -> None:
@@ -1582,30 +4032,25 @@ class STS2AutoplayService:
             pass
         return True
 
-    def _mark_loop_error(self, exc: Exception) -> None:
-        """记一次循环错误——**但绝不把自动玩打成终止态**。
-
-        历史教训（这就是"猫娘卡住不动"的真因）：这里曾经写
-        ``autoplay_state = "error" if autoplay_state == "running" else autoplay_state``，
-        而 ``loop_runner._autoplay_loop`` 只在 ``autoplay_state == "running"`` 时才干活——
-        于是**一次**被 mod 拒收的动作（例如缓存计划里的 target_index 越界）就让自动玩永久空转，
-        没有任何代码把它改回 running，玩家只能看到猫娘站着不动。
-
-        现在职责分清：
-          - ``autoplay_state`` 表示**意图**（running / paused / standby / idle），只由玩家指令改变；
-          - ``transport_state`` / ``last_error`` / ``consecutive_errors`` 表示**健康**。
-        出错只记健康信息，循环下一轮自己重试（退避见 ``_autoplay_retry_backoff``）。
-        """
+    def _mark_loop_error(self, exc: Exception, *, autoplay: bool = False) -> None:
+        """记录健康状态；自动决策/派发连续失败3轮后明确暂停，后台观察保持轮询。"""
         self._state.transport_state = "error"
         self._state.last_error = str(exc)
         self._state.consecutive_errors += 1
-        if isinstance(exc, STS2ActionRejected) and exc.retryable:
+        if autoplay or isinstance(exc, STS2ActionRejected):
+            self._state.decision_errors += 1
+            self._state.decision_error = str(exc)
+            if not self._pause_after_decision_failures():
+                self._state.retry_at = time() + self._autoplay_retry_backoff()
+        if isinstance(exc, STS2ActionRejected):
             # 状态漂移类拒绝：被拒的那一步没有落地，而缓存计划与手里的现场都是按"旧局面"算的 ——
             # 一并作废，下一轮先强制重刷 /state 再按现场重算，通常这一步就能过。
-            self._invalidate_combat_plan_cache(reason=f"rejected:{exc.code}")
-            self._state.force_replan_requested = True
+            if exc.retryable:
+                self._invalidate_combat_plan_cache(reason=f"rejected:{exc.code}")
+            self._invalidate_companion_plan()
+            self._state.force_replan_requested = exc.retryable
             self.logger.info(
-                "[sts2_recover] 动作被拒，已丢弃缓存的战斗计划并继续: code=%s action=%s screen=%s",
+                "[sts2_recover] 动作被拒，已丢弃缓存的战斗计划: code=%s action=%s screen=%s",
                 exc.code,
                 exc.action_name,
                 exc.screen,
@@ -1637,8 +4082,8 @@ class STS2AutoplayService:
             base = max(0.5, float(self._cfg_action_interval()))
         except (TypeError, ValueError):
             base = 1.5
-        errors = max(1, int(self._state.consecutive_errors or 1))
-        return min(base * (2 ** (errors - 1)), 8.0)
+        errors = max(1, self._state.consecutive_errors, self._state.decision_errors)
+        return min(base * (2 ** min(errors - 1, 4)), 8.0)
 
     def _companion_mode_active(self) -> bool:
         return bool(self._cfg.get("companion_mode_enabled", self._cfg.get("neko_commentary_enabled", True))) and bool(self._cfg.get("neko_commentary_enabled", True))
@@ -1646,11 +4091,13 @@ class STS2AutoplayService:
     def _should_keep_polling(self) -> bool:
         # "error" 也在名单里：即使旧版本把自动玩留在了 error 态，也**必须继续轮询** ——
         # 否则外部控制租约一过期，mod 就以为插件走了，游戏彻底没人驱动（曾是"卡住"的最后一环）。
-        return bool(self._cfg.get("companion_mode_enabled", False)) or self._state.autoplay_state in {"running", "paused", "error"}
+        return self._state.discussion_active or bool(self._cfg.get("companion_mode_enabled", False)) or self._state.autoplay_state in {"running", "paused", "error"}
 
     def _sync_background_polling(self) -> None:
         if self._should_keep_polling():
             self._loop_runner.start_background()
+            if self._ingress_enabled:
+                self._loop_runner.start_autoplay()
             return
         self._loop_runner.stop_background_sync()
 
@@ -1885,6 +4332,17 @@ class STS2AutoplayService:
         self._state.run_intent = run_intent
         self._remember_hp_sample(snapshot)
         self._remember_route_step(snapshot)
+        journal = self._companion_session.journal
+        if journal.data.get("run_id") == snapshot.get("run_id"):
+            telemetry = {name: deepcopy(getattr(self._state, name)) for name in
+                         ("hp_trail", "combat_room_id", "route_log", "route_room_key", "route_start", "route_last")}
+            samples = journal.data.setdefault("hp_samples", [])
+            latest = (telemetry["hp_trail"] or [None])[-1]
+            if latest and (not samples or latest != samples[-1]):
+                samples.append(deepcopy(latest))
+            if journal.data.get("telemetry") != telemetry:
+                journal.data["telemetry"] = telemetry
+                journal.save()
         self._maybe_announce_character(snapshot)
         self._maybe_record_run_memory(snapshot)
 
@@ -1921,6 +4379,8 @@ class STS2AutoplayService:
 
     def _remember_hp_sample(self, snapshot: dict[str, Any]) -> None:
         """记一条生命采样，供局末做"哪里损血"的归因（HP 或界面没变就不重复记）。"""
+        if snapshot.get("outcome") == "victory":
+            return
         try:
             raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
             combat = raw_state.get("combat") if isinstance(raw_state.get("combat"), dict) else {}
@@ -1959,11 +4419,13 @@ class STS2AutoplayService:
                 "floor": self._safe_int(snapshot.get("floor")) or 0,
                 "step_count": int(self._state.step_count),
                 "at": time(),
+                "sampling_gap": self._telemetry_gap,
             }
             trail = self._state.hp_trail
-            if trail and trail[-1].get("hp") == sample["hp"] and trail[-1].get("room") == sample["room"]:
+            if trail and trail[-1].get("hp") == sample["hp"] and trail[-1].get("room") == sample["room"] and not self._telemetry_gap:
                 return
             trail.append(sample)
+            self._telemetry_gap = False
             if len(trail) > 400:
                 del trail[: len(trail) - 400]
         except Exception:
@@ -2007,6 +4469,8 @@ class STS2AutoplayService:
         - 损血 = 进房间时的血 - 记录过程中最低的血；收获 = 金币差 + 新增卡/遗物/药水（按 id 差集）。
         - 换房间、换局、局末时收尾。
         """
+        if snapshot.get("outcome") == "victory":
+            return
         try:
             raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
             screen = str(snapshot.get("screen") or "")
@@ -2087,7 +4551,8 @@ class STS2AutoplayService:
 
     def _hp_loss_report(self) -> dict[str, Any]:
         """把本局生命轨迹整理成"哪里损血"的归因表（局末总结用）。"""
-        trail = [s for s in self._state.hp_trail if isinstance(s, dict)]
+        archived = self._companion_session.journal.data.get("hp_samples") or self._state.hp_trail
+        trail = [s for s in archived if isinstance(s, dict)]
         if not trail:
             return {}
         losses: list[dict[str, Any]] = []
@@ -2108,6 +4573,8 @@ class STS2AutoplayService:
                         "hp_after": cur.get("hp"),
                         "lost": -delta,
                         "at_step": cur.get("step_count"),
+                        "sampling_gap": cur.get("sampling_gap", False),
+                        "attribution": "same_room_interval" if prev.get("room") == cur.get("room") else "cross_room_interval",
                     }
                 )
         hp_values = []
@@ -2133,11 +4600,7 @@ class STS2AutoplayService:
         }
 
     def _maybe_announce_character(self, snapshot: dict[str, Any]) -> None:
-        """开局后**报一次**"这局我玩的是谁"，并顺手告诉本体。
-
-        角色是游戏自带的「随机」抽的（见 heuristic_planner 的 character_select_random），
-        所以实际抽到谁只能开局后从 run 里读 —— 顺便让猫娘把它说给玩家听。
-        """
+        """把本局使用的游戏角色交给本体，由本体决定是否开口。"""
         try:
             run_id = str(snapshot.get("run_id") or "")
             if not run_id or run_id in {"run_unknown"}:
@@ -2152,13 +4615,10 @@ class STS2AutoplayService:
             if not display:
                 return
             self._state.announced_character_run_id = run_id
-            self._schedule_catgirl_push(f"这局我抽到{display}喵，开打！")
-            # 悄悄交给本体：不可见、不进记忆，但会让它自己主动跟观众报一句开场。
-            # 归在「尖塔速报」这个开关下（它也是"跟本体说话"这一路）。
             if getattr(self._state, "host_digest_enabled", True):
                 self._push_proactive_to_host(
-                    f"《杀戮尖塔2》新的一局开始了，这局随机到的角色是「{display}」。"
-                    "用你自己的口吻跟观众报一句开场，一两句就够，别念稿。",
+                    f"《杀戮尖塔2》新的一局开始了，你使用的游戏角色是「{display}」。"
+                    "要不要就此说一句由你判断。",
                     kind="character_announcement",
                     priority=6,
                 )
@@ -2182,8 +4642,20 @@ class STS2AutoplayService:
             run_id = str(snapshot.get("run_id") or "")
             if not run_id or run_id == self._state.last_memory_run_id:
                 return
+            outcome = snapshot.get("outcome") or {"victory": "victory", "defeat": "defeat"}.get(screen)
+            if outcome is None:
+                return
             self._state.last_memory_run_id = run_id
-            outcome = "victory" if screen == "victory" else "defeat"
+            self.logger.info("[sts2_run_result] run_id=%s screen=%s outcome=%s raw_victory=%s terminal_hp=%s",
+                             run_id, screen, outcome,
+                             (snapshot.get("raw_state", {}).get("game_over") or {}).get("is_victory"),
+                             (snapshot.get("raw_state", {}).get("run") or {}).get("current_hp"))
+            saved_record = next((r for r in self._catgirl_memory.runs if r.get("run_id") == run_id), None)
+            if saved_record and saved_record.get("outcome") == outcome:
+                self.logger.info("[sts2_memory] retained existing run_id=%s outcome=%s decisions=%s", run_id,
+                                 outcome, len(saved_record.get("decisions") or []))
+                self._write_history_view()
+                return
             raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
             run = raw_state.get("run") if isinstance(raw_state.get("run"), dict) else {}
             character = str(snapshot.get("character") or raw_state.get("character_id") or run.get("character_id") or "")
@@ -2194,6 +4666,9 @@ class STS2AutoplayService:
             # 收尾最后一个房间，把路线图一起写进本局记录。
             self._close_route_room(reason="run_end")
             route = [dict(item) for item in self._state.route_log if isinstance(item, dict)]
+            if self._companion_session.journal.data:
+                self._companion_session.journal.data.setdefault("telemetry", {})["route_log"] = deepcopy(route)
+                self._companion_session.journal.save()
             record = self._catgirl_memory.add_run(
                 run_id,
                 character=character,
@@ -2203,7 +4678,9 @@ class STS2AutoplayService:
                 decision_memory=self._state.recent_decision_memory,
                 hp_report=hp_report,
                 route=route,
+                process=self._companion_session.journal.run_context(),
             )
+            hp_report = record.get("hp") or {}
             self._state.route_log = []
             self._state.route_room_key = ""
             self._state.route_start = {}
@@ -2221,6 +4698,11 @@ class STS2AutoplayService:
                 len(record.get("preferences", [])),
             )
             self._write_history_view()
+            if self._ingress_active:
+                if self._state.run_reflection_enabled:
+                    self._push_proactive_to_host(self._run_summary_digest({k: v for k, v in record.items() if k != "process"}, hp_report),
+                                                 kind="run_reflection", priority=7)
+                return
             # 复盘开关关掉时：只留结构化记录，既不暂停也不生成反思（连"暂停再恢复"这套都不做）。
             if not getattr(self._state, "run_reflection_enabled", True):
                 self.logger.info("[sts2_reflect] 复盘开关关闭，只记录不反思")
@@ -2245,7 +4727,8 @@ class STS2AutoplayService:
         权威数据仍在 catgirl_memory.json；这里失败不影响任何决策。
         """
         try:
-            path = write_history_view(self._catgirl_memory.runs)
+            path = write_history_view(self._catgirl_memory.runs, learning_report=self._catgirl_memory.learning_report(),
+                                      current_report=self._companion_session.journal.report())
             if path:
                 self.logger.info("[sts2_history] 历史快照已更新: %s", path)
         except Exception as exc:
@@ -2256,7 +4739,8 @@ class STS2AutoplayService:
         try:
             from .history_view import build_history_payload
 
-            return build_history_payload(self._catgirl_memory.runs)
+            return build_history_payload(self._catgirl_memory.runs, learning_report=self._catgirl_memory.learning_report(),
+                                         current_report=self._companion_session.journal.report())
         except Exception:
             return {"summary": {}, "runs": []}
 
@@ -2286,9 +4770,10 @@ class STS2AutoplayService:
                 "近况:"
                 + "；".join(f"{str(d.get('screen') or '')}:{str(d.get('action_type') or '')}" for d in recent)
             )
-        lessons = [str(item) for item in (record.get("lessons") or []) if str(item).strip()]
-        if lessons:
-            parts.append("已知教训:" + "；".join(lessons[:3]))
+        process = record.get("process") or {}
+        if process.get("turns"):
+            return json.dumps({"result": parts, "process": self._companion_session.journal.reflection_context(process)},
+                              ensure_ascii=False, separators=(",", ":"))
         return "｜".join(parts)[:600]
 
     def _pause_for_reflection(self) -> None:
@@ -2324,7 +4809,7 @@ class STS2AutoplayService:
     async def _reflect_run_end(self, record: dict[str, Any], hp_report: dict[str, Any]) -> None:
         """局末复盘：让**本体**（同一模型 + 本体人设）指出损血/失败的关键并给出下次的改法。
 
-        产物有三处去处：① 贴回猫娘记忆（并作为一条教训参与下一局的 strategy_directives）；
+        产物有三处去处：① 作为局末评价保存；结构化经验走统一决策的learning_updates；
         ② 作为弹幕说给玩家听；③ 推给本体 NEKO 的对话（`ai_behavior="respond"`，让它用自己口吻再说一遍）。
         """
         try:
@@ -2339,14 +4824,17 @@ class STS2AutoplayService:
             if not text:
                 self.logger.info("[sts2_reflect] 反思未产出（保留启发式总结）")
                 return
-            self._catgirl_memory.attach_reflection(str(record.get("run_id") or ""), text)
+            journal = self._companion_session.journal
+            source = next((t for t in reversed(journal.data.get("turns", [])) if t.get("actions")), None)
+            if source:
+                self._catgirl_memory.stage_review({"turn_id": source["id"], "assessment": text, "question": text}, text, journal)
             self.logger.info("[sts2_reflect] 反思=%s", text)
             self._write_history_view()  # 让历史页也能看到这条反思
             self._schedule_catgirl_push(text)
             head = (
                 f"这一局结束了（{record.get('outcome') or '?'}，第{record.get('floor') or 0}层）。"
                 f"复盘要点：{text}"
-                "用你自己的口吻跟观众复盘这局为什么输，一两句就够。"
+                "用你自己的口吻先给判断，再询问主人意见，等反馈后再总结经验。"
             )
             self._push_proactive_to_host(head, kind="run_reflection", priority=7)
         except Exception as exc:
@@ -2355,31 +4843,99 @@ class STS2AutoplayService:
             # 无论复盘成功与否都要恢复 —— 卡在"暂停"上等于猫娘永久停手。
             self._resume_after_reflection()
 
-    def _push_proactive_to_host(self, text: str, *, kind: str, priority: int = 5) -> None:
-        """把一段内容**悄悄**交给本体，让它自己主动开口讲。
+    async def _update_companion_feedback(self, snapshot: dict[str, Any]) -> None:
+        if self._feedback_lock.locked():
+            return
+        raw = snapshot.get("raw_state") or {}
+        multiplayer = raw.get("multiplayer") or {}
+        if multiplayer.get("is_multiplayer") and str(multiplayer.get("net_game_type") or "").lower() == "host":
+            self._feedback_observation = {}
+            return
+        combat = raw.get("combat") or {}
+        player = combat.get("player") or {}
+        hp = player.get("current_hp")
+        enemies = {e.get("entity_id"): e.get("current_hp") for e in combat.get("enemies", []) if e.get("is_alive", True)}
+        observation = {"run": raw.get("run_id"), "floor": snapshot.get("floor"), "owner": multiplayer.get("local_player_id"), "combat": bool(raw.get("in_combat")),
+                       "hp": hp, "enemies": enemies, "risk": bool(raw.get("in_combat")) and self._is_high_risk_combat(snapshot, {"summary_kind": "combat", "player": player})}
+        previous = self._feedback_observation
+        self._feedback_observation = observation
+        same_room = previous.get("run") == observation["run"] and previous.get("floor") == observation["floor"] and previous.get("owner") == observation["owner"]
+        if not same_room or not observation["risk"]:
+            self._feedback_risk_announced = False
+        event, detail = "", ""
+        if same_room and previous.get("combat") and isinstance(previous.get("hp"), (int, float)) and isinstance(hp, (int, float)) and hp < previous["hp"]:
+            event, detail = "hurt", f"猫娘角色刚损失 {previous['hp'] - hp} 点生命，目前 {hp} 点。"
+        elif same_room and previous.get("combat") and (not observation["combat"] or set(previous.get("enemies", {})) - set(enemies)):
+            event, detail = "success", "战斗结束或有敌人被击败。"
+        elif observation["risk"] and not self._feedback_risk_announced:
+            event, detail = "danger", f"当前生命 {hp}；敌人意图或低生命触发危险提醒。"
+            self._feedback_risk_announced = True
+        elif previous.get("risk") and not observation["risk"]:
+            event, detail = "thinking", "危险已缓解，继续观察局面。"
+        if event:
+            await self._emit_companion_feedback(event, detail)
 
-        玩家口径是：「不进记忆、不可见、本体主动讲，不然没有直播的互动味」，复盘也一样。落到
-        `ctx.push_message` 的两个轴 + 一个 metadata 开关上：
+    async def _emit_companion_feedback(self, event: str, detail: str, *, speak: bool = True) -> None:
+        if self._sdk_ctx is None and self._frontend_notifier is None:
+            return
+        if not self._feedback_lock.acquire(blocking=False):
+            return
+        try:
+            if self._feedback_last_event == event and time() - self._feedback_result.get("at", 0) < 8:
+                return
+            self._feedback_last_event = event
+            context = {
+                "persona": self._catgirl_llm._persona_system(),
+                "event_fact": detail,
+                "agent_view": self._agent_view(self._state.snapshot),
+                "session": self._companion_session.context(),
+                "recent_action": self._state.latest_action_frame,
+            }
+            analysis_text = (
+                "结合当前角色人格、最近对话、行动理由和实际得失判断情绪；没有明显情绪时保持平静。\n"
+                + json.dumps(context, ensure_ascii=False)
+            )
+            self._feedback_result = {"event": event, "detail": detail, "at": time(), "delivery": "pending"}
+            try:
+                result = await apply_existing_expression(self._main_server_port(), analysis_text)
+            except Exception as exc:
+                # 表情服务不可用时保持游戏控制，明确记录失败，语音仍可解释事件。
+                self._feedback_result.update(delivery="failed", error=str(exc))
+                self.logger.warning("[sts2_emotion] event=%s failed=%s", event, exc)
+            else:
+                self._feedback_result.update(result, delivery="host_emotion_queued")
+                self.logger.info("[sts2_emotion] event=%s character=%s emotion=%s", event, result["character"], result["emotion"])
+            if (speak and event != "thinking" and self._state.host_digest_enabled
+                    and not (self._ingress_active and self._companion_session.facts.get("screen") in {"GAME_OVER", "VICTORY", "DEFEAT"})
+                    and self._state.autoplay_state != "running" and not self._wait_for_turn_message):
+                self._push_proactive_to_host(
+                    detail if self._ingress_active else "游戏经历上下文：" + json.dumps(context, ensure_ascii=False)
+                    + "\n按实际感受决定是否回应。",
+                    kind="combat_feedback", priority=7,
+                )
+                self._feedback_voice_at = time()
+                self._state.last_host_digest_at = time()
+                self._feedback_result["voice"] = "submitted"
+            else:
+                self._feedback_result["voice"] = "current_dialogue" if self._state.discussion_active else "silent"
+        finally:
+            self._feedback_lock.release()
 
-        - ``visibility=[]`` —— 用户**看不到**这些 parts 本身。SDK 文档原话：空列表表示用户看不到
-          内容；若同时 ``ai_behavior="respond"``，用户**只看到本体的回复**。
-        - ``ai_behavior="respond"`` —— 喂进上下文**并立即触发一次 AI 回合**，所以是本体主动开口
-          （``"read"`` 不会开口，那才是"没有互动味"的原因；``"blind"`` 则连上下文都不给）。
-        - ``metadata["prompt_ephemeral"] = True`` —— **不进历史/记忆**。这是宿主认的临时提示开关
-          （`music_pusher` 的主动推送用的是同一个）。
-
-        另外刻意优先走 SDK 的 `ctx.push_message`：插件的 dispatcher 会把正文截到 **30 字**
-        （`_host_reply_text`），战报/速报会被切碎 —— 那 30 字限制是给"状态反馈"用的。
-        拿不到 SDK 上下文时退回 dispatcher（接受截断，但可见性/行为一致）。
-        """
+    def _push_proactive_to_host(self, text: str, *, kind: str, priority: int = 5,
+                                prompt_ephemeral: bool = False,
+                                coalesce_key: str | None = None) -> None:
+        """交回 N.E.K.O 本体表达；回复沿用主人格，保留会话历史。"""
         body = str(text or "").strip()
         if not body:
             return
-        meta = {"kind": kind, "prompt_ephemeral": True, "delivery_semantics": "proactive"}
-        # 留痕：这条是"悄悄交给本体"的，玩家在聊天里看不到正文，所以只有日志能核对三个开关。
+        if self._ingress_active:
+            self._ingress_callbacks.append({"kind": kind, "content": body, "timestamp": time()})
+            return
+        meta = {"kind": kind, "prompt_ephemeral": prompt_ephemeral, "delivery_semantics": "proactive"}
         self.logger.info(
-            "[sts2_host_push] kind=%s visibility=[] ai_behavior=respond ephemeral=True chars=%s",
+            "[sts2_host_push] kind=%s visibility=[] ai_behavior=respond ephemeral=%s chars=%s",
             kind,
+            prompt_ephemeral,
             len(body),
         )
         ctx = self._sdk_ctx
@@ -2392,6 +4948,8 @@ class STS2AutoplayService:
                     parts=[{"type": "text", "text": body}],
                     metadata=dict(meta),
                     priority=priority,
+                    **({"coalesce_key": coalesce_key} if coalesce_key else
+                       ({"coalesce_key": "sts2:combat_feedback"} if kind == "combat_feedback" else {})),
                 )
                 return
             except Exception as exc:
@@ -2411,6 +4969,213 @@ class STS2AutoplayService:
             except Exception:
                 pass
 
+    def _push_host_context(self, text: str, *, coalesce_key: str) -> None:
+        """把**被动局面上下文**交给本体：只进 LLM 上下文，绝不触发它开口。
+
+        `ai_behavior="read"` 在宿主映射为 `delivery_mode="passive"`——只入队，等本体
+        下一个自然轮次（用户开口）才 drain 进上下文，不打断、不抢话。这正是自动行动
+        期间缺的那一路：`_deliver_catgirl_sync` 的说话轨在 catgirl 自主行动时被压住，
+        若不单独喂局面，本体对"现在什么情况"只能拿旧画面作答。
+        """
+        body = str(text or "").strip()
+        if not body:
+            return
+        meta = {"kind": "host_context", "delivery_semantics": "passive"}
+        self.logger.info(
+            "[sts2_host_push] kind=host_context ai_behavior=read coalesce_key=%s chars=%s",
+            coalesce_key,
+            len(body),
+        )
+        ctx = self._sdk_ctx
+        if ctx is not None and hasattr(ctx, "push_message"):
+            try:
+                ctx.push_message(
+                    source="sts2_autoplay",
+                    visibility=[],
+                    ai_behavior="read",
+                    parts=[{"type": "text", "text": body}],
+                    metadata=dict(meta),
+                    priority=3,
+                    coalesce_key=coalesce_key,
+                )
+                return
+            except Exception as exc:
+                self.logger.info("[sts2_host_push] sdk context push failed (non-fatal): %s", exc)
+        notifier = self._frontend_notifier
+        if notifier is not None:
+            try:
+                notifier(
+                    content=body,
+                    description=body,
+                    metadata=dict(meta),
+                    priority=3,
+                    message_type="sts2_host_context",
+                    visibility=[],
+                    ai_behavior="read",
+                )
+            except Exception:
+                pass
+
+    def _deliver_host_context(self, snapshot: dict[str, Any]) -> None:
+        if self._ingress_active:
+            return  # 同伴决策直接读取当前事实，无需给普通聊天反复塞动态摘要。
+        """自动行动期间把**当前局面**被动喂给本体，修正"本体还在按旧画面说话"。
+
+        说话轨（`_deliver_catgirl_sync`）在 `autoplay_state == "running"` 时整段早退，
+        等待本回合用户话语时也早退——两处都是为了"别抢话"。但连同局面上下文一起
+        断掉就错了：玩家在自动行动中途开口问"现在什么情况"，本体手里还是上一屏的
+        快照（实测差着好几分钟、还停在 EVENT 界面）。这里补上被动上下文轨：
+        同一 `agent_view` 只喂一次（指纹去重），宿主侧同 key 合并为最新一条，最坏
+        只是本体多一份新上下文，绝不会因此开口。
+        """
+        if not getattr(self._state, "host_digest_enabled", True):
+            return
+        # 只在说话轨被压住的两个窗口补位，避免和说话轨重复喂：
+        #   ① 自动行动中（autoplay_state == "running"）；
+        #   ② 战斗中正在等本回合用户话语（_wait_for_turn_message + battle anchor）。
+        suppressed = self._state.autoplay_state == "running" or bool(
+            self._wait_for_turn_message and self._companion_session.anchor().get("battle_id")
+        )
+        if not suppressed:
+            return  # 说话轨本身会带上下文，不重复喂。
+        view = self._agent_view(snapshot)
+        if not view:
+            return
+        decision = self._companion_session.decision_state()
+        active = decision["active_plan"]
+        key = view_signature({"view": view, "revision": active.get("revision"), "status": active.get("status"),
+                              "remaining": [s.get("step_id") for s in active["remaining_steps"]],
+                              "action_sequence": decision["action_sequence"],
+                              "announced": decision["announced_plan"], "replacement_reason": decision["replacement_reason"]})
+        if key == self._state.last_host_context_key:
+            return
+        text = self._host_context_text(snapshot, view)
+        if not text:
+            return
+        self._state.last_host_context_key = key
+        self._push_host_context(text, coalesce_key="sts2:host_context")
+
+    def _host_context_text(self, snapshot: dict[str, Any], view: dict[str, Any]) -> str:
+        """把当前局面压成**紧凑速报**（宿主单条被动回调上限 1000 token）。
+
+        不能原样塞 agent_view/agent_facts/session：整包实测 28KB、峰值 48KB，而宿主
+        `_normalize_context_text_for_source` 会把一条 callback 截到 1000 token——
+        截在 JSON 中间既浪费带宽，本体读到的还是半截。这里只挑当下问题的答案：
+        在哪一屏、哪一层、轮到谁、血量、敌人意图/buff、自己的 buff 与充能球（含效果文本）。
+        """
+        bits: list[str] = []
+        screen = str(view.get("screen") or snapshot.get("screen") or "unknown")
+        floor = snapshot.get("floor") or view.get("floor")
+        act = snapshot.get("act") or view.get("act")
+        if act:
+            bits.append(f"第{act}幕")
+        if floor:
+            bits.append(f"第{floor}层")
+        bits.append(f"界面={screen}")
+        if screen == "COMBAT":
+            turn = snapshot.get("turn") or view.get("turn")
+            if turn is not None:
+                bits.append(f"回合{turn}")
+            combat = view.get("combat") if isinstance(view.get("combat"), dict) else {}
+            player = combat.get("player") if isinstance(combat.get("player"), dict) else {}
+            hp, max_hp = player.get("current_hp"), player.get("max_hp")
+            if isinstance(hp, (int, float)):
+                bits.append(f"我方生命{int(hp)}/{int(max_hp or 0)}")
+            if player.get("block"):
+                bits.append(f"格挡{player['block']}")
+            if isinstance(player.get("energy"), (int, float)):
+                bits.append(f"能量{player['energy']}")
+        head = "，".join(bits)
+        facts = build_agent_facts(snapshot.get("raw_state"))
+        details: list[str] = []
+        if facts.get("player_powers"):
+            details.append("我方效果：" + "、".join(str(item) for item in facts["player_powers"]))
+        if facts.get("orbs"):
+            orbs = []
+            for orb in facts["orbs"]:
+                effect = orb.get("effect")
+                orbs.append(f"{orb.get('name')}（{effect}）" if effect else str(orb.get("name")))
+            details.append("充能球：" + "、".join(orbs))
+        for enemy in facts.get("enemies") or []:
+            name = str(enemy.get("name") or f"敌人{enemy.get('index')}")
+            part = name
+            if enemy.get("intent"):
+                part += f" 意图={enemy['intent']}"
+            if enemy.get("powers"):
+                part += " 效果=" + "、".join(str(item) for item in enemy["powers"])
+            details.append(part)
+        if facts.get("potions"):
+            usable = [str(p.get("name")) for p in facts["potions"] if p.get("usable")]
+            if usable:
+                details.append("可用药水：" + "、".join(usable))
+        body = (
+            "游戏任务上下文（被动同步，仅供你了解当前局面，不必回应）："
+            "你正在操作自己的联机进程，以下是此刻的局势速报，宿主旧聊天只属历史。\n"
+            f"{head}"
+        )
+        decision = self._companion_session.decision_state()
+        plan = decision["active_plan"]
+        if plan.get("revision"):
+            labels = []
+            for step in plan["remaining_steps"][:5]:
+                d = step["description"]
+                label = d["card"].split("：", 1)[0][:45] or d["action_type"] + str(d["kwargs"])
+                if d["target"]:
+                    label += "→" + d["target"][:20]
+                labels.append(label)
+            body += f"\n计划版本={plan['revision']}，状态={plan['status']}，剩余打算=" + ("；".join(labels) or "无")
+        recent = [a for a in self._companion_session.actions
+                  if a.get("run_id") == view.get("run_id") and a.get("turn") == view.get("turn")][-3:]
+        if recent:
+            labels = []
+            for action in recent:
+                card = action.get("card") or {}
+                label = str(card.get("line") or card.get("name") or action["action_type"]).split("：", 1)[0][:45]
+                labels.append(f"{label}（{action['status']}）")
+            body += "\n最近动作：" + "；".join(labels)
+        announced = decision["announced_plan"]
+        if announced:
+            body += f"\n已说出的计划版本={announced['revision']}：{announced['text'][:120]}"
+        if decision["replacement_reason"]:
+            body += "\n旧计划取消原因：" + decision["replacement_reason"][:120]
+        body += "\n剩余计划是打算；pending 是等待完成，completed 才是完成。"
+        if details:
+            body += "\n" + "；".join(details)
+        return body
+
+    def _schedule_current_proactive_push(self, snapshot: dict[str, Any], body: str, *,
+                                         kind: str, priority: int) -> None:
+        """只把仍对应当前 agent_view 的主动观测交给宿主。"""
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(self._push_current_proactive(snapshot, body, kind=kind, priority=priority))
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+        except RuntimeError:
+            return
+
+    async def _push_current_proactive(self, snapshot: dict[str, Any], body: str, *,
+                                      kind: str, priority: int) -> None:
+        await asyncio.sleep(0.7)
+        if self._state.autoplay_state == "running":
+            return
+        try:
+            client = await self._ensure_companion_client()
+            current = await client.get_state()
+            expected_view = self._agent_view(snapshot)
+            current_view = self._agent_view(current)
+            if not expected_view or not current_view or view_signature(expected_view) != view_signature(current_view):
+                self.logger.info(
+                    "[sts2_host_push] drop stale proactive kind=%s expected=%s current=%s",
+                    kind, view_signature(expected_view), view_signature(current_view),
+                )
+                return
+            self._push_proactive_to_host(
+                body, kind=kind, priority=priority, prompt_ephemeral=True,
+                coalesce_key=f"sts2:proactive:{kind}",
+            )
+        except Exception as exc:
+            self.logger.info("[sts2_host_push] current-state recheck failed kind=%s: %s", kind, exc)
+
     def _remember_snapshot_metadata(self) -> None:
         snapshot = self._state.snapshot if isinstance(self._state.snapshot, dict) else {}
         payload = f"{snapshot.get('screen')}|{snapshot.get('floor')}|{snapshot.get('act')}|{snapshot.get('in_combat')}|{snapshot.get('available_action_count')}"
@@ -2427,9 +5192,6 @@ class STS2AutoplayService:
     # ---- 弹幕双线参数 -------------------------------------------------------------------
     # 高风险判据：血比低于此值，或敌人这一下的意图总伤害 >= 当前生命的一半。
     HIGH_RISK_HP_RATIO = 0.5
-    # 给本体的局势速报节流（秒）。**每次推送都会让本体开一次口**（ai_behavior="respond"），
-    # 所以这里不能像"只喂上下文"时那么密 —— 25 秒会让它一分钟讲两三次，成了刷屏。
-    HOST_DIGEST_MIN_INTERVAL_SECONDS = 75.0
     # 拿不到可执行动作持续多久才算"卡住"（要记日志 + 告诉本体）。跨屏切换时短暂拿不到动作是正常的：
     # 实测 2026-10-07 那次是 mod 认不出界面（只剩 save_and_quit），一卡就是两小时四十分。
     NO_OPERATION_STUCK_SECONDS = 20.0
@@ -2521,9 +5283,7 @@ class STS2AutoplayService:
             bits.append(f"我{int(player['current_hp'])}/{int(player.get('max_hp') or 0)}")
         if not bits:
             return ""
-        tails = ("喵！", "喵～", "喵。")
-        tail = tails[int(self._state.step_count) % len(tails)]
-        return "｜".join(bits) + " " + tail
+        return "｜".join(bits)
 
     def _should_emit_long_commentary(self, snapshot: dict[str, Any], payload: dict[str, Any]) -> bool:
         """要不要再让**本体**生成一条长讲解（即时短句之外的第二条线）。
@@ -2686,37 +5446,8 @@ class STS2AutoplayService:
         return f"{head}{screen}界面"
 
     def _push_host_situation_digest(self, snapshot: dict[str, Any], payload: dict[str, Any]) -> None:
-        """把局势**悄悄**交给本体，让它自己主动跟观众讲一句（不可见、不进记忆）。
-
-        两道闸门缺一不可：
-
-        - **只在场景/回合变化时**推（`_instant_line_key`）：否则同一局面每 tick 都想开口。
-        - **时间节流**：每次推送都会触发一次本体回合（`ai_behavior="respond"`），太密就是刷屏 + 烧 token。
-        """
-        notifier = self._frontend_notifier
-        if (notifier is None and self._sdk_ctx is None) or not self._danmaku_enabled:
-            return
-        if not getattr(self._state, "host_digest_enabled", True):
-            return
-        try:
-            key = self._instant_line_key(snapshot, payload)
-        except Exception:
-            return
-        if not key or key == self._state.last_host_digest_key:
-            return
-        now = time()
-        if now - self._state.last_host_digest_at < self.HOST_DIGEST_MIN_INTERVAL_SECONDS:
-            return
-        digest = self._situation_digest_text(snapshot, payload)
-        if not digest:
-            return
-        self._state.last_host_digest_key = key
-        self._state.last_host_digest_at = now
-        self._push_proactive_to_host(
-            f"当前对局情况：{digest}。用你自己的口吻跟观众说一句，别念稿、一两句就够。",
-            kind="situation_digest",
-            priority=4,
-        )
+        """兼容旧调用入口，统一使用事件驱动的主动交流。"""
+        self._deliver_catgirl_sync(snapshot)
 
     def _maybe_emit_catgirl_llm(self, snapshot: dict[str, Any], companion_evaluation: dict[str, Any], payload: dict[str, Any]) -> None:
         """catgirl 轨道：猫娘 LLM 生成点评（优先）或启发式 primary_message 兜底。
@@ -2801,15 +5532,17 @@ class STS2AutoplayService:
         """
         if not self._danmaku_enabled:
             return
-        client = self._client
-        if client is None or not text:
+        text = public_companion_text(text)
+        if not text:
             return
+        clients = {client.base_url: client for client in (self._host_client, self._companion_client()) if client is not None}
         avatar = await self._catgirl_avatar_base64() if fetch_avatar else self._cached_avatar_base64()
-        try:
-            await client.push_danmaku(text, style="catgirl", avatar=avatar)
-            self.logger.info("[sts2_catgirl_llm] pushed catgirl danmu to mod")
-        except Exception as exc:
-            self.logger.info("[sts2_catgirl_llm] push failed: %s", exc)
+        for client in clients.values():
+            try:
+                response = await client.push_danmaku(text, style="catgirl", avatar=avatar)
+                self.logger.info("[sts2_catgirl_llm] danmaku endpoint=%s result=%s", client.base_url, response)
+            except Exception as exc:
+                self.logger.info("[sts2_catgirl_llm] push failed endpoint=%s: %s", client.base_url, exc)
 
     async def _catgirl_llm_async(self, snapshot: dict[str, Any], payload: dict[str, Any], companion_evaluation: dict[str, Any] | None = None, scene_key: str = "") -> None:
         """异步生成猫娘点评并推 catgirl 弹幕；**LLM 没产出就退回启发式文本**（不能噤声）。
@@ -2857,32 +5590,8 @@ class STS2AutoplayService:
             self.logger.info("[sts2_catgirl_llm] exception %s kind=%s", exc, kind)
 
     async def _build_combat_prompt(self, snapshot: dict[str, Any], payload: dict[str, Any]) -> str:
-        """战斗 prompt：怪物行动意图 + 我方生命 + 当前层级；仅 combat_turn_changed 再加当前回合完整 line。
-
-        - 弹幕只响应 combat_started / available_actions_changed / combat_turn_changed 三个战斗事件；
-          只有 combat_turn_changed（回合推进，轮到玩家出牌）才带 line，其余两个只报基础三样，
-          避免 line 生成延迟或行动窗口未开时提示错误打法。其余事件（screen_changed 等）不触发。
-        - line 优先复用 loop_runner 的整回合缓存（_solver_plan_cached，按 run_id+turn 签名），
-          命中则不重复跑 /solver/plan 搜索；未命中/无战斗才回退调用 get_combat_plan()。
-          格式与 Mod 独立版 NekoDanmakuDriver.SolverHintAsync 一致。
-        """
+        """旧弹幕接口保留局面描述，不调用求解器生成出牌建议。"""
         steps_text = ""
-        try:
-            if str(payload.get("event_type") or "") == "combat_turn_changed":
-                plan: dict[str, Any] | None = None
-                loop_runner = getattr(self, "_loop_runner", None)
-                if loop_runner is not None:
-                    cache = getattr(loop_runner, "_solver_plan_cached", None)
-                    cache_sig = getattr(loop_runner, "_solver_plan_sig", None)
-                    if cache and cache_sig == _combat_plan_signature(snapshot):
-                        plan = cache
-                if plan is None and self._client is not None:
-                    fetched = await self._client.get_combat_plan()
-                    if fetched and fetched.get("in_combat"):
-                        plan = fetched
-                steps_text = self._format_plan_line(plan)
-        except Exception:
-            steps_text = ""
         # 怪物血量+意图 + 我方生命 + 当前层级。敌人带当前血量：payload["enemies"] 只有 name/intent，
         # 血量要从 snapshot.situation_summary.payload.enemies 取。
         enemies_pool = payload.get("enemies") if isinstance(payload.get("enemies"), list) else []
@@ -2952,7 +5661,7 @@ class STS2AutoplayService:
 
     def _push_catgirl_fallback(self, companion_evaluation: dict[str, Any], payload: dict[str, Any]) -> None:
         """兜底：推启发式 primary_message 到游戏内弹幕（原 catgirl 轨道文本来源）。"""
-        client = self._client
+        client = self._companion_client()
         if client is None:
             return
         catgirl_text = str(
@@ -2967,201 +5676,75 @@ class STS2AutoplayService:
                 self.logger.info("[sts2_catgirl_llm] fallback push failed")
 
     def _deliver_catgirl_sync(self, snapshot: dict[str, Any]) -> None:
-        catgirl_sync = snapshot.get("catgirl_sync") if isinstance(snapshot.get("catgirl_sync"), dict) else {}
-        payload = catgirl_sync.get("payload") if isinstance(catgirl_sync.get("payload"), dict) else {}
-        companion_evaluation = payload.get("companion_evaluation") if isinstance(payload.get("companion_evaluation"), dict) else {}
-        player_operation_observation = payload.get("player_operation_observation") if isinstance(payload.get("player_operation_observation"), dict) else {}
-        try:
-            self.logger.info(
-                "[sts2_push_debug] deliver_catgirl_sync should_sync=%s should_comment=%s force=%s fingerprint=%s last_fingerprint=%s min_interval=%s payload_keys=%s summary_kind=%s sync_priority=%s companion_trigger=%s player_op=%s queue_only=%s ai_behavior=%s message_len=%s",
-                catgirl_sync.get("should_sync"),
-                companion_evaluation.get("should_comment") if companion_evaluation else catgirl_sync.get("should_comment"),
-                catgirl_sync.get("force"),
-                catgirl_sync.get("fingerprint"),
-                self._state.last_sync_fingerprint,
-                catgirl_sync.get("min_interval_seconds"),
-                sorted(payload.keys()) if isinstance(payload, dict) else [],
-                payload.get("summary_kind") if isinstance(payload, dict) else None,
-                payload.get("sync_priority") if isinstance(payload, dict) else None,
-                payload.get("companion_trigger") if isinstance(payload, dict) else None,
-                player_operation_observation.get("event_type") if player_operation_observation else None,
-                payload.get("queue_only") if isinstance(payload, dict) else None,
-                payload.get("ai_behavior") if isinstance(payload, dict) else None,
-                len(str(payload.get("message") or payload.get("summary") or "")),
-            )
-        except Exception:
-            pass
-        if not payload:
+        # 被动局面上下文先喂——说话轨在自动行动/等待用户话语时会早退，那是"别抢话"
+        # 的正当理由，但不该连"本体知道现在什么情况"一起断掉（见 _deliver_host_context）。
+        self._deliver_host_context(snapshot)
+        # 自动行动的发言由同一次决策选择并等待播放；不再异步生成另一份旧局面回复。
+        if self._state.autoplay_state == "running":
             return
-        self._state.latest_sync_packet = dict(payload)
-        if not bool(catgirl_sync.get("should_sync")):
-            if str(companion_evaluation.get("trigger") or payload.get("trigger") or "") == "combat_turn":
-                try:
-                    self.logger.info(
-                        "[sts2_combat_turn_path] return=should_sync_false turn_key=%s last_turn_key=%s",
-                        companion_evaluation.get("turn_key"),
-                        self._state.last_companion_turn_key,
-                    )
-                except Exception:
-                    pass
-            try:
-                self.logger.info(
-                    "[sts2_push_debug] deliver_catgirl_sync skipped: should_sync false screen=%s summary_kind=%s sync_priority=%s",
-                    payload.get("screen"),
-                    payload.get("summary_kind"),
-                    payload.get("sync_priority"),
-                )
-            except Exception:
-                pass
+        if self._danmaku_enabled:
+            packet = snapshot.get("catgirl_sync") or {}
+            self._emit_instant_catgirl_line(snapshot, snapshot.get("companion_evaluation") or {}, packet.get("payload") or {})
+        # 等待本回合用户话语时，禁止异步生成与接下来决策无关的战斗回复。
+        if self._wait_for_turn_message and self._companion_session.anchor().get("battle_id"):
             return
-        # 先做指纹/间隔去重，再进入点评 —— 防刷屏统一由 _should_deliver_sync 把关。
-        # 否则点评(弹幕)不受节流控制，同一 fingerp指/场景反复刷屏。
-        if not self._should_deliver_sync(catgirl_sync):
-            if str(companion_evaluation.get("trigger") or payload.get("trigger") or "") == "combat_turn":
-                try:
-                    self.logger.info(
-                        "[sts2_combat_turn_path] return=should_deliver_sync_false turn_key=%s last_turn_key=%s fingerprint=%s",
-                        companion_evaluation.get("turn_key"),
-                        self._state.last_companion_turn_key,
-                        catgirl_sync.get("fingerprint"),
-                    )
-                except Exception:
-                    pass
-            print("[sts2_companion_sync:skip] reason=dedup_or_interval_gate")
-            try:
-                self.logger.info(
-                    "[sts2_push_debug] deliver_catgirl_sync skipped: _should_deliver_sync false fingerprint=%s last_fingerprint=%s last_sync_at=%s repeat_count=%s",
-                    catgirl_sync.get("fingerprint"),
-                    self._state.last_sync_fingerprint,
-                    self._state.last_sync_at,
-                    self._state.sync_repeat_count,
-                )
-            except Exception:
-                pass
+        view = self._agent_view(snapshot)
+        if not view or not self._state.host_digest_enabled:
             return
-        if companion_evaluation:
-            if str(companion_evaluation.get("trigger") or "") == "combat_turn":
-                try:
-                    self.logger.info(
-                        "[sts2_combat_turn_path] companion_eval trigger=%s should_comment=%s turn_key=%s last_turn_key=%s",
-                        companion_evaluation.get("trigger"),
-                        companion_evaluation.get("should_comment"),
-                        companion_evaluation.get("turn_key"),
-                        self._state.last_companion_turn_key,
-                    )
-                except Exception:
-                    pass
-            if str(companion_evaluation.get("trigger") or "") == "combat_turn":
-                try:
-                    self.logger.info(
-                        "[sts2_combat_turn_gate] should_comment=%s turn_key=%s last_turn_key=%s scene_key=%s eval_key=%s commentary=%s",
-                        companion_evaluation.get("should_comment"),
-                        companion_evaluation.get("turn_key"),
-                        self._state.last_companion_turn_key,
-                        companion_evaluation.get("scene_key"),
-                        companion_evaluation.get("evaluation_key"),
-                        str(companion_evaluation.get("commentary") or "")[:120],
-                    )
-                except Exception:
-                    pass
-            if not bool(companion_evaluation.get("should_comment", True)):
-                if str(companion_evaluation.get("trigger") or "") == "combat_turn":
-                    try:
-                        self.logger.info(
-                            "[sts2_combat_turn_path] return=should_comment_false turn_key=%s last_turn_key=%s eval_key=%s",
-                            companion_evaluation.get("turn_key"),
-                            self._state.last_companion_turn_key,
-                            companion_evaluation.get("evaluation_key"),
-                        )
-                    except Exception:
-                        pass
-                try:
-                    self.logger.info(
-                        "[sts2_push_debug] deliver_catgirl_sync skipped: companion should_comment false trigger=%s turn_key=%s scene_key=%s evaluation_key=%s commentary_len=%s",
-                        companion_evaluation.get("trigger"),
-                        companion_evaluation.get("turn_key"),
-                        companion_evaluation.get("scene_key"),
-                        companion_evaluation.get("evaluation_key"),
-                        len(str(companion_evaluation.get("commentary") or "")),
-                    )
-                except Exception:
-                    pass
-                return
-        if not bool(catgirl_sync.get("force")) and not self._should_allow_push_by_probability(companion_mode=self._companion_mode_active()):
-            try:
-                self.logger.info(
-                    "[sts2_push_debug] deliver_catgirl_sync skipped: probability_gate companion_mode=%s autoplay_state=%s companion_probability=%.3f autoplay_probability=%.3f",
-                    self._companion_mode_active(),
-                    self._state.autoplay_state,
-                    self._cfg_companion_push_probability(),
-                    self._cfg_autoplay_push_probability(),
-                )
-            except Exception:
-                pass
+        screen = str(view.get("screen") or "")
+        combat = view.get("combat") or {}
+        anchor = self._companion_session.anchor()
+        living = [enemy.get("i", enemy.get("index")) for enemy in combat.get("enemies") or []
+                  if enemy.get("alive", enemy.get("is_alive", True))]
+        previous = self._proactive_observation
+        observation = {**anchor, "screen": screen, "living": living}
+        self._proactive_observation = observation
+        result_changed = previous.get("battle_id") == anchor.get("battle_id") and len(living) < len(previous.get("living") or [])
+        if screen == "COMBAT":
+            if not (combat.get("end_turn_will_kill_player") or any(
+                risk.get("will_kill_player") for risk in combat.get("lethal_risks") or []
+            )):
+                if result_changed:
+                    kind = "combat_result"
+                elif previous.get("battle_id") != anchor.get("battle_id") or previous.get("turn") != anchor.get("turn"):
+                    kind = "combat_turn"
+                else:
+                    return
+            else:
+                kind = "danger"
+        elif screen in {"MAIN_MENU", "MULTIPLAYER_LOBBY", "CHARACTER_SELECT"}:
             return
-        # 弹幕**双线**（解决"都到下一个场景了才刷出上一个场景的弹幕"）：
-        #   ① 即时短句：完全不调 LLM，用手里的信息拼一句话立刻推 —— 弹幕才跟得上画面；
-        #   ② 高风险详解：只有血低/要挨重击时才再用**本体的模型与人设**补一条讲解。
-        # 实测点评生成平均 5~10 秒（主系统是推理模型，每次约 450~520 个思考 token），
-        # 等它出来画面早换了；所以"及时"只能靠①，"讲得好"才靠②。场景已变的话②直接丢弃。
-        self._emit_instant_catgirl_line(snapshot, companion_evaluation, payload)
-        self._push_host_situation_digest(snapshot, payload)
-        if self._should_emit_long_commentary(snapshot, payload):
-            self._maybe_emit_catgirl_llm(snapshot, companion_evaluation, payload)
-        # 点评改走游戏内弹幕（上方 _maybe_emit_catgirl_llm -> mod /danmaku，文本+头像），不再经 push_message 发 NEKO。
-        push_scene_key = f"{payload.get('screen')}|{payload.get('summary_kind')}|{payload.get('trigger')}"
-        push_reason = str(catgirl_sync.get("reason") or "")
-        trigger = str(companion_evaluation.get("trigger") or payload.get("trigger") or "")
-        turn_key = str(companion_evaluation.get("turn_key") or "")
-        scene_key = str(companion_evaluation.get("scene_key") or "")
-        evaluation_key = str(companion_evaluation.get("evaluation_key") or "")
-        if trigger == "combat_turn":
-            try:
-                self.logger.info(
-                    "[sts2_combat_turn_commit] before trigger=%s turn_key=%s last_turn_key=%s eval_key=%s",
-                    trigger,
-                    turn_key,
-                    self._state.last_companion_turn_key,
-                    evaluation_key,
-                )
-            except Exception:
-                pass
-        if trigger == "combat_turn" and turn_key:
-            self._state.last_companion_turn_key = turn_key
-            self._state.last_companion_combat_comment_key = turn_key
-            self._state.last_companion_scene_key = ""
-            self._state.last_companion_evaluation_key = evaluation_key
-            try:
-                self.logger.info(
-                    "[sts2_combat_turn_commit] after trigger=%s turn_key=%s last_turn_key=%s eval_key=%s",
-                    trigger,
-                    turn_key,
-                    self._state.last_companion_turn_key,
-                    self._state.last_companion_evaluation_key,
-                )
-            except Exception:
-                pass
-        elif trigger == "scene_entry" and scene_key:
-            self._state.last_companion_scene_key = scene_key
-            self._state.last_companion_evaluation_key = evaluation_key
-        self._state.touch_sync()
-        self._state.last_sync_fingerprint = str(catgirl_sync.get("fingerprint") or "")
-        self._state.last_sync_screen = str(payload.get("screen") or "")
-        self._state.last_sync_summary_kind = str(payload.get("summary_kind") or "")
-        self._state.last_sync_reason = str(catgirl_sync.get("reason") or "")
-        self._state.last_push_scene_key = push_scene_key
-        self._state.last_push_reason = push_reason
-        self._state.last_push_step_count = self._state.step_count
-        self._state.last_push_at = time()
-        self._state.sync_repeat_count = 0
-        self._state.remember_delivery(
-            {
-                "kind": "catgirl_sync",
-                "screen": payload.get("screen"),
-                "summary_kind": payload.get("summary_kind"),
-                "synced_at": time(),
-            }
+        else:
+            kind = "decision:" + screen
+        if self._companion_session.facts.get("last_outcome"):
+            outcome = self._companion_session.facts["last_outcome"]
+        else:
+            outcome = {}
+        key = (view_signature({"anchor": anchor, "kind": kind, "living": living})
+               if kind in {"combat_turn", "combat_result", "danger"}
+               else view_signature({"run_id": view.get("run_id"), "screen": screen,
+                                    "choice": view.get({"REWARD": "reward", "MAP": "map", "EVENT": "event",
+                                                        "SHOP": "shop", "REST_SITE": "rest"}.get(screen, "selection"))}))
+        last_key, last_at = self._companion_push_keys.get(kind, ("", 0.0))
+        now = time()
+        if key == last_key or (kind not in {"danger", "combat_result", "combat_turn"} and now - last_at < 8):
+            return
+        self._companion_push_keys[kind] = (key, now)
+        body = (
+            "联机现场：agent_view 是本次观测，session 记录本局对话和执行结果。"
+            "按人格和现场感受决定是否简短回应。此消息用于交流，游戏动作由自动行动循环执行。\n"
+            + json.dumps({"agent_view": view, "agent_facts": build_agent_facts(snapshot.get("raw_state")),
+                          "session": self._companion_session.context(),
+                          "last_action_outcome": outcome}, ensure_ascii=False)
         )
+        # 状态推送和宿主回复是异步的。选牌/奖励/事件等决策界面经常只存在一个轮询周期，
+        # 延迟一个短窗口并重新读取 agent_view，避免界面已经回到战斗后宿主还按旧画面回复。
+        if kind.startswith("decision:"):
+            self._schedule_current_proactive_push(
+                snapshot, body, kind=kind, priority=7 if kind == "danger" else 4,
+            )
+        else:
+            self._push_proactive_to_host(body, kind=kind, priority=7 if kind == "danger" else 4)
 
     def _host_reply_text(self, text: str, *, limit: int = 30) -> str:
         normalized = " ".join(str(text or "").split())
@@ -3207,10 +5790,13 @@ class STS2AutoplayService:
             # 只推轻量摘要，不塞整包 /state（snapshot 里含完整 raw_state，几十 MB；塞进状态/IPC 会触发
             # NEKO 端 ZMQ 反序列化错误 / 超时）。需要全量就单独走 refresh_state / get_snapshot。
             light_keys = ("screen", "floor", "act", "in_combat", "run_id", "character", "turn", "available_action_count", "summary_kind", "state_signature")
-            self._report_status({
+            payload = {
                 "source": "sts2_autoplay",
                 "transport_state": self._state.transport_state,
-                "last_error": self._state.last_error,
+                "last_error": self._state.decision_error or self._state.last_error,
+                "decision_errors": self._state.decision_errors,
+                "input_warning": self._state.input_warning,
+                "retry_at": self._state.retry_at,
                 "snapshot": {k: snap.get(k) for k in light_keys if k in snap},
                 "standby": self._state.standby,
                 "autoplay_state": self._state.autoplay_state,
@@ -3219,6 +5805,11 @@ class STS2AutoplayService:
                 # 让"它不动了"变成看得见的事实，而不是要玩家自己盯出来。
                 "stuck_reason": self._state.stuck_reason,
                 "sse_reconnect_count": getattr(self._state, "sse_reconnect_count", 0),
-            })
+            }
+            key = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            if key == self._reported_status_key and time() - self._reported_status_at < 3:
+                return
+            self._report_status(payload)
+            self._reported_status_key, self._reported_status_at = key, time()
         except Exception:
             pass
