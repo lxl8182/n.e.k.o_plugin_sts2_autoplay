@@ -118,7 +118,7 @@ _INTENT_TYPE_LABELS: dict[str, str] = {
     "stun": "眩晕",
     "escape": "逃跑",
 }
-# "还没决定 / 没数据"的哨兵值 —— 这些**什么都不说**，别念 `UNSET_MOVE` 给观众听。
+# "还没决定 / 没数据"的哨兵值 —— 这些**什么都不说**，别把 `UNSET_MOVE` 念出来给人听。
 _INTENT_UNKNOWN_KEYS = frozenset({"", "unset", "unsetmove", "none", "null", "unknown", "unknownmove"})
 
 
@@ -171,6 +171,48 @@ def _enemy_intent_label(enemy: Any, raw_enemy: Any = None) -> str:
 
 
 class STS2CompanionEvaluator:
+    #: ════════════════════════════════════════════════════════════════════════
+    #: ★★ 人称契约（VOICE CONTRACT）—— 冻结区，改文案前必读
+    #: ════════════════════════════════════════════════════════════════════════
+    #:
+    #: 玩家指示（2026-10-18）：
+    #:   「整个插件都需要是第一人称，注意一下包裹关系」
+    #:   「插件就是猫娘的反射弧，没人会把反射作为第三者吧」
+    #:
+    #: 核心不变量：**猫娘是唯一主体。插件不是她的代言人，是她的一部分。**
+    #:   绝不出现「插件」「求解器」作为第三方在说话；也不出现「建议…理由：…」
+    #:   这种**转达/汇报**口吻 —— 那等于把反射弧说成身外之物。
+    #:
+    #: ── 三层包裹关系（**只有 A/B 用第一人称，C 必须保持第三人称**）──────
+    #:
+    #: 【A 层】猫娘 → 玩家 直接说的话          ⇒ **第一人称「我」**
+    #:     companion.suggestion.* / companion.eval.* / companion.reminder.*
+    #:     判据：这段话是猫娘对玩家说的。
+    #:       ✗「建议这回合先出 打击。理由：…」   ← 汇报口吻
+    #:       ✓「这回合我先打『打击』」           ← 她自己的动作
+    #:
+    #: 【B 层】喂给猫娘自己的上下文（她读的局面）  ⇒ **第一人称「我」**
+    #:     summary.*
+    #:     判据：猫娘就在这个局面里，「玩家」是把自己当外人的错误视角。
+    #:       ✗「当前战斗状态，玩家血量 {hp}…」
+    #:       ✓「当前战斗状态，我的血量 {hp}…」
+    #:
+    #: 【C 层】宿主/系统在**描述**猫娘              ⇒ **保持第三人称「她」**
+    #:     entries.*（NEKO 的按钮标签）/ plugin.* / tools.* / errors.* / status.*
+    #:     判据：这是**玩家在操作猫娘**的界面文字，不是猫娘说的话。
+    #:       ✓「让她自己玩起来」  ← 玩家按的按钮
+    #:       ✗「我要自己玩起来」  ← 主语错位（那是猫娘的自言自语，不是按钮）
+    #:
+    #: ★ 判别口诀：**这段字是"猫娘对玩家说"还是"宿主在对玩家描述猫娘"？**
+    #:   前者第一人称，后者第三人称。**不要无差别全局替换。**
+    #:
+    #: ⚠️ 修改文案时**必须同时改两处**，否则会静默漂移：
+    #:   1) i18n/*.json 里的值
+    #:   2) 代码里的 `default="..."` 内联兜底（`self.t(key, default=...)`）
+    #:   两者不一致时，i18n 命中就用 JSON、缺失就用 default —— 漏改一处
+    #:   会在语言切换/键缺失时露出错误的旧口吻。
+    #: ════════════════════════════════════════════════════════════════════════
+
     def __init__(self, i18n: Any) -> None:
         self._i18n = i18n
         self._planner = STS2HeuristicPlanner()
@@ -268,33 +310,42 @@ class STS2CompanionEvaluator:
         return "low"
 
     def _focus(self, *, summary_kind: str, payload: dict[str, Any]) -> str:
+        """★ 2026-10-19 第一人称改造：这一组原来有**主语残缺**的旁白腔
+        （"先看…"、"优先看…"），读起来像系统在列检查项，不像猫娘在说自己想什么。
+        ⇒ 统一补上「我想」。
+
+        ⚠️ 这 8 个键**在 JSON 里没有条目**（只存在于内联 default），
+           所以只改 JSON 的手法是碰不到它们的 —— 它们是靠契约测试
+           （`test_ab_layer_has_first_person_viewpoint`）才被查出来的。
+        """
         if summary_kind == "combat":
-            return self.t("companion.focus.combat", default="先看生存、格挡与怪物意图")
+            return self.t("companion.focus.combat", default="我想先看生存、格挡和怪物意图")
         if summary_kind == "reward":
-            return self.t("companion.focus.reward", default="优先看是否贴合当前构筑方向")
+            return self.t("companion.focus.reward", default="我想看它贴不贴合当前构筑方向")
         if summary_kind == "selection":
-            return self.t("companion.focus.selection", default="优先看长期精简与构筑质量")
+            return self.t("companion.focus.selection", default="我想看长期精简和构筑质量")
         if summary_kind == "map":
-            return self.t("companion.focus.map", default="优先看路线风险与成长窗口")
+            return self.t("companion.focus.map", default="我想看路线风险和成长窗口")
         if summary_kind == "event":
-            return self.t("companion.focus.event", default="优先看代价与长期收益")
+            return self.t("companion.focus.event", default="我想看代价和长期收益")
         if summary_kind == "shop":
-            return self.t("companion.focus.shop", default="优先看金币效率与删牌机会")
+            return self.t("companion.focus.shop", default="我想看金币效率和删牌机会")
         if summary_kind == "rest":
-            return self.t("companion.focus.rest", default="优先看保血还是升级更值")
-        return self.t("companion.focus.general", default="优先看当前局势和下一步选择")
+            return self.t("companion.focus.rest", default="我想看保血还是升级更值")
+        return self.t("companion.focus.general", default="我想看当前局势和下一步选择")
 
     def _evaluation(self, *, summary_kind: str, risk_level: str, focus: str, strategy_name: str, trigger: str, player_operation_observation: dict[str, Any]) -> str:
         if player_operation_observation:
             observation_summary = str(player_operation_observation.get("summary") or "").strip()
             if observation_summary:
-                return self.t("companion.eval.player_operation", default="玩家刚完成操作：{summary}。", summary=observation_summary)
+                # ★ "玩家刚完成操作" → "你刚完成操作"：猫娘在对玩家说话，不是旁白在第三人称报告
+                return self.t("companion.eval.player_operation", default="你刚完成操作：{summary}。", summary=observation_summary)
         prefix = {
             "high": self.t("companion.eval.high", default="当前局势偏危险"),
             "medium": self.t("companion.eval.medium", default="当前局势需要仔细取舍"),
             "low": self.t("companion.eval.low", default="当前局势相对平稳"),
         }.get(risk_level, self.t("companion.eval.default", default="当前局势需要观察"))
-        template = self.t("companion.eval.template", default="{prefix}，按 {strategy_name} 策略应当 {focus}。", prefix=prefix, strategy_name=strategy_name, focus=focus)
+        template = self.t("companion.eval.template", default="{prefix}，按 {strategy_name} 策略我想 {focus}。", prefix=prefix, strategy_name=strategy_name, focus=focus)
         if trigger == "combat_turn":
             return self.t("companion.eval.combat_turn", default="回合更新：{template}", template=template)
         if trigger == "scene_entry":
@@ -329,75 +380,132 @@ class STS2CompanionEvaluator:
         incoming = sum(self._safe_int(enemy.get("intent_damage")) for enemy in enemies if isinstance(enemy, dict))
         enemy_intents = [str(enemy.get("intent") or enemy.get("move_id") or "") for enemy in enemies if isinstance(enemy, dict)]
         if any(intent in {"SHRINKER_MOVE", "CHARGE_UP_MOVE", "ENERGY_ORB_MOVE"} for intent in enemy_intents):
-            return self.t("companion.suggestion.combat_intent_window", default="这回合可抓机会输出。")
+            return self.t("companion.suggestion.combat_intent_window", default="这回合我想抓机会输出。")
         if incoming > block:
-            return self.t("companion.suggestion.combat_defense", default="建议优先防御或找减伤线。")
-        return self.t("companion.suggestion.combat_value", default="建议优先寻找高收益出牌线。")
+            return self.t("companion.suggestion.combat_defense", default="我想先垫防御，或者找条减伤线。")
+        return self.t("companion.suggestion.combat_value", default="我想找收益更高的出牌线。")
 
-    def _combat_reason_text(self, payload: dict[str, Any], selected_card: dict[str, Any], target_name: str) -> str:
-        player = payload.get("player") if isinstance(payload.get("player"), dict) else {}
-        enemies = payload.get("enemies") if isinstance(payload.get("enemies"), list) else []
-        block = self._safe_int(player.get("block"))
-        incoming = sum(self._safe_int(enemy.get("intent_damage")) for enemy in enemies if isinstance(enemy, dict))
-        remaining_block_needed = max(0, incoming - block)
-        damage = self._planner._card_damage(selected_card)
-        card_block = self._planner._card_block(selected_card)
-        if target_name and damage > 0:
-            target = next(
-                (enemy for enemy in enemies if isinstance(enemy, dict) and str(enemy.get("name") or enemy.get("enemy_id") or "").strip() == target_name),
-                None,
-            )
-            target_hp = self._safe_int(target.get("current_hp") if isinstance(target, dict) else None)
-            if target_hp is not None and target_hp > 0 and damage >= target_hp:
-                return self.t(
-                    "companion.suggestion.combat_reason.lethal",
-                    default="这张牌预计能打出 {damage} 点伤害，足以先收掉【{target_name}】。",
-                    damage=damage,
-                    target_name=target_name,
-                )
-        if card_block > 0 and incoming > block:
+    def _combat_solver_suggestion(self, payload: dict[str, Any], directives: dict[str, Any]) -> str:
+        """战斗台词：**说求解器的选择**，用第一人称。
+
+        ★ 2026-10-18 重写（原 `_combat_heuristic_suggestion`）。
+        玩家指示：
+          「战斗完全交给求解器。战斗以外的才需要启发式评分。」
+          「猫娘点评不能出现插件说这种转达的字眼，插件就是猫娘的反射弧，
+            没人会把反射作为第三者吧」
+
+        ⇒ 两处语义修正：
+          1. **意见源**：不再用启发式评分挑牌（那是第二个意见源，会和实际出牌打架），
+             改为念**求解器**真正要打的那一步 —— 她说的话和她的手是同一个决定。
+          2. **人称**：不再有「建议……理由：……」这种报告口吻，改为
+             「这回合我打『X』」—— 她是主体，不是分析工具的输出端。
+
+        ★ 求解器不可用时的降级（`_combat_voice`）：
+          拿不到求解器计划时**不编造具体牌名**（编了就会和实际出牌不符，
+          反而暴露"她说的和做的不是一回事"）。此时只说局势层面的短句。
+        """
+        plan = payload.get("solver_plan") if isinstance(payload.get("solver_plan"), dict) else None
+        step = None
+        if plan and plan.get("in_combat"):
+            line = plan.get("line") if isinstance(plan.get("line"), list) else []
+            steps = (line[0].get("steps") if line and isinstance(line[0], dict) else None) or []
+            if steps and isinstance(steps[0], dict):
+                step = steps[0]
+        if not isinstance(step, dict):
+            return ""
+        kind = str(step.get("kind") or "").strip()
+
+        if kind == "end_turn":
             return self.t(
-                "companion.suggestion.combat_reason.block_gap",
-                default="敌方这回合大约会打出 {incoming} 点伤害，目前还差 {gap} 点防御，这张牌更稳。",
-                incoming=incoming,
-                gap=remaining_block_needed,
+                "companion.solver.end_turn",
+                default="这回合就这样，我收手了。",
             )
-        if damage > 0 and target_name:
+        if kind == "use_potion":
+            potion_name = _trim_trailing_punct(
+                _display_name(step.get("card_name") or step.get("choice_card_name") or step.get("card_id") or "")
+            )
+            if not potion_name:
+                return ""
             return self.t(
-                "companion.suggestion.combat_reason.target_pressure",
-                default="这张牌能先把伤害压到【{target_name}】身上，推进当前交换。",
+                "companion.solver.use_potion",
+                default="我先喝口『{potion_name}』。",
+                potion_name=potion_name,
+            )
+        if kind != "play_card":
+            return ""
+
+        card_name = _trim_trailing_punct(_display_name(step.get("card_name") or step.get("card_id") or ""))
+        if not card_name:
+            return ""
+        target_name = self._solver_step_target_name(payload, step)
+        if target_name:
+            return self.t(
+                "companion.solver.play_card_with_target",
+                default="这回合我打『{card_name}』，招呼 {target_name}。",
+                card_name=card_name,
                 target_name=target_name,
             )
-        if damage > 0:
-            return self.t(
-                "companion.suggestion.combat_reason.damage_value",
-                default="这张牌当前能提供更直接的输出收益。",
-            )
-        if card_block > 0:
-            return self.t(
-                "companion.suggestion.combat_reason.block_value",
-                default="这张牌能先把防御垫起来，让这一回合更安全。",
-            )
         return self.t(
-            "companion.suggestion.combat_reason.generic",
-            default="它更符合当前血量、能量、手牌和敌人意图。",
+            "companion.solver.play_card",
+            default="这回合我打『{card_name}』。",
+            card_name=card_name,
         )
 
+    def _solver_step_target_name(self, payload: dict[str, Any], step: dict[str, Any]) -> str:
+        """把求解器步里的 target_index 翻成敌人名（念名字才有"在场"感）。
+
+        ★★ 缺陷防御（2026-10-18 实测复现后修）：**必须区分"没目标"与"目标是 0 号"**。
+
+        原实现用 `self._safe_int(step.get("target_index"))`，而 `_safe_int(None) == 0`
+        （实测），于是：
+            防御牌 + target_index=None  →  被念成「招呼 异螨」  ❌ 编造目标
+            防御牌 + 无 target_index 键 →  同样被念成「招呼 异螨」❌
+            打击牌 + target_index=0     →  「招呼 异螨」         ✅ 唯一正确的情况
+
+        两种输入被折叠成同一个 0，**信息在进函数前就丢了**，所以判据不能是"数值"，
+        必须是"键在不在 / 值是不是 null"。
+
+        为什么这条特别要紧：弹幕是陪玩玩家**唯一**能看到的信息渠道（玩家自己打、
+        看不到求解器）。念错目标 = 让他去打错敌人。宁可不念目标，也不能念错。
+        """
+        if "target_index" not in step:
+            return ""
+        raw = step.get("target_index")
+        if raw is None or raw == "":
+            return ""
+        idx = self._safe_int(raw)
+        if idx is None:
+            return ""
+        enemies = payload.get("enemies") if isinstance(payload.get("enemies"), list) else []
+        if not (0 <= idx < len(enemies)):
+            return ""
+        enemy = enemies[idx]
+        if not isinstance(enemy, dict):
+            return ""
+        return _trim_trailing_punct(_display_name(enemy.get("name") or enemy.get("enemy_id") or ""))
+
     def _suggestion(self, *, summary_kind: str, payload: dict[str, Any], directives: dict[str, Any], trigger: str, player_operation_observation: dict[str, Any]) -> str:
+        """★ 2026-10-19 第一人称改造：这一组原来是「**建议**先看…」的旁白腔。
+
+        ⚠️ 与 `_focus` 一样，这 4 个键**在 JSON 里没有条目**（只在内联 default），
+           靠契约测试（`test_ab_layer_code_defaults_are_also_first_person`）查出。
+        """
         if player_operation_observation:
             event_type = str(player_operation_observation.get("event_type") or "")
             if event_type == "combat_ended":
-                return self.t("companion.suggestion.player_operation.combat_ended", default="建议先看奖励、遗物或后续路线，别急着无脑继续。")
+                return self.t("companion.suggestion.player_operation.combat_ended", default="我想先看看奖励、遗物和后面的路线，不急着无脑往下走。")
             if event_type == "choice_committed":
-                return self.t("companion.suggestion.player_operation.choice_committed", default="建议顺着这次选择继续观察局势，确认是否贴合当前构筑方向。")
+                return self.t("companion.suggestion.player_operation.choice_committed", default="我想顺着这次选择继续看局势，确认它贴不贴合当前构筑方向。")
             if event_type == "combat_turn_advanced":
-                return self.t("companion.suggestion.player_operation.turn_advanced", default="新回合已经开始，建议先看敌方意图、能量和可打出的牌。")
+                return self.t("companion.suggestion.player_operation.turn_advanced", default="新回合开始了，我想先看敌方意图、能量和能打的牌。")
             if event_type == "player_card_or_action_committed":
-                return self.t("companion.suggestion.player_operation.action_committed", default="这步已经落下，建议接着看伤害交换、护盾变化和下一张牌的收益。")
+                return self.t("companion.suggestion.player_operation.action_committed", default="这步已经落下，我想接着看伤害交换、护盾变化和下一张牌的收益。")
         if summary_kind == "combat":
-            heuristic_suggestion = self._combat_heuristic_suggestion(payload, directives)
-            if heuristic_suggestion:
-                return self._post_action_wrap(heuristic_suggestion, trigger)
+            # ★ 战斗台词 = 求解器要打的那一步（见 _combat_solver_suggestion 的说明）。
+            #   拿不到求解器计划就退到局势短句，**不编造牌名**。
+            solver_suggestion = self._combat_solver_suggestion(payload, directives)
+            if solver_suggestion:
+                return self._post_action_wrap(solver_suggestion, trigger)
             return self._combat_voice(payload)
         if summary_kind == "reward":
             reward_cards = payload.get("reward_cards") if isinstance(payload.get("reward_cards"), list) else []
@@ -408,18 +516,18 @@ class STS2CompanionEvaluator:
             preferred_text = _clean_preference(preferred[0]) if preferred else ""
             preferred_index = self._preferred_reward_index(payload, directives)
             if preferred_text:
-                base = self.t("companion.suggestion.reward_preferred", default="建议优先贴合策略偏好的奖励：{preferred}。", preferred=preferred_text)
+                base = self.t("companion.suggestion.reward_preferred", default="按我的策略，我更想要：{preferred}。", preferred=preferred_text)
             elif preferred_index is not None and 0 <= preferred_index < len(reward_cards):
                 reward_card = reward_cards[preferred_index] if isinstance(reward_cards[preferred_index], dict) else {}
                 reward_name = _trim_trailing_punct(_display_name(reward_card.get("name") or reward_card.get("card_id") or ""))
                 if reward_name:
-                    base = self.t("companion.suggestion.reward_named", default="当前奖励里可以重点看：{card_name}。", card_name=reward_name)
+                    base = self.t("companion.suggestion.reward_named", default="这几个奖励里，我想要 {card_name}。", card_name=reward_name)
                 elif preferred_index < len(reward_card_names):
-                    base = self.t("companion.suggestion.reward_named", default="当前奖励里可以重点看：{card_name}。", card_name=_trim_trailing_punct(_display_name(reward_card_names[preferred_index])))
+                    base = self.t("companion.suggestion.reward_named", default="这几个奖励里，我想要 {card_name}。", card_name=_trim_trailing_punct(_display_name(reward_card_names[preferred_index])))
                 else:
-                    base = self.t("companion.suggestion.reward_default", default="建议优先选择能补当前构筑短板的奖励。")
+                    base = self.t("companion.suggestion.reward_default", default="我想拿能补当前构筑短板的奖励。")
             else:
-                base = self.t("companion.suggestion.reward_default", default="建议优先选择能补当前构筑短板的奖励。")
+                base = self.t("companion.suggestion.reward_default", default="我想拿能补当前构筑短板的奖励。")
             return self._post_action_wrap(base, trigger)
         if summary_kind == "selection":
             selection_cards = payload.get("selection_cards") if isinstance(payload.get("selection_cards"), list) else []
@@ -429,13 +537,13 @@ class STS2CompanionEvaluator:
                 selection_card = selection_cards[preferred_index] if isinstance(selection_cards[preferred_index], dict) else {}
                 card_name = _trim_trailing_punct(_display_name(selection_card.get("name") or selection_card.get("card_id") or ""))
                 if card_name:
-                    base = self.t("companion.suggestion.selection_named", default="当前可处理的卡里，可以优先看：{card_name}。", card_name=card_name)
+                    base = self.t("companion.suggestion.selection_named", default="这些牌里我想处理 {card_name}。", card_name=card_name)
                 elif preferred_index < len(selection_card_names):
-                    base = self.t("companion.suggestion.selection_named", default="当前可处理的卡里，可以优先看：{card_name}。", card_name=_trim_trailing_punct(_display_name(selection_card_names[preferred_index])))
+                    base = self.t("companion.suggestion.selection_named", default="这些牌里我想处理 {card_name}。", card_name=_trim_trailing_punct(_display_name(selection_card_names[preferred_index])))
                 else:
-                    base = self.t("companion.suggestion.selection", default="建议优先精简低价值卡，保持牌组质量。")
+                    base = self.t("companion.suggestion.selection", default="我想先精简掉低价值的牌，保持牌组干净。")
             else:
-                base = self.t("companion.suggestion.selection", default="建议优先精简低价值卡，保持牌组质量。")
+                base = self.t("companion.suggestion.selection", default="我想先精简掉低价值的牌，保持牌组干净。")
             return self._post_action_wrap(base, trigger)
         if summary_kind == "map":
             travelable_nodes = payload.get("travelable_nodes") if isinstance(payload.get("travelable_nodes"), list) else []
@@ -451,18 +559,18 @@ class STS2CompanionEvaluator:
                 node_type = str(preferred_node.get("type") or preferred_node.get("node_type") or "") if isinstance(preferred_node, dict) else ""
                 node_label = _display_node_type(node_type)
                 if node_label:
-                    base = self.t("companion.suggestion.map_named", default="当前可走路线里，可以优先考虑：{node_type}。", node_type=node_label)
+                    base = self.t("companion.suggestion.map_named", default="能走的路线里，我更想走 {node_type}。", node_type=node_label)
                 else:
-                    base = self.t("companion.suggestion.map", default="建议优先选择更稳的成长路线，不要无意义贪战。")
+                    base = self.t("companion.suggestion.map", default="我更想走稳一点的成长路线，没必要贪这几场。")
             else:
-                base = self.t("companion.suggestion.map", default="建议优先选择更稳的成长路线，不要无意义贪战。")
+                base = self.t("companion.suggestion.map", default="我更想走稳一点的成长路线，没必要贪这几场。")
             return self._post_action_wrap(base, trigger)
         if summary_kind == "event":
             event_name = _trim_trailing_punct(payload.get("event_name") or payload.get("event_id") or "")
             if event_name:
-                base = self.t("companion.suggestion.event_named", default="当前事件 {event_name}，建议优先看代价可控且长期收益更高的选项。", event_name=event_name)
+                base = self.t("companion.suggestion.event_named", default="遇到 {event_name} 了，我想挑代价可控、长期更划算的那个。", event_name=event_name)
             else:
-                base = self.t("companion.suggestion.event", default="建议优先选择代价可控、长期收益更高的选项。")
+                base = self.t("companion.suggestion.event", default="我会挑代价可控、长期更划算的那个。")
             return self._post_action_wrap(base, trigger)
         if summary_kind == "shop":
             shop_cards = payload.get("shop_cards") if isinstance(payload.get("shop_cards"), list) else []
@@ -475,26 +583,26 @@ class STS2CompanionEvaluator:
                 shop_card = shop_cards[preferred_card_index] if isinstance(shop_cards[preferred_card_index], dict) else {}
                 item_name = str(shop_card.get("name") or shop_card.get("card_id") or "")
                 if item_name:
-                    base = self.t("companion.suggestion.shop_card_named", default="商店里可以先看看：{item_name}。", item_name=item_name)
+                    base = self.t("companion.suggestion.shop_card_named", default="商店里我想要 {item_name}。", item_name=item_name)
                 elif preferred_card_index < len(shop_card_names):
-                    base = self.t("companion.suggestion.shop_card_named", default="商店里可以先看看：{item_name}。", item_name=shop_card_names[preferred_card_index])
+                    base = self.t("companion.suggestion.shop_card_named", default="商店里我想要 {item_name}。", item_name=shop_card_names[preferred_card_index])
                 else:
-                    base = self.t("companion.suggestion.shop", default="建议优先考虑高价值购买或删牌，而不是随手消费。")
+                    base = self.t("companion.suggestion.shop", default="我想买真有用的，或者干脆删张牌，不乱花钱。")
             elif preferred_relic_index is not None and 0 <= preferred_relic_index < len(shop_relics):
                 shop_relic = shop_relics[preferred_relic_index] if isinstance(shop_relics[preferred_relic_index], dict) else {}
                 item_name = str(shop_relic.get("name") or shop_relic.get("relic_id") or "")
                 if item_name:
-                    base = self.t("companion.suggestion.shop_relic_named", default="商店里可以先看看遗物：{item_name}。", item_name=item_name)
+                    base = self.t("companion.suggestion.shop_relic_named", default="商店里我想要那件遗物 {item_name}。", item_name=item_name)
                 elif preferred_relic_index < len(shop_relic_names):
-                    base = self.t("companion.suggestion.shop_relic_named", default="商店里可以先看看遗物：{item_name}。", item_name=shop_relic_names[preferred_relic_index])
+                    base = self.t("companion.suggestion.shop_relic_named", default="商店里我想要那件遗物 {item_name}。", item_name=shop_relic_names[preferred_relic_index])
                 else:
-                    base = self.t("companion.suggestion.shop", default="建议优先考虑高价值购买或删牌，而不是随手消费。")
+                    base = self.t("companion.suggestion.shop", default="我想买真有用的，或者干脆删张牌，不乱花钱。")
             else:
-                base = self.t("companion.suggestion.shop", default="建议优先考虑高价值购买或删牌，而不是随手消费。")
+                base = self.t("companion.suggestion.shop", default="我想买真有用的，或者干脆删张牌，不乱花钱。")
             return self._post_action_wrap(base, trigger)
         if summary_kind == "rest":
-            return self._post_action_wrap(self.t("companion.suggestion.rest", default="建议结合当前血量决定是休息还是升级。"), trigger)
-        return self._post_action_wrap(self.t("companion.suggestion.general", default="建议先看当前局势，再决定是否执行动作。"), trigger)
+            return self._post_action_wrap(self.t("companion.suggestion.rest", default="我想先看血线，再定是歇一会儿还是升级。"), trigger)
+        return self._post_action_wrap(self.t("companion.suggestion.general", default="我先看看局势，再决定动不动。"), trigger)
 
     def _combat_voice(self, payload: dict[str, Any]) -> str:
         player = payload.get("player") if isinstance(payload.get("player"), dict) else {}
@@ -512,71 +620,6 @@ class STS2CompanionEvaluator:
         if hp_ratio <= 0.65:
             return self.t("companion.commentary.combat_low_hp", default="这血线看着就不太适合贪刀，先稳一稳。")
         return self.t("companion.commentary.combat_general", default="这手牌还能打，但别太上头。")
-
-    def _combat_heuristic_suggestion(self, payload: dict[str, Any], directives: dict[str, Any]) -> str:
-        summary_context = {
-            "payload": {
-                "decision_payload": {"guidance": {"pending": []}, "instructions": []},
-            }
-        }
-        snapshot = {
-            "raw_state": {
-                "combat": {
-                    "player": dict(payload.get("player") if isinstance(payload.get("player"), dict) else {}),
-                    "hand": self._combat_hand_from_payload(payload),
-                    "enemies": list(payload.get("enemies") if isinstance(payload.get("enemies"), list) else []),
-                }
-            }
-        }
-        preferences = self._combat_preferences(directives)
-        guidance_override = self._planner._guidance_override_from_payload(summary_context)
-        # 没有文本指令时，按局面推导攻防偏好：先找斩杀，再考虑保命
-        if not guidance_override:
-            if self._combat_has_lethal_play(payload):
-                guidance_override = {"prefer_attack": True, "prefer_lethal": True}
-            elif self._combat_needs_defense(payload):
-                guidance_override = {"prefer_defense": True}
-        preferred_card_index = self._planner._preferred_combat_card_index(snapshot, preferences, guidance_override)
-        hand = snapshot["raw_state"]["combat"]["hand"]
-        if preferred_card_index is None:
-            return ""
-        selected_card = next(
-            (
-                card for card in hand
-                if isinstance(card, dict) and self._safe_int(card.get("index")) == preferred_card_index
-            ),
-            None,
-        )
-        if not isinstance(selected_card, dict):
-            return ""
-        # 需要保命却没有可选防御牌 → 交给通用建议，不强行命名非防御牌
-        if guidance_override.get("prefer_defense") and not self._is_defensive_card(selected_card):
-            return ""
-        card_name = str(selected_card.get("name") or selected_card.get("card_id") or "").strip()
-        if not card_name:
-            return ""
-        enemies = snapshot["raw_state"]["combat"]["enemies"]
-        target_index = self._planner._preferred_target_for_card(selected_card, enemies)
-        target_name = ""
-        if target_index is not None and 0 <= target_index < len(enemies):
-            enemy = enemies[target_index]
-            if isinstance(enemy, dict):
-                target_name = str(enemy.get("name") or enemy.get("enemy_id") or "").strip()
-        reason = self._combat_reason_text(payload, selected_card, target_name)
-        if target_name:
-            return self.t(
-                "companion.suggestion.combat_named_with_target",
-                default="建议这回合先出 {card_name}，目标是【{target_name}】。理由：{reason}",
-                card_name=card_name,
-                target_name=target_name,
-                reason=reason,
-            )
-        return self.t(
-            "companion.suggestion.combat_named_without_target",
-            default="建议这回合先出 {card_name}。理由：{reason}",
-            card_name=card_name,
-            reason=reason,
-        )
 
     def _combat_has_lethal_play(self, payload: dict[str, Any]) -> bool:
         enemies = payload.get("enemies") if isinstance(payload.get("enemies"), list) else []
@@ -732,9 +775,9 @@ class STS2CompanionEvaluator:
             current_hp = self._safe_int(player.get("current_hp"))
             max_hp = max(1, self._safe_int(player.get("max_hp"), default=1))
             if max_hp > 0 and current_hp / max_hp <= 0.3:
-                return self.t("companion.reminder.low_hp", default="提醒：当前血量偏低，别为了贪输出吃不必要伤害。")
+                return self.t("companion.reminder.low_hp", default="你血不多了，别为了贪输出白挨这一下。")
         if must:
-            return self.t("companion.reminder.must", default="提醒：当前策略明确强调 {must}。", must=must[0])
+            return self.t("companion.reminder.must", default="按我的策略，{must} 这条得守住。", must=must[0])
         return ""
 
     def _safe_int(self, value: Any, default: int = 0) -> int:

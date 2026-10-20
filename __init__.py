@@ -15,6 +15,7 @@ if sys.platform == "win32":
         pass
 
 from plugin.sdk.plugin import Err, NekoPluginBase, Ok, SdkError, lifecycle, llm_tool, neko_plugin, plugin_entry, tr
+from plugin.sdk.plugin import ui as _ui
 
 from .dispatcher import STS2Dispatcher
 from .service import STS2AutoplayService
@@ -63,6 +64,41 @@ class STS2AutoplayPlugin(NekoPluginBase):
     async def shutdown(self, **_: Any):
         await self._service.shutdown()
         return Ok({"status": "shutdown"})
+
+    # ------------------------------------------------------------------
+    # Hosted surface UI context
+    # ------------------------------------------------------------------
+    #
+    # ★★ 为什么必须有这个 provider（踩了很久才定位，记下来）：
+    #
+    #   hosted surface 的按钮走 `call_surface_action` → `host.get_ui_context(context_id)`。
+    #   而 `host._collect_ui_actions()`（`core/host.py:1253-1261`）只收集**同时**带
+    #   `@ui.action` 的 entry：
+    #
+    #       ui_meta = _get_ui_action_meta(handler)
+    #       if not ui_meta:
+    #           continue          # ← 没有 @ui.action 的 entry 直接被跳过
+    #
+    #   于是 actions 白名单为空，面板上**每个按钮都会 403**
+    #   （"is not exposed by surface"）。
+    #
+    #   provider 缺失还有第二重后果：`get_ui_context` 直接报
+    #   "UI context not found"，连 context 里的 state 都拿不到。
+    #
+    #   这条路径的对错只在 `warnings` 里留一行，UI 上看不出区别，
+    #   所以它长期没被发现。参照实现见 `plugins/game_agent_minecraft/__init__.py:628`。
+    #
+    # ★ 返回**轻量快照**即可：surface 自己会通过 api.call 拉实时状态，
+    #   这里不做 lazy-start，避免每次取 context 都阻塞等连接握手。
+    @_ui.context(id="main")
+    async def main_ui_context(self, **_: Any) -> JsonObject:
+        """main 面板的只读上下文 provider（与 `plugin.toml` 的 panel context 对应）。"""
+        try:
+            status = await self._service.get_status()
+        except Exception:
+            self.logger.exception("[sts2_ui_context] get_status 失败，降级返回空快照")
+            status = {}
+        return {"status": status}
 
     @llm_tool(
         name="sts2_get_status",
@@ -191,6 +227,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         input_schema={"type": "object", "properties": {}},
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_health_check", label=tr("entries.sts2_health_check.name", default="sts2_health_check"), tone="default", group="status", order=10)
     async def sts2_health_check(self, **_: Any):
         async def action() -> JsonObject:
             payload = await self._service.health_check()
@@ -211,6 +248,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         input_schema={"type": "object", "properties": {}},
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_get_status", label=tr("entries.sts2_get_status.name", default="sts2_get_status"), tone="default", group="status", order=20)
     async def sts2_get_status(self, **_: Any):
         return await self._run_entry(self._service.get_status)
 
@@ -222,6 +260,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         input_schema={"type": "object", "properties": {}},
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_read_state", label=tr("entries.sts2_read_state.name", default="sts2_read_state"), tone="default", group="status", order=30)
     async def sts2_read_state(self, **_: Any):
         async def action() -> JsonObject:
             payload = await self._service.neko.get_readout()
@@ -248,6 +287,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         },
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_set_standby", label=tr("entries.sts2_set_standby.name", default="sts2_set_standby"), tone="default", group="mode", order=10)
     async def sts2_set_standby(self, standby: bool, **_: Any):
         return await self._run_entry(lambda: self._service.neko.set_standby(standby))
 
@@ -259,6 +299,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         input_schema={"type": "object", "properties": {}},
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_start_autoplay", label=tr("entries.sts2_start_autoplay.name", default="让它自己玩起来"), tone="primary", group="autoplay", order=10)
     async def sts2_start_autoplay(self, **_: Any):
         return await self._run_entry(self._service.neko.start_autoplay)
 
@@ -270,6 +311,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         input_schema={"type": "object", "properties": {}},
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_pause_autoplay", label=tr("entries.sts2_pause_autoplay.name", default="先停一下自动玩"), group="autoplay", order=20)
     async def sts2_pause_autoplay(self, **_: Any):
         return await self._run_entry(self._service.neko.pause_autoplay)
 
@@ -281,6 +323,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         input_schema={"type": "object", "properties": {}},
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_resume_autoplay", label=tr("entries.sts2_resume_autoplay.name", default="继续让它自己玩"), group="autoplay", order=30)
     async def sts2_resume_autoplay(self, **_: Any):
         return await self._run_entry(self._service.neko.resume_autoplay)
 
@@ -292,6 +335,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         input_schema={"type": "object", "properties": {}},
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_stop_autoplay", label=tr("entries.sts2_stop_autoplay.name", default="别让它自己玩了"), tone="danger", group="autoplay", order=40)
     async def sts2_stop_autoplay(self, **_: Any):
         return await self._run_entry(self._service.neko.stop_autoplay, finish=True)
 
@@ -307,6 +351,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         },
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_open_coop_room", label=tr("entries.sts2_open_coop_room.name", default="sts2_open_coop_room"), tone="default", group="coop", order=10)
     async def sts2_open_coop_room(self, host: bool = True, **_: Any):
         return await self._run_entry(lambda: self._service.open_coop_room(host=host))
 
@@ -318,6 +363,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         input_schema={"type": "object", "properties": {}},
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_enable_companion_mode", label=tr("entries.sts2_enable_companion_mode.name", default="sts2_enable_companion_mode"), tone="default", group="companion", order=10)
     async def sts2_enable_companion_mode(self, **_: Any):
         return await self._run_entry(lambda: self._service.neko.set_companion_mode(True))
 
@@ -329,6 +375,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         input_schema={"type": "object", "properties": {}},
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_disable_companion_mode", label=tr("entries.sts2_disable_companion_mode.name", default="sts2_disable_companion_mode"), tone="default", group="companion", order=20)
     async def sts2_disable_companion_mode(self, **_: Any):
         return await self._run_entry(lambda: self._service.neko.set_companion_mode(False))
 
@@ -349,6 +396,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         },
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_set_danmaku", label=tr("entries.sts2_set_danmaku.name", default="sts2_set_danmaku"), tone="default", group="companion", order=30)
     async def sts2_set_danmaku(self, enabled: bool = True, **_: Any):
         return await self._run_entry(lambda: self._service.neko.set_danmaku(enabled))
 
@@ -392,6 +440,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         },
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_set_host_digest", label=tr("entries.sts2_set_host_digest.name", default="sts2_set_host_digest"), tone="default", group="companion", order=40)
     async def sts2_set_host_digest(self, enabled: bool = True, **_: Any):
         async def action() -> JsonObject:
             payload = self._service.set_host_digest_enabled(bool(enabled))
@@ -418,6 +467,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         },
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_set_run_reflection", label=tr("entries.sts2_set_run_reflection.name", default="sts2_set_run_reflection"), tone="default", group="companion", order=50)
     async def sts2_set_run_reflection(self, enabled: bool = True, **_: Any):
         async def action() -> JsonObject:
             payload = self._service.set_run_reflection_enabled(bool(enabled))
@@ -463,6 +513,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         input_schema={"type": "object", "properties": {}},
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_continue_run", label=tr("entries.sts2_continue_run.name", default="sts2_continue_run"), tone="primary", group="run", order=10)
     async def sts2_continue_run(self, **_: Any):
         return await self._run_entry(self._service.neko.continue_saved_run, finish=True)
 
@@ -511,6 +562,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         },
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_set_route", label=tr("entries.sts2_set_route.name", default="sts2_set_route"), tone="default", group="route", order=10)
     async def sts2_set_route(self, mode: str = "safe", pick: Any = None, index: Any = None, **_: Any):
         async def action() -> JsonObject:
             payload = await self._service.neko.set_route(mode=mode, pick=pick, index=index)
@@ -574,6 +626,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         },
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_set_control_mode", label=tr("entries.sts2_set_control_mode.name", default="sts2_set_control_mode"), tone="default", group="mode", order=20)
     async def sts2_set_control_mode(self, mode: str = "program", **_: Any):
         async def action() -> JsonObject:
             payload = await self._service.neko.set_control_mode(mode)
@@ -704,6 +757,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         },
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_set_play_style", label=tr("entries.sts2_set_play_style.name", default="sts2_set_play_style"), tone="default", group="mode", order=30)
     async def sts2_set_play_style(self, style: str = "serious", **_: Any):
         async def action() -> JsonObject:
             payload = await self._service.neko.set_play_style(style)
@@ -731,6 +785,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         },
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_set_instance", label=tr("entries.sts2_set_instance.name", default="sts2_set_instance"), tone="default", group="mode", order=40)
     async def sts2_set_instance(self, instance: str = "host", **_: Any):
         return await self._run_entry(lambda: self._service.neko.set_instance(instance))
 
@@ -760,6 +815,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         input_schema={"type": "object", "properties": {}},
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_get_planned_operation", label=tr("entries.sts2_get_planned_operation.name", default="sts2_get_planned_operation"), tone="default", group="plan", order=10)
     async def sts2_get_planned_operation(self, **_: Any):
         async def action() -> JsonObject:
             payload = await self._service.neko.get_planned_operation()
@@ -780,6 +836,7 @@ class STS2AutoplayPlugin(NekoPluginBase):
         input_schema={"type": "object", "properties": {}},
         metadata={"agent_auto": False},
     )
+    @_ui.action(id="sts2_execute_planned_operation", label=tr("entries.sts2_execute_planned_operation.name", default="sts2_execute_planned_operation"), tone="default", group="plan", order=20)
     async def sts2_execute_planned_operation(self, **_: Any):
         return await self._run_entry(self._service.neko.execute_planned_operation, finish=True)
 

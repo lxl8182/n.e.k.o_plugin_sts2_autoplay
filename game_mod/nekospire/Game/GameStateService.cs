@@ -74,12 +74,19 @@ internal static class GameStateService
 
     public static GameStatePayload BuildStatePayload()
     {
+        return BuildStatePayloadCore();
+    }
+
+    private static GameStatePayload BuildStatePayloadCore()
+    {
         var currentScreen = ActiveScreenContext.Instance.GetCurrentScreen();
         var combatState = CombatManager.Instance.DebugOnlyGetState();
         var runState = RunManager.Instance.DebugOnlyGetState();
         var screen = ResolveScreen(currentScreen);
         var session = BuildSessionPayload(currentScreen, runState);
-        var availableActions = BuildAvailableActionNames(currentScreen, combatState, runState);
+        // ★ 必须在 BuildAvailableActionNames 之前算：动作清单要据此决定是否给 divine_crystal_sphere。
+        var crystalSphere = BuildCrystalSpherePayload(currentScreen);
+        var availableActions = BuildAvailableActionNames(currentScreen, combatState, runState, crystalSphere);
         var combat = BuildCombatPayload(combatState);
         var run = BuildRunPayload(currentScreen, combatState, runState);
         var multiplayer = BuildMultiplayerPayload(currentScreen, runState);
@@ -118,6 +125,7 @@ internal static class GameStateService
             timeline = timeline,
             chest = chest,
             @event = eventPayload,
+            crystal_sphere = crystalSphere,
             shop = shop,
             rest = rest,
             reward = reward,
@@ -467,6 +475,19 @@ internal static class GameStateService
             });
         }
 
+        // 水晶球"占卜"子屏：屏名是 EVENT，但不是 NEventRoom，choose_event_option 不管用。
+        // 单独给一个揭格子的动作，否则这一屏可用动作会退化成只剩 save_and_quit。
+        var crystalSphereHere = BuildCrystalSpherePayload(currentScreen);
+        if (crystalSphereHere != null && crystalSphereHere.active && !crystalSphereHere.is_finished)
+        {
+            descriptors.Add(new ActionDescriptor
+            {
+                name = "divine_crystal_sphere",
+                requires_target = false,
+                requires_index = true
+            });
+        }
+
         if (CanChooseCapstoneOption(currentScreen))
         {
             descriptors.Add(new ActionDescriptor
@@ -794,6 +815,39 @@ internal static class GameStateService
         }
     }
 
+    /// <summary>
+    /// 「当前屏**是不是**一个事件屏」——**唯一**的事件屏判据。
+    ///
+    /// 为什么不能直接写 `currentScreen is NEventRoom`：`ResolveScreen` 在认不出屏时会用
+    /// `ResolveScreenFromStaticRoom()` 兜底成 "EVENT"（见 :736-741 的说明与 2026-10-07 实测）。
+    /// 水晶球事件的"占卜"子屏类型是 `NCrystalSphereScreen`，兜底后屏名说这是 EVENT，
+    /// 但按类型判定说不是 —— 于是插件按屏名去找 `choose_event_option`，动作清单里却没有，
+    /// 自相矛盾，整局永久卡死。
+    ///
+    /// ★ 这就是为什么 `BuildEventPayload` 与 `CanChooseEventOption` **必须共用本函数**：
+    /// 只改一处会重新制造「屏名说能处理、守卫说不能」的矛盾，而且那种矛盾比两处都不改更难查，
+    /// 因为它让现象与代码看起来是一致的。
+    ///
+    /// 判据刻意**与 `ResolveScreen` 同源**：直接复用 `ResolveScreenFromStaticRoom()`，
+    /// 而不是另起一套"屏名/类型白名单"，否则两处又会各自漂移。
+    /// </summary>
+    private static bool IsEventScreen(IScreenContext? currentScreen)
+    {
+        if (currentScreen is NEventRoom)
+        {
+            return true;
+        }
+
+        // 屏类型认不出时才吃静态房间兜底 —— 与 ResolveScreen 的调用时序一致：
+        // 那里也是先 ResolveNonModalScreen，返回 UNKNOWN 才 fallback。
+        if (currentScreen != null && ResolveNonModalScreen(currentScreen) != "UNKNOWN")
+        {
+            return false;
+        }
+
+        return ResolveScreenFromStaticRoom() == "EVENT";
+    }
+
     public static bool CanEndTurn(IScreenContext? currentScreen, CombatState? combatState, bool requireButtonReady = true)
     {
         if (!CanUseCombatActions(currentScreen, combatState, out _, out var combatRoom))
@@ -984,7 +1038,8 @@ internal static class GameStateService
 
     public static bool CanChooseEventOption(IScreenContext? currentScreen)
     {
-        if (currentScreen is not NEventRoom)
+        // ★ 与 BuildEventPayload 共用 IsEventScreen —— 两处必须同源（见该函数注释）。
+        if (!IsEventScreen(currentScreen))
         {
             return false;
         }
@@ -1666,6 +1721,73 @@ internal static class GameStateService
         }
     }
 
+    private static int SafeReadInt(Func<int> getter, int fallback = 0)
+    {
+        try
+        {
+            return getter();
+        }
+        catch
+        {
+            return fallback;
+        }
+    }
+
+    /// <summary>
+    /// 读一个 int 属性（反射返回的是装箱 object，直接给 SafeReadInt 会类型不匹配）。
+    /// `gridAxis` 用于 `Vector2I`（GridSize）：0 取 X，1 取 Y，其它值原样转 int。
+    /// </summary>
+    private static int GetReflectedInt(object target, string propertyName, int gridAxis = -1)
+    {
+        var value = GetReflectedProperty(target, propertyName);
+        if (value == null)
+        {
+            return 0;
+        }
+
+        try
+        {
+            if (value is Vector2I v)
+            {
+                return gridAxis switch
+                {
+                    0 => v.X,
+                    1 => v.Y,
+                    _ => 0
+                };
+            }
+
+            return Convert.ToInt32(value);
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+
+    internal static object? GetReflectedField(object target, string fieldName)
+    {
+        try
+        {
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
+            for (var t = target.GetType(); t != null; t = t.BaseType)
+            {
+                var f = t.GetField(fieldName, flags);
+                if (f != null)
+                {
+                    return f.GetValue(target);
+                }
+            }
+
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private static string GetCardRulesText(CardModel? card)
     {
         if (card == null)
@@ -2213,7 +2335,11 @@ internal static class GameStateService
         return property?.GetValue(button) is not bool canTurnBeEnded || canTurnBeEnded;
     }
 
-    private static string[] BuildAvailableActionNames(IScreenContext? currentScreen, CombatState? combatState, RunState? runState)
+    private static string[] BuildAvailableActionNames(
+        IScreenContext? currentScreen,
+        CombatState? combatState,
+        RunState? runState,
+        CrystalSpherePayload? crystalSphere = null)
     {
         var names = new List<string>();
 
@@ -2346,6 +2472,12 @@ internal static class GameStateService
         if (CanChooseEventOption(currentScreen))
         {
             names.Add("choose_event_option");
+        }
+
+        // 水晶球"占卜"子屏：屏名是 EVENT 但不是 NEventRoom，choose_event_option 不管用。
+        if (crystalSphere != null && crystalSphere.active && !crystalSphere.is_finished)
+        {
+            names.Add("divine_crystal_sphere");
         }
 
         if (CanChooseCapstoneOption(currentScreen))
@@ -4003,7 +4135,8 @@ internal static class GameStateService
 
     private static EventPayload? BuildEventPayload(IScreenContext? currentScreen)
     {
-        if (currentScreen is not NEventRoom)
+        // ★ 与 CanChooseEventOption 共用 IsEventScreen —— 两处必须同源（见该函数注释）。
+        if (!IsEventScreen(currentScreen))
         {
             return null;
         }
@@ -4086,6 +4219,126 @@ internal static class GameStateService
         catch (Exception ex)
         {
             Log.Warn($"[NekoComm] Failed to build event payload on screen {currentScreen.GetType().FullName}: {ex}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 水晶球"占卜"子屏（`NCrystalSphereScreen`）的**专用状态层**。
+    ///
+    /// 为什么必须单开一层：这一屏的屏名会被 `ResolveScreenFromStaticRoom()` 兜底成 "EVENT"，
+    /// 但它**没有** `NEventRoom`，进小游戏后 `EventSynchronizer.GetLocalEvent()` 也不再有
+    /// 可选项 —— 于是 `event` 层是 null（或只剩事件标题），插件无从下手。
+    /// 而这一屏真正的可操作对象是 `CrystalSphereMinigame.cells[,]`（11x11）。
+    ///
+    /// 数据来源（全部 public，已反射核实，见 .dsh-artifacts/_t33_PROBE-SUMMARY.md）：
+    ///   NCrystalSphereScreen._entity         : CrystalSphereMinigame
+    ///   CrystalSphereMinigame.cells          : CrystalSphereCell[,]
+    ///   CrystalSphereMinigame.DivinationCount / IsFinished / GridSize / CrystalSphereTool
+    ///   CrystalSphereCell.IsHidden / X / Y / Item
+    ///
+    /// ★ 恢复力：`_entity` 是私有字段，走反射读取；任何一步失败都返回 null 而不是抛出，
+    ///   让上层退回"至少不卡死"的行为，绝不让读状态把整局弄崩。
+    /// </summary>
+    private static CrystalSpherePayload? BuildCrystalSpherePayload(IScreenContext? currentScreen)
+    {
+        try
+        {
+            if (currentScreen is not Node root)
+            {
+                return null;
+            }
+
+            // 只有真的是水晶球屏才建这一层 —— 不做"猜"。
+            if (!currentScreen.GetType().Name.Contains("CrystalSphere"))
+            {
+                return null;
+            }
+
+            var minigame = GetReflectedField(root, "_entity");
+            if (minigame == null)
+            {
+                return null;
+            }
+
+            var cellsObj = GetReflectedProperty(minigame, "cells") ?? GetReflectedField(minigame, "cells");
+            if (cellsObj is not Array cells)
+            {
+                return null;
+            }
+
+            var revealed = new List<CrystalSphereCellPayload>();
+            var candidates = new List<CrystalSphereCellPayload>();
+            var hiddenCount = 0;
+
+            foreach (var c in cells)
+            {
+                if (c == null)
+                {
+                    continue;
+                }
+
+                var isHidden = SafeReadBool(() => GetReflectedProperty(c, "IsHidden") is true);
+                var x = GetReflectedInt(c, "X");
+                var y = GetReflectedInt(c, "Y");
+                var item = GetReflectedProperty(c, "Item");
+
+                if (isHidden)
+                {
+                    hiddenCount++;
+                    // ★★★ 队长 ②「能力缺口」：隐藏格**必须给坐标**，不能只给一个数字。
+                    //   理由与 CANON §23 同源：**枚举要给出"有哪些可能"，而不是"有多少"**。
+                    //   只有 `cells_hidden = 37` 时，插件无从判断"该揭哪块"，只能瞎点 ——
+                    //   而"瞎点"正是 `_advance_custom_event_cursor` 当初的问题。
+                    //   ⇒ 这里输出**可点候选的坐标清单**，插件才真的能做决策。
+                    candidates.Add(new CrystalSphereCellPayload
+                    {
+                        x = x,
+                        y = y,
+                        item_type = "",
+                        item_name = ""
+                    });
+                    continue;
+                }
+
+                // 已揭开的格子：把 Item 类型说出来（CardReward/Curse/Gold/Potion/Relic）
+                if (item == null)
+                {
+                    continue;
+                }
+
+                var itemType = item.GetType().Name;
+                revealed.Add(new CrystalSphereCellPayload
+                {
+                    x = x,
+                    y = y,
+                    item_type = itemType,
+                    item_name = SafeReadString(() => GetReflectedProperty(item, "Name")?.ToString(), itemType)
+                });
+                // ★ 队长 ③：原来这里有个 `occupiedHiddenCount++`，**从未被 return 使用**（死变量），
+                //   而且名字与语义相反（它加在"未隐藏"分支）。已删除 ——
+                //   不留"看起来实现了、实则没接到"的变量（CANON §22.4 判据 E1，
+                //   与 t25 那个 `require_no_new_key` 死形参同形态）。
+            }
+
+            return new CrystalSpherePayload
+            {
+                active = true,
+                grid_width = GetReflectedInt(minigame, "GridSize", gridAxis: 0),
+                grid_height = GetReflectedInt(minigame, "GridSize", gridAxis: 1),
+                divinations_left = GetReflectedInt(minigame, "DivinationCount"),
+                is_finished = SafeReadBool(() => GetReflectedProperty(minigame, "IsFinished") is true),
+                tool = (GetReflectedProperty(minigame, "CrystalSphereTool")?.ToString() ?? "None"),
+                cells_total = cells.Length,
+                cells_hidden = hiddenCount,
+                cells_revealed = revealed.Count,
+                revealed_cells = revealed.ToArray(),
+                candidates = candidates.ToArray()
+            };
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"[NekoComm] Failed to build crystal sphere payload: {ex}");
             return null;
         }
     }
@@ -4346,6 +4599,30 @@ internal static class GameStateService
             return null;
 
         var submenuOpen = mainMenu.SubmenuStack?.SubmenusOpen == true;
+
+        // ★★ t33 顺手修掉 D10 的 **mod 侧根因**（既有缺陷，非本轮引入）。
+        //
+        // 【现象】MAIN_MENU 出现约 9 秒后，`/state` **永久 500**；`/health` 与
+        //   `/actions/available` 仍 200（它们不经过本方法）⇒ 自动游玩彻底失明。
+        // 【栈帧】（godot.log，2026-10-20 07:27:30 那次启动）
+        //   System.NullReferenceException
+        //     at NekoComm.Game.GameStateService.BuildMainMenuPayload(IScreenContext, RunState)
+        //     at NekoComm.Game.GameStateService.BuildStatePayloadCore()
+        //     at NekoComm.Game.GameStateService.BuildStatePayload()
+        //   ⇒ 交付 DLL 不带 PDB，栈帧**没有行号**，而这一行是
+        //     `RunManager.Instance.NetService.Type.IsMultiplayer()` 三个裸解引用串在一起
+        //     ⇒ 无法从栈帧判断断在哪一环。
+        // 【定位】t33 加了一次性诊断直接打每一环的值（`_t33` 系列日志）：
+        //     `RunManager.Instance null=False  NetService null=True  SubmenuStack null=False`
+        //   ⇒ ★ **就是 `NetService`**。`RunManager.Instance` 与 `mainMenu.SubmenuStack` 都正常。
+        //   ★ 注意 sts2.dll 的可空性标注把 `RunManager.NetService` 标成 `NotNull` —— **那是错的**：
+        //     该字段只在 `InitializeShared` 里赋值，主菜单早期尚未跑 ⇒ 实际为 null。
+        //     （教训：别信跨程序集的 `NotNull` 标注，要实测。）
+        // 【修法】改用 `IsMultiplayerRunSafe()` 逐级判空（与同文件 :3690 的
+        //   `netService?.GetRawLobbyIdentifier()` 同款自觉）。
+        // 【验证】修复后 MAIN_MENU 下 `/state` 连续 6/6 返回 200、27 个顶层键（修前 0/20）。
+        // 【旧 DLL 对照】回滚到昨晚原版 917C76F6C3F9E66A 同样复现（见 `_t33_state500.log`）
+        //   ⇒ 确认是既有缺陷，t26 只做了插件侧降级绕过，mod 侧根因一直没修。
         return new MainMenuPayload
         {
             has_resumable_run = CanContinueRun(currentScreen),
@@ -4353,8 +4630,31 @@ internal static class GameStateService
             submenu_open = submenuOpen,
             can_open_multiplayer_menu = CanOpenMultiplayerMenu(currentScreen),
             save_and_quit_available = CanSaveAndQuit(currentScreen, runState),
-            is_multiplayer_run = RunManager.Instance.NetService?.Type.IsMultiplayer() ?? false,
+            is_multiplayer_run = IsMultiplayerRunSafe(),
         };
+    }
+
+    /// <summary>
+    /// 安全判定"是否多人局"：`RunManager.Instance?.NetService?.Type` 逐级判空。
+    /// 任一级缺失都当作单人（与 `NetService.Type.IsMultiplayer()` 的默认语义一致 ——
+    /// 单人局的 `Type` 是单人枚举，不是 null）。
+    /// </summary>
+    private static bool IsMultiplayerRunSafe()
+    {
+        try
+        {
+            var netService = RunManager.Instance?.NetService;
+            if (netService == null)
+            {
+                return false;
+            }
+
+            return netService.Type.IsMultiplayer();
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static ModalPayload? BuildModalPayload(IScreenContext? currentScreen)
@@ -4998,7 +5298,7 @@ internal static class GameStateService
         };
     }
 
-    private static object? GetReflectedProperty(object target, string propertyName)
+    internal static object? GetReflectedProperty(object target, string propertyName)
     {
         try
         {
@@ -6129,6 +6429,9 @@ internal sealed class GameStatePayload
 
     public EventPayload? @event { get; init; }
 
+    /// <summary>水晶球"占卜"子屏（`NCrystalSphereScreen`）专用层；非该屏时为 null。</summary>
+    public CrystalSpherePayload? crystal_sphere { get; init; }
+
     public ShopPayload? shop { get; init; }
 
     public RestPayload? rest { get; init; }
@@ -6536,6 +6839,59 @@ internal sealed class EventOptionPayload
     public bool has_relic_preview { get; init; }
 
     public RunRelicPayload? relic_preview { get; init; }
+}
+
+/// <summary>
+/// 水晶球"占卜"子屏的状态层。见 <c>BuildCrystalSpherePayload</c> 的注释。
+/// </summary>
+internal sealed class CrystalSpherePayload
+{
+    public bool active { get; init; }
+
+    public int grid_width { get; init; }
+
+    public int grid_height { get; init; }
+
+    /// <summary>还能占卜几次（`CrystalSphereMinigame.DivinationCount`）。</summary>
+    public int divinations_left { get; init; }
+
+    public bool is_finished { get; init; }
+
+    /// <summary>`None` / `Small` / `Big` —— 对应当前选中的占卜工具。</summary>
+    public string tool { get; init; } = "None";
+
+    public int cells_total { get; init; }
+
+    public int cells_hidden { get; init; }
+
+    public int cells_revealed { get; init; }
+
+    public CrystalSphereCellPayload[] revealed_cells { get; init; } = Array.Empty<CrystalSphereCellPayload>();
+
+    /// <summary>
+    /// ★ 可点候选格子的**坐标清单**（即当前隐藏的格子）。
+    ///
+    /// 为什么不能只给 `cells_hidden` 这个数字：占卜的**核心决策就是"揭哪一块"**，
+    /// 而纯数量无法支撑决策（CANON §23：「枚举要给出**有哪些可能**，不只是**有多少**」）。
+    /// 插件据此才能算"哪块更值得揭"，而不是按下标瞎点。
+    ///
+    /// ★ 顺序与 `CrystalSphereMinigame.cells[,]` 的**遍历顺序一致**（行优先），
+    ///   而 mod 的 `divine_crystal_sphere` 的 `option_index` 也是按这个顺序数的
+    ///   ⇒ 插件可以直接用 `candidates[i]` 的坐标去选，序号天然对齐（无需自己算 y*width+x）。
+    /// </summary>
+    public CrystalSphereCellPayload[] candidates { get; init; } = Array.Empty<CrystalSphereCellPayload>();
+}
+
+internal sealed class CrystalSphereCellPayload
+{
+    public int x { get; init; }
+
+    public int y { get; init; }
+
+    /// <summary>`CardReward` / `Curse` / `Gold` / `Potion` / `Relic`。</summary>
+    public string item_type { get; init; } = string.Empty;
+
+    public string item_name { get; init; } = string.Empty;
 }
 
 internal sealed class RestPayload

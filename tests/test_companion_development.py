@@ -770,8 +770,14 @@ def test_output_ownership_recovery_keeps_output_id_and_failure_count(monkeypatch
             return httpx.Response(409, json={"detail": "Companion instance expired or replaced"})
         return httpx.Response(200, json={"ok": True, "text_sent": True})
     factory = httpx.AsyncClient
+
+    def _client_with_mock_transport(**kwargs):
+        # 生产代码可能自己传 transport（共享 internal client）；测试必须接管它。
+        kwargs["transport"] = httpx.MockTransport(handle)
+        return factory(**kwargs)
+
     monkeypatch.setattr("plugin.plugins.sts2_autoplay.service.httpx.AsyncClient",
-                        lambda **kwargs: factory(transport=httpx.MockTransport(handle), **kwargs))
+                        _client_with_mock_transport)
     async def sync(*, restore_state=True):
         assert restore_state is False
         service._ingress_active = recovered

@@ -12,9 +12,11 @@
     <Sts2DataDir Condition="'$(Sts2DataDir)' == '' and '$(Sts2DataDirFromEnv)' != ''">$(Sts2DataDirFromEnv)</Sts2DataDir>
     <Sts2DataDir Condition="'$(Sts2DataDir)' == ''">C:/Program Files (x86)/Steam/steamapps/common/Slay the Spire 2/data_sts2_windows_x86_64</Sts2DataDir>
   </PropertyGroup>
-  <!-- Link the pure Sim sources from the current mod tree (they are game-type-free). Game-coupled
-       files (SimBuild/SimCapture) are excluded so this runs without sts2.dll. -->
-  <!-- Run: see the command in Program.cs header. -->
+  <!-- Link the pure Sim sources (they are game-type-free) from the mod project itself. Game-coupled
+       files (SimBuild / SimCapture / SimSolverPlan) are excluded so this runs without sts2.dll.
+       T40: the old path was "..\neko_comm\Game\Sim\" — that directory does not exist (the sim sources
+       live in "..\nekospire\Game\Sim\"), so the whole gate failed with 15x CS2001 and the mod had no
+       runnable automated verification at all. -->
   <ItemGroup>
     <Reference Include="System.IO.Hashing">
       <HintPath>$(Sts2DataDir)/System.IO.Hashing.dll</HintPath>
@@ -37,5 +39,8 @@
     <Compile Include="..\nekospire\Game\Sim\SimOrb.cs" />
     <Compile Include="..\nekospire\Game\Sim\SimRelic.cs" />
     <Compile Include="..\nekospire\Game\Sim\SimOnPlay.cs" />
+    <!-- T40: the shared card-side coverage classifier (pure; the mod compiles the same file through
+         its default **/*.cs glob, so the gate tests the shipping logic, not a copy). -->
+    <Compile Include="..\nekospire\Game\Sim\SimCoverage.cs" />
   </ItemGroup>
 </Project>

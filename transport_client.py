@@ -2,9 +2,38 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from time import time
 from typing import Any, AsyncIterator, Dict
 
 import httpx
+
+
+def _internal_client() -> httpx.AsyncClient:
+    """本机 mod（127.0.0.1）专用 HTTP 客户端——**绝不经系统/环境代理**。
+
+    为什么必须共用宿主那个 client（而不是每次请求新建 `httpx.AsyncClient`）：
+
+    1. ★ **代理正确性（本函数的直接动因）**：httpx 默认 ``trust_env=True``，会读
+       ``HTTP_PROXY`` / ``HTTPS_PROXY`` 等环境变量；在 Windows 上它还会通过
+       ``urllib.request.getproxies()`` 读注册表的 WinINET 设置。
+       我方**只**访问 ``base_url``（本机 mod，``http://127.0.0.1:<port>``），
+       **没有任何合法场景需要经系统代理**。实测本机开着 FlClash
+       （``HKCU\\...\\Internet Settings``：``ProxyEnable=1``、``ProxyServer=127.0.0.1:7890``）；
+       系统本意是让 ``127.*`` 直连（``ProxyOverride`` 里有 ``127.*``），
+       但 **httpx 不读那个绕过列表** ⇒ 127.0.0.1 的请求被丢给 7890 ⇒ **HTTP 502**。
+       宿主的 ``utils/http/internal_client.py:107`` 用 ``trust_env=False`` + ``proxy=None``
+       从根上关掉这条路。
+    2. **性能**：`utils/http/internal_client.py:20-25` 记述每次新建 client 会**急切**初始化
+       SSLContext（读 certifi / Windows 证书库），即便访问的是纯 ``http://127.0.0.1``；
+       冷启动实测**最多 1.1 秒/次**，曾把 2 秒超时的接口打成"mosel server 响应超时"。
+
+    生命周期归宿主：此 client 按 event loop 共享（``_clients_by_loop``），
+    由 main_server 的 shutdown hook 关闭 ⇒ **调用方不得 `async with` 包裹它、不得 `aclose()`**。
+    超时**逐请求传**（``client.get(url, timeout=...)``），因为共享 client 带的是无关的默认值（5s）。
+    """
+    from utils.internal_http_client import get_internal_http_client
+
+    return get_internal_http_client()
 
 
 class STS2TransportError(RuntimeError):
@@ -49,6 +78,57 @@ class STS2ActionRejected(STS2TransportError):
             retryable = self.code in self.RETRYABLE_CODES
         self.retryable = bool(retryable)
 
+    # ★★ D11（t28）：游戏逐字告知"这个选项被锁"的判据。
+    #
+    #   实机真形状（2026-10-20 01:15:34 抓取，HTTP 409，`_t28_probe_reject.log`）：
+    #     {"ok": false, "request_id": "req_...",
+    #      "error": {"code": "invalid_target",
+    #                "message": "The selected event option is locked.",
+    #                "details": {"action": "choose_event_option", "option_index": 0},
+    #                "retryable": false}}
+    #
+    #   ★ 修复前**从未解析**这条信息：源码对 "The selected event option" 命中 **0**。
+    #   ★ 而它携带两个高价值信号：
+    #       ① `details.option_index` = 游戏**精确点名**了哪个选项被锁（比读 `is_locked` 更直接）；
+    #       ② `retryable: false` ⇒ 与本类 `RETRYABLE_CODES` 的推断**冲突**，
+    #          而这个显式值优先（见 `__init__` 的 `if retryable is None`）
+    #          ⇒ `invalid_target` 在**此处**并非"状态漂移、重算即可"，而是**确定不可选**。
+    #   ★ 为什么按"消息文本 + option_index 存在"判定而不是按屏判定：
+    #     `details` **不含 `screen`**（实测 `exc.screen == ''`）⇒ 无法从错误本身知道当前屏，
+    #     故不能写"EVENT 屏才这样"。改用**最强可用信号**：确切的 message 文本，
+    #     且要求 `option_index` 存在（战斗屏的越界错误不带该字段 ⇒ 天然不误伤）。
+    LOCKED_OPTION_MESSAGE_MARKERS = ("option is locked", "option locked")
+
+    @property
+    def is_locked_option_rejection(self) -> bool:
+        """这次拒收是否是「事件选项被锁」——**错误驱动**的精确判据。
+
+        ★ 安全边界（为什么不会误伤战斗屏的 `target_index` 越界）：
+          · 契约与实测均确认：`invalid_target` 在 EVENT 场景下**语义单一**
+            （全日志 `invalid_target` 文本去重只有 locked 这一种；
+              `play_card requires card_index` 是 `invalid_request`，**不同码**）；
+          · 进一步要求 **message 命中** locked 字样 —— 战斗屏越界的 message 是
+            `target_index is out of range for combat.enemies[]`，**不含** locked；
+          · 且要求 `details` 里**确有** `option_index`。
+          ⇒ 三条同时成立才判定，战斗屏**结构上不可能**命中。
+        """
+        if self.code != "invalid_target":
+            return False
+        text = str(self).lower()
+        if not any(marker in text for marker in self.LOCKED_OPTION_MESSAGE_MARKERS):
+            return False
+        return self.details.get("option_index") is not None
+
+    @property
+    def locked_option_index(self) -> int | None:
+        """被游戏点名锁定的选项下标；不是「被锁」类拒收时返回 `None`。"""
+        if not self.is_locked_option_rejection:
+            return None
+        try:
+            return int(self.details.get("option_index"))
+        except (TypeError, ValueError):
+            return None
+
     def as_dict(self) -> Dict[str, Any]:
         return {
             "code": self.code,
@@ -73,6 +153,18 @@ class STS2TransportClient:
         self.connect_timeout = connect_timeout
         self.request_timeout = request_timeout
         self._effect_catalogs: dict[str, dict[str, Any]] = {}
+        # ★★ t14/D4（批 2）：**最后一次收到业务事件（非心跳）的时刻**。
+        #
+        # 为什么需要它（实机证据，2026-10-19）：mod 每 ~1s 发一行 `: heartbeat` 注释，
+        # 它刷新了 `read=60.0` 的读超时 ⇒ 超时永不触发；而注释行不产出事件
+        # ⇒ 当**业务事件流**真的停了，连接看起来**完全健康**，
+        # `_event_loop` 永久阻塞在 `async for`、不抛异常、不重连、不刷新。
+        #   实机：`ENTER=4 / EXIT=0 / WAKE=0 / DROPPED=0`，而直连 mod `/events/stream`
+        #   仍是 HTTP 200、15 秒 16 行 ⇒ ★ **保活信号掩盖了业务事件流的死亡**。
+        #
+        # 判据：`time() - last_business_event_at` 才是"事件流是否还有用"的正解，
+        #       而不是"连接还在不在"。★ 0.0 表示本次连接还没收到过业务事件。
+        self.last_business_event_at: float = 0.0
 
     async def close(self) -> None:
         return None
@@ -155,32 +247,45 @@ class STS2TransportClient:
             return payload
 
         try:
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-                async with client.stream("GET", url, headers=dict(self.EXTERNAL_CONTROL_HEADERS)) as response:
-                    if response.status_code >= 400:
-                        body = await response.aread()
-                        raise STS2TransportError(
-                            f"events stream HTTP {response.status_code}: {body[:120]!r}"
-                        )
-                    async for raw_line in response.aiter_lines():
-                        line = raw_line.rstrip("\r")
-                        if not line:
-                            # Blank line terminates the current SSE event (if any).
-                            flushed = _flush()
-                            if flushed is not None:
-                                yield flushed
-                            continue
-                        if line.startswith(":"):
-                            # Comment / heartbeat; carries no event.
-                            continue
-                        if line.startswith("id:"):
-                            # id is also mirrored inside the JSON envelope; ignore the raw field.
-                            continue
-                        if line.startswith("event:"):
-                            event_name = line[len("event:"):].strip()
-                            continue
-                        if line.startswith("data:"):
-                            data_lines.append(line[len("data:"):].lstrip(" "))
+            # ★ 共用宿主 client（不经代理），但 **client 本身绝不可 `async with`** ——
+            #   它按 event loop 共享、由宿主管理生命周期，`async with` 退出时会调 `aclose()`
+            #   把别人正在用的连接池关掉。这里用 `client.stream(...)` 的 `async with`：
+            #   它只关**本次响应**，不碰 client。
+            #   timeout 逐请求传（共享 client 的默认超时 5s 与本流的语义无关）。
+            client = _internal_client()
+            async with client.stream(
+                "GET", url, headers=dict(self.EXTERNAL_CONTROL_HEADERS), timeout=timeout
+            ) as response:
+                if response.status_code >= 400:
+                    body = await response.aread()
+                    raise STS2TransportError(
+                        f"events stream HTTP {response.status_code}: {body[:120]!r}"
+                    )
+                async for raw_line in response.aiter_lines():
+                    line = raw_line.rstrip("\r")
+                    if not line:
+                        # Blank line terminates the current SSE event (if any).
+                        flushed = _flush()
+                        if flushed is not None:
+                            # ★★ t14/D4（批 2）：**只有业务事件**才刷新这个时刻。
+                            #   心跳（下面的 `:` 行）刻意【不】刷新它 —— 那正是本缺陷的病灶：
+                            #   心跳让连接"看起来活着"，从而掩盖业务事件流已经死亡。
+                            self.last_business_event_at = time()
+                            yield flushed
+                        continue
+                    if line.startswith(":"):
+                        # ★ 保活心跳（`: heartbeat`）：**只代表连接没断**，不代表有业务进度。
+                        #   ★ 绝不可在这里刷新 `last_business_event_at` —— 否则又回到
+                        #   "保活信号掩盖业务事件流死亡"的老路（见 __init__ 的说明）。
+                        continue
+                    if line.startswith("id:"):
+                        # id is also mirrored inside the JSON envelope; ignore the raw field.
+                        continue
+                    if line.startswith("event:"):
+                        event_name = line[len("event:"):].strip()
+                        continue
+                    if line.startswith("data:"):
+                        data_lines.append(line[len("data:"):].lstrip(" "))
         except STS2TransportError:
             raise
         except httpx.HTTPError as exc:
@@ -266,8 +371,15 @@ class STS2TransportClient:
             pool=self.request_timeout,
         )
         try:
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-                response = await client.request(method, url, headers=headers, **kwargs)
+            # ★ 共用宿主 client：``proxy=None`` + ``trust_env=False``（见 `_internal_client`），
+            #   127.0.0.1 的请求因此**绝不被系统代理劫持** —— 修复前实测被丢给
+            #   FlClash 的 127.0.0.1:7890，HTTP 502、body 空 ⇒ 抛「返回了无效 JSON」。
+            #   ★ **不得 `async with` 包裹它、不得 `aclose()`**：它按 event loop 共享、
+            #   生命周期归宿主（main_server 的 shutdown hook），关掉会连带废掉别人正在用的连接池。
+            #   ★ timeout **逐请求传**：共享 client 自带 5s 默认值，与本类的
+            #   `connect_timeout` / `request_timeout` 无关，不传就静默丢掉本类的超时语义。
+            client = _internal_client()
+            response = await client.request(method, url, headers=headers, timeout=timeout, **kwargs)
         except RuntimeError as exc:
             if "Event loop is closed" in str(exc):
                 raise STS2TransportError("事件循环已关闭，无法完成 STS2 请求") from exc

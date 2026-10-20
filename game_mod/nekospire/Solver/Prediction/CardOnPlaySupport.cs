@@ -199,5 +199,6 @@ internal static partial class CardOnPlaySupport
         }
         ApplyBatch042(simulator, combat, playedCard, cardPlay, target, processedEnemyDeaths);
         ApplyBatch043(simulator, combat, playedCard, target, processedEnemyDeaths);
+        ApplyBatch044(simulator, combat, playedCard, target, processedEnemyDeaths);
     }
 }

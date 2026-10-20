@@ -14,6 +14,27 @@ class STS2SummaryContextBuilder:
 
         builder = getattr(self, f"_build_{summary_kind}_context", self._build_general_context)
         payload = builder(snapshot, raw_state)
+        # ★★ 把求解器计划带进 payload —— 战斗唯一的权威决策来源。
+        #
+        # 为什么必须在这里接（而不是各处自己去取）：
+        #   1. `companion_evaluator._combat_solver_suggestion` 需要它来生成**出牌建议弹幕**。
+        #      陪玩模式下玩家自己在打、看不到求解器 ⇒ 弹幕是他唯一的告知渠道。
+        #   2. `service._build_combat_prompt` 另外**自己单独取了一次**（:2945-2963），
+        #      走 loop_runner 缓存 + 兜底 fetch。两处各取一次会造成
+        #      "弹幕说的牌"和"LLM 被喂的牌"不一致 —— 同一屏出现两个不同建议。
+        #   ⇒ 收口到 payload 一处，两个消费者读同一份。
+        #
+        # ★ 来源优先级（与 loop_runner 的战斗决策一致）：
+        #   snapshot 里已带（loop_runner 战斗时塞的）→ runtime_state 快照 → 不塞。
+        #   取不到就**不塞**（键缺失），让下游走"无计划"分支，绝不编造。
+        if isinstance(payload, dict):
+            plan = snapshot.get("solver_plan")
+            if not isinstance(plan, dict) and runtime_state is not None:
+                candidate = getattr(runtime_state, "latest_solver_plan", None)
+                if isinstance(candidate, dict):
+                    plan = candidate
+            if isinstance(plan, dict) and plan:
+                payload["solver_plan"] = plan
         context = {
             "summary_kind": summary_kind,
             "screen": snapshot.get("screen", "unknown"),
@@ -156,6 +177,9 @@ class STS2SummaryContextBuilder:
             "screen": snapshot.get("screen"),
             "phase": session.get("phase"),
             "available_actions": self._available_action_names(snapshot),
+            # ★ 缺陷 J3：补齐 `deck`（实机卡组在 run.deck，见 _extract_deck 说明）。
+            #   缺它 ⇒ 该屏 `_infer_archetype_tags` 拿不到卡组 ⇒ 流派恒空。
+            "deck": self._extract_deck(raw_state),
         }
 
     def _build_menu_context(self, snapshot: dict[str, Any], raw_state: dict[str, Any]) -> dict[str, Any]:
@@ -165,6 +189,9 @@ class STS2SummaryContextBuilder:
         return {
             "phase": session.get("phase"),
             "available_actions": self._available_action_names(snapshot),
+            # ★ 缺陷 J3：补齐 `deck`（实机卡组在 run.deck，见 _extract_deck 说明）。
+            #   缺它 ⇒ 该屏 `_infer_archetype_tags` 拿不到卡组 ⇒ 流派恒空。
+            "deck": self._extract_deck(raw_state),
             "selected_character_id": character_select.get("selected_character_id"),
             "can_embark": character_select.get("can_embark"),
             "ascension": character_select.get("ascension"),
@@ -185,6 +212,10 @@ class STS2SummaryContextBuilder:
             "event_options": event.get("options") if isinstance(event.get("options"), list) else [],
             "available_actions": self._available_action_names(snapshot),
             "event": event,
+            # ★ 缺陷 J3：事件屏也要给 `deck`。用户点名的缺陷 A/B **都发生在事件屏**，
+            #   而"避开诅咒/避开扣上限"的判断需要知道卡组流派（诅咒卡对成型卡组的破坏更大）。
+            #   此前本 builder 无 `deck` 键 ⇒ 事件屏拿不到卡组。
+            "deck": self._extract_deck(raw_state),
         }
 
     def _build_map_context(self, snapshot: dict[str, Any], raw_state: dict[str, Any]) -> dict[str, Any]:
@@ -230,6 +261,9 @@ class STS2SummaryContextBuilder:
             "is_multiplayer": is_multiplayer,
             "future_nodes": game_map.get("future_nodes") if isinstance(game_map.get("future_nodes"), list) else [],
             "available_actions": self._available_action_names(snapshot),
+            # ★ 缺陷 J3：补齐 `deck`（实机卡组在 run.deck，见 _extract_deck 说明）。
+            #   缺它 ⇒ 该屏 `_infer_archetype_tags` 拿不到卡组 ⇒ 流派恒空。
+            "deck": self._extract_deck(raw_state),
         }
 
     def _other_player_vote_index(
@@ -298,7 +332,7 @@ class STS2SummaryContextBuilder:
             "hand": hand,
             "playable_card_summaries": self._card_summaries(hand),
             "enemies": enemies,
-            "deck": raw_state.get("deck") if isinstance(raw_state.get("deck"), dict) else {},
+            "deck": self._extract_deck(raw_state),
             "relics": raw_state.get("relics") if isinstance(raw_state.get("relics"), list) else [],
             "potions": raw_state.get("potions") if isinstance(raw_state.get("potions"), list) else [],
             "selection": selection,
@@ -306,6 +340,45 @@ class STS2SummaryContextBuilder:
             **self._selection_counts(selection),
             "available_actions": self._available_action_names(snapshot),
         }
+
+    @staticmethod
+    def _extract_deck(raw_state: dict[str, Any]) -> dict[str, Any]:
+        """从 mod 的 `/state` 里取出卡组，**兼容两种位置**。
+
+        ★ 缺陷 J（2026-10-17 实机查证）：
+        实机 `/state` 的形状是
+          ```json
+          { "run_id": ..., "screen": ..., "run": { ..., "deck": [ {card}, ... ] } }
+          ```
+        卡组在 **`run.deck`**（**list**），而顶层**没有** `deck` 键
+        （实测顶层键：state_version/run_id/screen/turn/combat/run/map/selection/
+         chest/event/shop/rest/reward/main_menu/... —— 无 `deck`）。
+
+        原实现统一写成 `raw_state.get("deck")`（**顶层**）
+        ⇒ **恒为 `{}`** ⇒ 奖励屏/商店屏的 `deck` 永远为空
+        ⇒ `_infer_archetype_tags` 拿不到卡组 ⇒ **流派推断永远为空**
+        ⇒ 即使 `_archetype_policy_from_deck` 写得对，也永远产不出流派偏好。
+        实测证据：实机选卡留痕连续两条都是 `流派=[] 成型=[]`
+        （`[sts2_reward_route] ... 流派=[]`），而同一时刻 `run.deck` 有 20 张卡。
+
+        这里统一归一化为 `{"cards": [...]}`（引擎内部约定），
+        同时保留对旧口径（顶层 `deck` 且已是 dict）的兼容。
+        """
+        if not isinstance(raw_state, dict):
+            return {}
+        # 旧口径优先（若顶层真有 dict 形状的 deck，尊重它）
+        top = raw_state.get("deck")
+        if isinstance(top, dict) and top.get("cards"):
+            return top
+        run = raw_state.get("run") if isinstance(raw_state.get("run"), dict) else {}
+        run_deck = run.get("deck")
+        if isinstance(run_deck, list):
+            return {"cards": run_deck}
+        if isinstance(run_deck, dict):
+            return run_deck
+        if isinstance(top, dict):
+            return top
+        return {}
 
     def _build_reward_context(self, snapshot: dict[str, Any], raw_state: dict[str, Any]) -> dict[str, Any]:
         run = raw_state.get("run") if isinstance(raw_state.get("run"), dict) else {}
@@ -320,7 +393,7 @@ class STS2SummaryContextBuilder:
             "reward_cards": cards,
             "reward_card_names": [str(card.get("name") or card.get("card_id") or "?") for card in cards if isinstance(card, dict)],
             "reward_card_indices": [self._safe_int(card.get("index"), default=index) for index, card in enumerate(cards) if isinstance(card, dict)],
-            "deck": raw_state.get("deck") if isinstance(raw_state.get("deck"), dict) else {},
+            "deck": self._extract_deck(raw_state),
             "relics": raw_state.get("relics") if isinstance(raw_state.get("relics"), list) else [],
             "potions": raw_state.get("potions") if isinstance(raw_state.get("potions"), list) else [],
             "available_actions": self._available_action_names(snapshot),
@@ -337,7 +410,7 @@ class STS2SummaryContextBuilder:
             "current_hp": run.get("current_hp"),
             "max_hp": run.get("max_hp"),
             "gold": run.get("gold"),
-            "deck": raw_state.get("deck") if isinstance(raw_state.get("deck"), dict) else {},
+            "deck": self._extract_deck(raw_state),
             "shop": shop,
             "shop_cards": cards,
             "shop_card_names": [str(card.get("name") or card.get("card_id") or "?") for card in cards if isinstance(card, dict)],
@@ -360,6 +433,9 @@ class STS2SummaryContextBuilder:
             "rest_options": options,
             "rest_option_types": [str(option.get("type") or option.get("name") or "?") for option in options if isinstance(option, dict)],
             "available_actions": self._available_action_names(snapshot),
+            # ★ 缺陷 J3：补齐 `deck`（实机卡组在 run.deck，见 _extract_deck 说明）。
+            #   缺它 ⇒ 该屏 `_infer_archetype_tags` 拿不到卡组 ⇒ 流派恒空。
+            "deck": self._extract_deck(raw_state),
         }
 
     def _build_selection_context(self, snapshot: dict[str, Any], raw_state: dict[str, Any]) -> dict[str, Any]:
@@ -376,6 +452,15 @@ class STS2SummaryContextBuilder:
             "selection_card_names": [str(card.get("name") or card.get("card_id") or "?") for card in selection_cards if isinstance(card, dict)],
             **self._selection_counts(selection),
             "reward": reward,
+            # ★★ 缺陷 J2（2026-10-17 实机查证）：本 builder **此前完全没有 `deck` 键**。
+            #   而 `card_selection_reward` / `card_selection` 都走本 builder
+            #   （`state_machine._screen_class`：它们在 `_SELECTION_SCREENS` ⇒ class=selection
+            #    ⇒ `_summary_kind`="selection"），
+            #   而这正是**选卡屏**——`_preferred_reward_option` 要在这里读 deck 推流派。
+            #   实测：`_build_selection_context` 给的 deck=0 张，而同一状态
+            #   `_extract_deck(raw)` = 13 张 ⇒ 选卡屏的流派**永远为空**（留痕 `流派=[]`）。
+            "deck": self._extract_deck(raw_state),
+            "relics": raw_state.get("relics") if isinstance(raw_state.get("relics"), list) else [],
             "available_actions": self._available_action_names(snapshot),
         }
 

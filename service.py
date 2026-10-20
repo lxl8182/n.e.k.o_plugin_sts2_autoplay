@@ -27,6 +27,7 @@ from .catgirl_llm import CatgirlCommentGenerator
 from .companion_session import CompanionSession
 from .companion_journal import CompanionJournal
 from .catgirl_memory import CatgirlMemoryStore, _default_memory_path
+from .encounter_memory import EncounterMemory, _default_encounter_db_path
 from .companion_evaluator import STS2CompanionEvaluator, _enemy_intent_label
 from .companion_feedback import apply_existing_expression, public_companion_text, speak_current_turn
 from .fact_gate import FactSuppressionGate
@@ -72,6 +73,9 @@ class CompanionAudioPending(RuntimeError):
 
 
 class STS2AutoplayService:
+    # 旧入口 `_push_host_situation_digest` 的时间节流（保留上游兼容语义）。
+    HOST_DIGEST_MIN_INTERVAL_SECONDS = 75.0
+
     def __init__(self, logger: Any, status_reporter: Callable[[dict[str, Any]], None], frontend_notifier: Callable[..., Any] | None = None, *, sdk_bus: Any = None, sdk_ctx: Any = None, i18n: Any = None, play_style_random: Any = None) -> None:
         self.logger = logger
         self._report_status = status_reporter
@@ -129,6 +133,14 @@ class STS2AutoplayService:
         self._fact_gate = FactSuppressionGate(self.logger)
         # 跨局经验按条件匹配；旧局报和自由反思保留为历史记录。
         self._catgirl_memory = CatgirlMemoryStore(path=_default_memory_path(), logger=self.logger)
+        # ★ t31：怪物/事件实例知识库。**独立文件**（契约 §5.1）—— 不挂 catgirl_memory，
+        #   因为后者是 cap=50 环形缓冲（实测 20 分钟内就有局被逐出），
+        #   而"这只怪啃过我多少血"是**跨局累积**资产，生命周期必须长于单局。
+        self._encounter_memory = EncounterMemory(
+            path=_default_encounter_db_path(), logger=self.logger
+        )
+        # 采集开关（默认开）。关掉只影响本库的累积，不影响任何决策。
+        self._encounter_memory_enabled = True
         self._strategy_repository = STS2StrategyRepository(
             logger,
             self._preference_store,
@@ -262,6 +274,9 @@ class STS2AutoplayService:
         # 默认开；只有显式配置 false 才不抑制。解析不到本体数据根时静默降级。
         if bool(self._cfg.get("suppress_host_facts", True)):
             self._fact_gate.start()
+        # ★ t31（上游）：怪物/事件实例知识库采集开关。默认开。
+        #   关掉只停止累积（不影响自动游玩、不影响任何决策）。
+        self._encounter_memory_enabled = bool(self._cfg.get("encounter_memory_enabled", True))
         # 地图投票：跟随玩家（co-op 队友先投就跟着投），以及无人投票时的等待秒数。
         # 地图投票策略：wait（默认，彻底等玩家发话）/ follow（自动跟票）/ auto（自己选）。
         # 兼容旧配置：只有 map_follow_player 布尔而没有 map_policy 时，true->follow、false->auto。
@@ -292,6 +307,9 @@ class STS2AutoplayService:
         self._catgirl_client: STS2TransportClient | None = None
         self._catgirl_base_url = ""
         self._instance_failures = 0
+        # ★ 联机房间是否开着。供 `_is_coop_active()`（弹幕优先级 coop>autoplay>陪玩）判断。
+        #   与 `active_instance` 互补：后者在"接管不了猫娘"时会停在 host 上，此处仍能记住开过房。
+        self._coop_room_open = False
         startup_result = {"connected": False, "companion_mode_enabled": False}
 
         try:
@@ -525,11 +543,15 @@ class STS2AutoplayService:
         # 只在缺少 user 记录时补读，避免把导入时刻冒充发言时刻。
         if not any(getattr(item, "turn_type", "") == "user_message" for item in records):
             try:
+                from utils.internal_http_client import get_internal_http_client
                 port = self._main_server_port()
-                async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
-                    response = await client.get(f"http://127.0.0.1:{port}/get_recent_history/{self._catgirl_llm.character_name()}")
-                    response.raise_for_status()
-                    history = response.json()
+                client = get_internal_http_client()
+                response = await client.get(
+                    f"http://127.0.0.1:{port}/get_recent_history/{self._catgirl_llm.character_name()}",
+                    timeout=5.0,
+                )
+                response.raise_for_status()
+                history = response.json()
                 if isinstance(history, str):
                     pattern = re.compile(r"^([^|]+) \|(?: \[(\d{8}) \w+ (\d{2}:\d{2})\])?\s*(.*)$")
                     for line in history.splitlines():
@@ -561,36 +583,38 @@ class STS2AutoplayService:
         )
 
     async def _companion_host_request(self, path: str, payload: dict) -> dict:
+        from utils.internal_http_client import get_internal_http_client
         origin = f"http://127.0.0.1:{self._main_server_port()}"
-        async with httpx.AsyncClient(timeout=70 if path == "output" else 5, trust_env=False) as client:
-            if not self._ingress_csrf:
-                response = await client.get(origin + "/api/config/page_config")
-                response.raise_for_status()
-                self._ingress_csrf = response.json()["autostart_csrf_token"]
-            body = {"name": self._ingress_character or self._catgirl_llm.character_name(), "instance": self._ingress_instance, **payload}
-            headers = {"Origin": origin, "X-CSRF-Token": self._ingress_csrf}
-            response = await client.post(origin + "/api/sts2-companion/" + path, headers=headers, json=body)
-            if response.status_code == 409 and path == "output":
-                self.logger.warning("[sts2_ownership_lost] instance=%s run=%s output_id=%s reason=%s",
-                                    self._ingress_instance, self._companion_session.facts.get("run_id"),
-                                    payload.get("output_id"), response.json().get("detail"))
-                self._ingress_active = False
-                self._ingress_checkpoint_key = None
-                # poll恢复既有租约规则；不强占别的实例。输出ID不变，已送文本仍去重。
-                await self._sync_companion_ingress(restore_state=False)
-                if not self._ingress_active:
-                    raise DecisionContextChanged("同伴输出所有权已失效，等待重新接管后投递")
-                response = await client.post(origin + "/api/sts2-companion/" + path, headers=headers, json=body)
-                if response.status_code == 409:
-                    self._ingress_active = False
-                    raise DecisionContextChanged("同伴输出所有权再次变化，等待重新接管后投递")
-            if response.status_code == 403:
-                self._ingress_csrf = ""
+        request_timeout = 70 if path == "output" else 5
+        client = get_internal_http_client()
+        if not self._ingress_csrf:
+            response = await client.get(origin + "/api/config/page_config", timeout=request_timeout)
             response.raise_for_status()
-            result = response.json()
-            if not result.get("ok") and path != "output":
-                raise RuntimeError("同伴会话接口失败：" + str(result.get("reason")))
-            return result
+            self._ingress_csrf = response.json()["autostart_csrf_token"]
+        body = {"name": self._ingress_character or self._catgirl_llm.character_name(), "instance": self._ingress_instance, **payload}
+        headers = {"Origin": origin, "X-CSRF-Token": self._ingress_csrf}
+        response = await client.post(origin + "/api/sts2-companion/" + path, headers=headers, json=body, timeout=request_timeout)
+        if response.status_code == 409 and path == "output":
+            self.logger.warning("[sts2_ownership_lost] instance=%s run=%s output_id=%s reason=%s",
+                                self._ingress_instance, self._companion_session.facts.get("run_id"),
+                                payload.get("output_id"), response.json().get("detail"))
+            self._ingress_active = False
+            self._ingress_checkpoint_key = None
+            # poll恢复既有租约规则；不强占别的实例。输出ID不变，已送文本仍去重。
+            await self._sync_companion_ingress(restore_state=False)
+            if not self._ingress_active:
+                raise DecisionContextChanged("同伴输出所有权已失效，等待重新接管后投递")
+            response = await client.post(origin + "/api/sts2-companion/" + path, headers=headers, json=body, timeout=request_timeout)
+            if response.status_code == 409:
+                self._ingress_active = False
+                raise DecisionContextChanged("同伴输出所有权再次变化，等待重新接管后投递")
+        if response.status_code == 403:
+            self._ingress_csrf = ""
+        response.raise_for_status()
+        result = response.json()
+        if not result.get("ok") and path != "output":
+            raise RuntimeError("同伴会话接口失败：" + str(result.get("reason")))
+        return result
 
     async def _sync_companion_ingress(self, *, receive_only: bool = False, restore_state: bool = True) -> None:
         if not self._ingress_enabled:
@@ -1079,6 +1103,9 @@ class STS2AutoplayService:
             action = await self._join_coop_room(client)
 
         self.logger.info(f"[sts2] opened co-op room ({action})")
+        # ★ 房间已开 ⇒ 记进联机状态，并立刻重判弹幕（coop 优先级高于陪玩）。
+        self._coop_room_open = True
+        self._apply_mode_danmaku_policy()
         result = await self._coop_opened_result(host=host, action=action)
         if host:
             # 房间是交给主机开的，而**要玩的是猫娘**。主机把猫娘进程拉起来之后，插件切过去接管，
@@ -1226,6 +1253,8 @@ class STS2AutoplayService:
             self._resolve_pending_action(self._state.snapshot)
         self._update_run_intent()
         await self._update_companion_feedback(self._state.snapshot)
+        # ★ t31：把本 tick 的 /state 喂给「怪物/事件实例知识库」（纯观测，见方法注释）。
+        self._observe_encounter_memory()
         if trigger_sync:
             self._deliver_catgirl_sync(self._state.snapshot)
         self._emit_status()
@@ -1306,6 +1335,14 @@ class STS2AutoplayService:
                           or self._ingress_active and self._state.autoplay_state != "running" and not force)
         if actions_paused and not has_input:
             return {"status": "idle", "executed": False, "message": "已暂停动作，仍可聊天。"}
+        # advise（听我安排）：照常算计划，但不自动执行任何界面（含战斗）。
+        # force=True 是玩家亲口点的那一步，必须放行。
+        if not force and not self._mode_controller.describe(self._state.control_mode).get("allows_execute"):
+            snapshot_now = self._state.snapshot if isinstance(self._state.snapshot, dict) else {}
+            state_name = self._snapshot_state_name(snapshot_now)
+            message = f"现在听你安排：{state_name or '当前界面'} 这一步我先不动，你说一声我再走。"
+            return {"status": "idle", "executed": False, "held": True,
+                    "message": message, "summary": message, "state_name": state_name}
         question = self._companion_session.pending_question
         if (question.get("status") == "open" and question.get("required")
                 and not self._companion_session.pending_messages() and not force):
@@ -2335,6 +2372,167 @@ class STS2AutoplayService:
         advanced["auto_divination"] = True
         return advanced
 
+    # ---- D12（t32）：mod 认不出、插件也推不动的「自定义事件屏」------------------------------
+    #: `unknown_screen_type` 里出现这些**类名片段** ⇒ 该屏是游戏侧的自定义小游戏界面
+    #: （水晶球/占卜/壁画一类），其交互元素**不在 `/state` 的任何层里**。
+    #: ★ 用「片段」而非全名：类名带命名空间前缀（实机为
+    #:   `MegaCrit.Sts2.Core.Nodes.Events.Custom.CrystalSphere.NCrystalSphereScreen`），
+    #:   前缀/后缀都可能变，片段匹配更稳。
+    #: ⚠️ 但片段**必须足够独特**：我最初只写 `"CrystalSphere"`，结果把 t29 测例里的
+    #:   `MegaCrit.Sts2.Core.Nodes.Screens.CrystalSphereScreen`（**旧命名空间**的另一个类）
+    #:   也一起命中 ⇒ 打坏了 t29 的既有契约（全量测试抓到 2 failed）。
+    #:   ⇒ 现在要求「片段 + 与屏语义一致」两段同时成立才认（见 :meth:`_crystal_sphere_screen`）。
+    UNADVANCEABLE_SCREEN_MARKERS = (
+        "CrystalSphere",
+        "DivinationScreen",
+        "ProphecyScreen",
+    )
+    #: ★ 与标记同现的**屏语义**片段 —— 必须同时满足，避免跨命名空间误伤。
+    #: 实机为 `...Nodes.Events.Custom.CrystalSphere.NCrystalSphereScreen`
+    #: （`Events` + `Custom` 都在）。这条把 `Nodes.Screens.CrystalSphereScreen` 排除在外。
+    UNADVANCEABLE_SCREEN_CONTEXT = ("Events", "Custom")
+    #: 这些动作**不构成推进** —— 它们在自定义事件屏上也在册，但点了局面不变/会毁局。
+    #: ★ `discard_potion` 在册但语义是"丢药水"，与推进这一屏无关（实测 :2377 只按"有药水"加入册）。
+    #: ★ `save_and_quit` / `return_to_main_menu` / `abandon_run` 会**毁掉当前局**，绝不能自动发。
+    NON_PROGRESSING_ACTIONS = frozenset({
+        "save_and_quit", "return_to_main_menu", "abandon_run", "discard_potion",
+    })
+
+    def _crystal_sphere_screen(self, snapshot: dict[str, Any]) -> dict[str, Any] | None:
+        """判定「本 tick 是不是 D12 那块推不动的自定义事件屏」。命中则返回诊断 dict。
+
+        ## 为什么需要这个判定（实机证据，2026-10-20 03:10:03）
+
+        `/state` 原文（落盘 `.dsh-artifacts/_t32/live-crystal-sphere-20261020_031003.json`）：
+        ```
+        screen              = 'EVENT'
+        unknown_screen_type = '...Custom.CrystalSphere.NCrystalSphereScreen'
+        available_actions   = ['save_and_quit', 'discard_potion']   ← 无任何推进动作
+        event               = null      ← ★ 连事件层都没有
+        selection/modal/bundles/timeline/map/reward/rest/shop/chest/character_select = 全 null
+        ```
+        ⇒ 26 个顶层键里**除 run/session/agent_view 外全为 null**。
+
+        ## 为什么 `_advance_custom_event_cursor` 救不了它
+
+        :meth:`_advance_custom_event_cursor`（本文件 :656）对水晶球**确实**有推进逻辑，
+        但它的前置条件是 `event["screen_progress"]` 非空（:672 `if not str(event.get("screen_progress") or "")`）。
+        本屏 `event is None` ⇒ `screen_progress` 恒为 `''` ⇒ **游标机制被早退绕过**。
+        ⇒ 「水晶球」有两个子形态：**有 event 层**（游标可推进，已被 :656 修过）与
+          **无 event 层**（就是本缺陷，`event/map` 全 null，任何已知动作都推不动）。
+
+        ## 与 D10/D11 同族
+
+        游戏给了结构（`EVENT` 只是 mod `ResolveScreenFromStaticRoom()` 用
+        `EventRoom => "EVENT"` **兜底猜出来**的屏幕名，见
+        `game_mod/nekospire/Game/GameStateService.cs:736-746`），
+        插件照着 `EVENT` 去找 `choose_event_option`（`heuristic_planner.py:1020-1032`），
+        而游戏从没提供该动作 ⇒ 规划不出动作 ⇒ 空转。
+        """
+        raw = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        screen = str(snapshot.get("screen") or raw.get("screen") or "")
+        unknown = str(raw.get("unknown_screen_type") or "")
+        if not unknown or not any(m in unknown for m in self.UNADVANCEABLE_SCREEN_MARKERS):
+            return None
+        # ★ 必须同现「屏语义」片段（`Events` + `Custom`），否则不认 ——
+        #   防止把别的命名空间下的同名类（如 `Nodes.Screens.CrystalSphereScreen`）误伤。
+        #   参考件：t29 的 `test_stuck_screen.py` 用的正是那个旧类名，且它**不属于**本缺陷。
+        if not all(ctx in unknown for ctx in self.UNADVANCEABLE_SCREEN_CONTEXT):
+            return None
+        # ★ 还必须落在 EVENT 语义的屏上：本缺陷的症状就是"被兜底猜成 EVENT，却没有事件层"。
+        #   其它屏（战斗/地图）即使类名带标记，也不该由本判定接管。
+        if screen.upper() != "EVENT":
+            return None
+        # ★ 必须同时满足「事件层为空」：有 event 层时交给 :656 的游标机制（那条路已验证可用），
+        #   不能把能推进的形态也拦掉（否则就是把一个能修的场景降级成放弃）。
+        if isinstance(raw.get("event"), dict) and raw.get("event"):
+            return None
+        actions = raw.get("available_actions") if isinstance(raw.get("available_actions"), list) else []
+        progressing = [
+            str(a) for a in actions if str(a) not in self.NON_PROGRESSING_ACTIONS
+        ]
+        if progressing:
+            return None
+        # ★ t33：mod 补了 `crystal_sphere` 层之后，这一屏**不再是死局** ——
+        #   它有专门的 `divine_crystal_sphere` 动作（在 `progressing` 里，所以上面就已 return None）。
+        #   这一段是**双保险**：即使某一版 mod 只补了层的读法、还没把动作挂进册，
+        #   只要 `crystal_sphere.active` 为真，也**不算"推不动"**，交由规划器/游标去处理。
+        #   否则会出现最坏的自相矛盾：屏上明明能占卜，插件却在喊"卡住了"。
+        cs = raw.get("crystal_sphere") if isinstance(raw.get("crystal_sphere"), dict) else {}
+        if cs.get("active"):
+            return None
+        return {
+            "screen": screen or "EVENT",
+            "unknown": unknown,
+            "actions": sorted(str(a) for a in actions),
+        }
+
+    def _note_unadvanceable_screen(self, snapshot: dict[str, Any], diag: dict[str, Any]) -> None:
+        """D12：对推不动的自定义事件屏**停止静默空转**，并给出**可执行的降级指引**。
+
+        ## 「至少不要卡死」的降级方案（本任务契约要求）
+
+        ★ 诚实的边界：**该屏无法从当前 `/state` 信息自动推进**。证据：
+          · `/state` 的 12 个交互层全为 `null`（无坐标/按钮/确认键可读）；
+          · mod 的 `/action` 支持 54 个动作（`GameActionService.cs:99-152`），
+            **没有任何一个**与水晶球交互；
+          · 实测未知动作名 ⇒ HTTP 409 `invalid_action` "Action is not supported yet."
+          · 唯一"看起来能推"的 `discard_potion` 只是丢药水（且需要 option_index，实测无 index 时
+            HTTP 400 `invalid_request`），点它不会让这一屏结束。
+          ⇒ 想**真推进**必须 mod 侧新增（见 :meth:`_unadvanceable_screen_advice`），
+            那超出本任务 inScope（`game_mod/` 被明确排除）。
+
+        ★ 因此本降级**只做三件不冒险的事**（都不动 autoplay 意图、不发任何破坏性动作）：
+          1. **停止重复上报**：同一指纹只记一次 WARNING（复用既有 `stuck_*` 记账，
+             不新增 runtime_state 字段 —— 该文件不在 inScope）；
+          2. **把「推不动」与「没认出」讲清楚**：状态里写明是哪个屏、为什么推不动、
+             以及需要 mod 补什么；
+          3. **绝不自作主张毁局**：`save_and_quit`/`return_to_main_menu`/`abandon_run`
+             一律不发（那是玩家的进度，实测这局已到 act1/floor23 是当晚最深的一局）。
+
+        ★ 调用约定：由 :meth:`_note_no_operation` 的**共享闸**在「指纹稳定且已等够」之后调用
+          ⇒ 本方法**不再自己计时**（那会重复实现一套时序，且第一版就是那样打坏了 t29 的测例）。
+        """
+        self._state.stuck_reported = True
+        waited = int(max(0, time() - self._state.stuck_since))
+        advice = self._unadvanceable_screen_advice(diag)
+        detail = f"{diag['screen']}（未识别界面类型 {diag['unknown']}）"
+        self._emit_stuck_report(
+            reason=(
+                f"{detail} 是游戏侧自定义小游戏界面，/state 不含任何可交互元素、"
+                f"mod 也没有对应动作 ⇒ 本插件无法推进（已等 {waited} 秒）；需 mod 侧补充交互动作"
+            ),
+            log_line=(
+                "[sts2_d12] 推不动的自定义事件屏：screen=%s unknown=%s actions=%s 已等 %s 秒"
+                "（autoplay 意图保持 %s）★ 需 mod 侧新增：%s"
+                % (diag["screen"], diag["unknown"], diag["actions"], waited,
+                   self._state.autoplay_state, advice)
+            ),
+            host_text=(
+                f"我卡在{detail}这个界面上了 —— 这是个游戏自带的互动小游戏（水晶球那类），"
+                f"它不给我能点的东西，我也没长手去点屏幕，你手动点一下就能继续喵。"
+            ),
+        )
+
+    @staticmethod
+    def _unadvanceable_screen_advice(diag: dict[str, Any]) -> str:
+        """给出**需要 mod 侧新增什么**（本任务契约要求的「读不到就说清要补什么」）。
+
+        实机现状：mod 把该屏当 `EVENT` **兜底**返回（`GameStateService.cs:741-746`），
+        但 `/state` 的 `event` 层是 `null` —— 于是插件拿着 `EVENT` 找不到任何事件动作。
+        ⇒ mod 侧至少要补其一：
+          (a) 把水晶球的**可交互元素**（每个图块/按钮的 index 或坐标 + 是否可点）暴露成
+              某个层（例如 `event.screen_progress` + `event.options[]`，即已有游标机制认识的那个形状），
+              这样插件 :656 的 `_advance_custom_event_cursor` 就能自动扫下标推进；
+          (b) 或在 mod 内直接实现"自动完成该小游戏"的动作（如 `crystal_sphere_pick(option_index)`），
+              由插件照常 `choose_event_option` 派发。
+        """
+        return (
+            "在 GameStateService/GameActionService 里为该屏暴露可交互元素"
+            "（建议复用 event.screen_progress + event.options[] 形状，插件已有游标推进逻辑）"
+            "或新增专用动作；当前 :state 的 event/selection/modal 全为 null，插件无从下手"
+        )
+
     def _note_step_progress(self, snapshot: dict[str, Any], operation: dict[str, Any]) -> None:
         """动作发出去、mod 也回 ok，但**局面指纹没变** —— 那就是这个动作其实没生效。
 
@@ -2429,7 +2627,23 @@ class STS2AutoplayService:
         if not screen or self._state.transport_state != "connected":
             self._clear_stuck()
             return
-        signature = self._no_operation_signature(snapshot)
+        # ★★ D12（t32）：先判「是不是游戏侧推不动的自定义事件屏」。
+        #   命中的话走专用降级（把原因/需 mod 补什么讲清楚），而不是笼统的"没有可执行动作"。
+        #
+        # ⚠️ 我第一版在这里写错了，**打坏了 t29 的既有测例**（全量测试抓到的，1242 passed/2 failed）：
+        #   写成 `if (now - stuck_since) >= 阈值 or 指纹不同:` ⇒ 指纹**第一次**建立时
+        #   `stuck_since == 0.0` ⇒ `time() - 0` 是巨大的正数 ⇒ **立刻上报** ⇒
+        #   t29 的「跨屏切换短暂拿不到动作是正常的，不许报卡住」被破坏。
+        # ⇒ 改成**完全复用**下方既有闸的语义（先记账 → 再按阈值/已报判），
+        #   只把"报什么"换成专用文案 ⇒ **时序行为与 t29 逐字保持一致**。
+        diag = self._crystal_sphere_screen(snapshot)
+        special_signature = (
+            f"unadvanceable|{diag['screen']}|{diag['unknown']}|{','.join(diag['actions'])}"
+            if diag is not None
+            else ""
+        )
+        # ★ 专用形态用自己的指纹（它比通用的更具体），但**走同一个闸**。
+        signature = special_signature or self._no_operation_signature(snapshot)
         now = time()
         if signature != self._state.stuck_signature:
             self._state.stuck_signature = signature
@@ -2438,6 +2652,10 @@ class STS2AutoplayService:
             self._state.stuck_reason = ""
             return
         if self._state.stuck_reported or (now - self._state.stuck_since) < self.NO_OPERATION_STUCK_SECONDS:
+            return
+        if diag is not None:
+            # ★ 命中专用屏：走专用文案（`_note_unadvanceable_screen` 自己置 stuck_reported）。
+            self._note_unadvanceable_screen(snapshot, diag)
             return
         self._state.stuck_reported = True
         raw = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
@@ -2464,7 +2682,6 @@ class STS2AutoplayService:
         """
         if self._state.stuck_reason:
             return
-        self._state.stuck_signature = self._no_operation_signature(self._state.snapshot)
         self._state.stuck_reported = True
         self._state.stuck_reason = reason
         try:
@@ -2857,12 +3074,24 @@ class STS2AutoplayService:
                 self._resolve_pending_action(self._state.snapshot)
             self._deliver_host_context(self._state.snapshot)
             return result
+        # ★ t20/D9：派发前的药水数量（用于"派发了但没消耗"的可观测性判据）。
+        potion_count_before = self._count_potions(snapshot)
         if result.get("status") == "ok":
             self._state.touch_action()
             self._companion_session.facts["last_action"] = {
                 "action_type": operation.get("action_type"), "reason": operation.get("reason"),
             }
             op = result.get("operation") if isinstance(result.get("operation"), dict) else {}
+            # ★★ t20/D9 修复：「派发成功」= mod 回 `completed`，**或**局面确实发生了可观测变化。
+            #   原实现把「HTTP 200」当作已执行（`action_engine.execute` 无条件返回 status="ok"，
+            #   而 mod 的真实 status 被埋在 `result["result"]["status"]` 里，**从未被读**）。
+            #   后果：mod 回 `status="pending", stable=false`（药水被游戏侧 Cancel()、槽位未变）
+            #   也被当成执行成功 ⇒ `solver_step_index` 空耗 ⇒ 步骤用尽 ⇒ 重取 ⇒
+            #   求解器又给同一建议 ⇒ 无限循环。
+            #   实测 run22 X9XP0L8HZWF7 循环 7347 次、卡死 5.88 小时（16:51:13 → 22:44:06）。
+            #   ⇒ 下面把真实 status 解析出来，交给 `_note_action_status` 判定是否算「有效」。
+            mod_status = self._mod_action_status(result)
+            self._state.last_action_status = mod_status
             if op.get("action_type") == "select_deck_card":
                 # 选牌光标由"这一下真的按下去了"推动。plan() 是每 tick 都跑的（事件流约 1 次/秒），
                 # 若让它自己推进光标，四个候选会在几秒内被规划耗光、屏幕却一张都没选中，
@@ -2880,13 +3109,35 @@ class STS2AutoplayService:
                 self._planner.note_character_select_dispatched(kwargs.get("option_index"))
                 self._companion_session.character_choice_made = True
                 self._companion_session.generation += 1
+            if op.get("action_type") == "choose_event_option":
+                # ★缺陷 A3 修复：事件选项的"已选次数"必须由**真的派发成功**推动。
+                # 可重复选择的事件（选完选项仍在、屏幕不变）上，无状态的评分器每轮算出同一个最优解
+                # ⇒ 无限重复同一项。实机后果：反复选"消耗生命上限"直到 HP 变 1
+                # （用户报告："脚本会一直选择消耗，直接把生命值变成了1"）。
+                # 与上面选牌/领奖同一个道理：plan() 每 tick 都跑，用规划记账会凭空放大计数。
+                kwargs = op.get("kwargs") if isinstance(op.get("kwargs"), dict) else {}
+                self._planner.note_event_option_chosen(
+                    self._summary_builder.build(snapshot, runtime_state=self._state),
+                    kwargs.get("option_index"),
+                )
+                # ★ t31：把"我选了哪个选项"告诉实例知识库，供它跨 tick diff 出代价/收益
+                #   （契约 §4.3）。**纯观测**：只记录事实，不影响本方法的任何返回值。
+                self._note_encounter_event_choice(kwargs.get("option_index"))
             if op.get("action_type") == "use_potion":
                 # 战斗用药水的记账："同一回合只喝一瓶"（规格「八、节流」）。只在**真的喝下去之后**记，
                 # 与选牌光标/奖励领取同一个道理：规划每 tick 都跑，用规划记账会把机会白白耗光。
                 self._state.potion_used_turn_key = self._combat_turn_key(snapshot)
             # 战斗整回合缓存：仅战斗步(出牌/用药/结束回合)推进 line[0].steps 索引；选牌子动作不推进。
+            # ★★ t20/D9：**只在这次派发"有效"时才推进**。mod 回 pending 且局面未变 ⇒ 这一步
+            #   其实什么都没做，若照样 +1 就是把计划步骤空耗掉 ⇒ 步骤用尽 ⇒ 重取 ⇒ 同一建议 ⇒
+            #   死循环（实测 7347 次 / 5.88 小时）。有效性由 `_note_action_status` 判定。
             if op.get("action_type") in {"play_card", "use_potion", "end_turn"}:
-                self._state.solver_step_index = (self._state.solver_step_index if isinstance(self._state.solver_step_index, int) else 0) + 1
+                if self._note_action_status(
+                    action_type=str(op.get("action_type") or ""),
+                    mod_status=mod_status,
+                    snapshot=snapshot,
+                ):
+                    self._state.solver_step_index = (self._state.solver_step_index if isinstance(self._state.solver_step_index, int) else 0) + 1
             self._state.last_decision_source = str(op.get("source") or "")
             self._state.last_decision_reason = str(op.get("reason") or "")
             self._consume_guidance(op)
@@ -2904,6 +3155,10 @@ class STS2AutoplayService:
             self._companion_session.complete_step(operation)
             await self.refresh_state(trigger_sync=True)
             after_snapshot = self._state.snapshot if isinstance(self._state.snapshot, dict) else {}
+            # ★ t20/D9 可观测性：同一回合连续 3 次 use_potion 而药水数量未减少 ⇒ 告警。
+            #   放在 refresh_state **之后**，比的是"派发前 vs 派发后"的真实槽位数量。
+            if op.get("action_type") == "use_potion":
+                self._note_potion_maybe_no_effect(after_snapshot, potion_count_before)
             after_summary = self._summary_builder.build_snapshot_summary(after_snapshot) if after_snapshot else {}
             action_delta = self._summary_engine.compute_delta(before_summary, after_summary, source="action_paired")
             after_view = self._agent_view(after_snapshot)
@@ -3183,6 +3438,237 @@ class STS2AutoplayService:
                 self._status_push_at = time()
         finally:
             self._status_push_lock.release()
+    # ── ★★ t20/D9：「派发成功」的有效性判据 ──────────────────────────────────────
+    _VALID_MOD_STATUSES = frozenset({"completed", "ok", "success"})
+
+    def _mod_action_status(self, result: dict[str, Any]) -> str:
+        """从 `execute_operation` 的返回里取出 **mod 真实回的动作状态**。
+
+        结构（逐层实证，见 `transport_client._request` :"data = payload.get('data')"）：
+            transport `POST /action` → `{"ok":true,"data":{"action":...,"status":"pending",...}}`
+            `_request` 已把 `data` 拆出来 ⇒ `action_engine.execute` 的 `result["result"]`
+            就是 `{"action":..., "status":"pending","stable":false, ...}`。
+
+        `action_engine.execute` **自己**那条 `result["status"]="ok"` 只是"动作已派发"，
+        与 mod 的执行结果无关 —— 这正是原先误判的根源。
+        取不到时返回 `""`（视为未知，**不**据此判失败，避免误伤）。
+        """
+        inner = result.get("result")
+        if isinstance(inner, dict):
+            raw = inner.get("status")
+            if raw is not None:
+                return str(raw).strip().lower()
+        return ""
+
+    def _note_event_option_locked(self, option_index: int | None) -> None:
+        """★★ D11（t28）：把「被游戏锁定」的事件选项 index 转交给 planner 的**本屏禁用集**。
+
+        ★ 为什么经 service 转交而不是直接在 planner 里读 `is_locked`：
+          · planner 读 `is_locked` 属**事前预防**（字段存在才有效）；
+          · 本函数属**事后校正**（错误驱动，字段缺失也有效）。
+          ⇒ 两条腿正交、互为备份。见 `transport_client.STS2ActionRejected.is_locked_option_rejection`。
+
+        ★ 传 `None` 时**什么都不做**（游戏没点名就不猜）—— 保守，避免误禁正常选项。
+        """
+        if option_index is None:
+            return
+        try:
+            # ★ 用 `self._state.snapshot` —— 它是 tick 每轮写入的**当前快照**
+            #   （`runtime_state.py:75`）。★ 不要用 `last_snapshot`：**该字段不存在**
+            #   （实测 `hasattr(STS2RuntimeState(), 'last_snapshot') = False`），
+            #   若用它，禁用集键会恒为 `"||"`（空屏键）⇒ 禁用集跨屏串味 ⇒ 新的误伤。
+            snapshot = self._state.snapshot if isinstance(self._state.snapshot, dict) else {}
+            self._planner.note_event_option_locked(
+                self._summary_builder.build(snapshot, runtime_state=self._state),
+                option_index,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 记账失败绝不能把决策路径带崩（与 `note_event_option_chosen` 同口径）。
+            self.logger.debug(f"[sts2_d11] note_event_option_locked failed (non-fatal): {exc}")
+
+    def _observe_encounter_memory(self) -> None:
+        """★★ t31：把本 tick 的 `/state` 喂给「怪物/事件实例知识库」。
+
+        ## 为什么读 `snapshot["raw_state"]`
+
+        实测（`_t31_snapshape.log`）：归一化后的 `snapshot` 只有 **11 个键**，
+        `combat` / `event` / `map` / `run` **全部不在其中** —— `normalize_snapshot()`
+        把它们**拍平**掉了。但它把**完整原始载荷**挂在 `snapshot["raw_state"]`（26 键）。
+        ⇒ 采集器必须读 `raw_state`，否则拿不到 `combat.enemies` / `event.options`。
+        ★ 不要改 `normalize_snapshot`（out of scope 且会影响既有决策链）。
+
+        ## 为什么放在 `refresh_state` 的**末尾**
+
+        `refresh_state` 是唯一的 tick 漏斗（`_autoplay_loop` / `sts2_get_status` /
+        各 entry 都经它）。放在末尾是因为：此时 `snapshot` 已定稿、
+        决策已经做完 ⇒ **采集不可能影响本 tick 的任何决策**（契约「纯观测」要求）。
+
+        ## 纯观测与容错
+
+        · 只读：把 `raw_state` 交给采集器，采集器**从不写回**（有测例锁住）。
+        · 不抛：任何异常都吞掉并 `debug` 记一行 —— 采集是"锦上添花"，
+          绝不能因为它让自动游玩停摆（与 `_note_*` 系列同口径）。
+        · 开关：`encounter_memory_enabled`（默认开）。
+        """
+        if not self._encounter_memory_enabled:
+            return
+        try:
+            raw = self._state.snapshot.get("raw_state") if isinstance(self._state.snapshot, dict) else None
+            if not isinstance(raw, dict):
+                return
+            self._encounter_memory.observe(raw)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug(f"[sts2_t31] observe_encounter_memory failed (non-fatal): {exc}")
+
+    def _note_encounter_event_choice(self, option_index: Any) -> None:
+        """★ t31：记下"我刚选了哪个事件选项"，供知识库跨 tick diff 出代价/收益。
+
+        ★ 只在**真的派发**之后调（与 `note_event_option_chosen` 同一位置），
+          否则"规划了但没执行"会被记成"我选了" ⇒ 代价差分失真。
+
+        ★ `option_index` 非 int 时什么都不做（保守，与 `_note_event_option_locked` 同口径）。
+        """
+        if not isinstance(option_index, int):
+            return
+        try:
+            raw = self._state.snapshot.get("raw_state") if isinstance(self._state.snapshot, dict) else None
+            if not isinstance(raw, dict):
+                return
+            self._encounter_memory.note_event_choice(raw, option_index)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug(f"[sts2_t31] note_encounter_event_choice failed (non-fatal): {exc}")
+
+    def _note_action_status(
+        self,
+        *,
+        action_type: str,
+        mod_status: str,
+        snapshot: dict[str, Any] | None = None,
+    ) -> bool:
+        """判定这次派发是否**有效**，并维护 D9 的「连续无效」计数。返回 `True` 表示有效。
+
+        判据（★ 这是本修复的核心，刻意做窄以免误伤正常路径）：
+          · `mod_status` 是 completed/ok/success        ⇒ **有效**，计数清零；
+          · `mod_status` 取不到（""）                    ⇒ **有效**（未知不惩罚，保守）；
+          · `mod_status == "pending"` 且**局面指纹变了** ⇒ **有效**（长动画等合法过渡）
+            ⇒ 计数清零；
+          · `mod_status == "pending"` 且**局面指纹未变** ⇒ **无效** ⇒ 同一指纹下计数 +1。
+
+        「连续无效」达到 `heuristic_planner._SOLVER_DEADLOCK_RETRIES`(3) 时，调用既有破局路径
+        （把 planner 的 `_solver_deadlock_count` 顶到阈值），由 planner 产出
+        `source="solver_deadlock_breaker", reason="solver_deadlock_end_turn"` 的 end_turn。
+        ★ 复用既有机制，不新造破局动作。
+
+        为什么用「局面指纹未变」而不是只看 status：mod 在长动画期间也会回 pending，
+        那时局面**确实在变**，不该计入（契约明确要求不误伤这类）。
+
+        ★ 判据的精确语义（第一版写错过，被本门抓到）：
+          「局面未变」= 与**上一次派发后**观察到的指纹相同 —— 包括**第一次**遇到某指纹。
+          第一版把「首次遇到该指纹」也算作"局面变了、合法过渡"，于是每次 pending 都先
+          `count=0` 再 `+1` ⇒ 计数**永远到不了 3** ⇒ 破局永不触发（等于没修）。
+          正确做法：进入 pending 分支就**无条件** `+1`，只有 status 变为完成态、
+          或指纹真的发生变化时，才清零。
+        """
+        from .loop_runner import _combat_deadlock_signature
+
+        state = self._state
+        # 未知 status ⇒ 不惩罚（避免把正常的旧版 mod / 非战斗动作误判为无效）。
+        if not mod_status:
+            state.invalid_action_signature = ""
+            state.invalid_action_count = 0
+            return True
+        if mod_status in self._VALID_MOD_STATUSES:
+            state.invalid_action_signature = ""
+            state.invalid_action_count = 0
+            return True
+
+        # 至此 status 非完成态 ⇒ 只有"局面真的动了"才算合法过渡。
+        # ★ 注意：这里必须与**上一次**记录的指纹比（不是与"是否为空"比）。
+        signature = _combat_deadlock_signature(snapshot if isinstance(snapshot, dict) else {})
+        board_changed = bool(state.invalid_action_signature) and signature != state.invalid_action_signature
+        state.invalid_action_signature = signature
+        if board_changed:
+            # 局面确实变了 ⇒ 这是合法过渡（长动画等），不计入。
+            state.invalid_action_count = 0
+            return True
+
+        state.invalid_action_count += 1
+        retries = getattr(self._planner, "_SOLVER_DEADLOCK_RETRIES", 3)
+        try:
+            self.logger.warning(
+                "[sts2_d9] 动作无效：mod 回 status=%s 且局面指纹 %s 未变"
+                "（连续 %d/%d；action=%s）"
+                % (mod_status, signature or "<空>", state.invalid_action_count, retries, action_type)
+            )
+        except Exception:
+            pass
+        if state.invalid_action_count >= retries:
+            # ★ 复用既有破局路径：把 planner 的死锁计数顶到阈值 + 对齐指纹，让它下一 tick
+            #   产出 `solver_deadlock_breaker / solver_deadlock_end_turn` 的 end_turn。
+            self._planner._solver_deadlock_signature = signature
+            self._planner._solver_deadlock_count = retries
+            try:
+                self.logger.warning(
+                    "[sts2_d9] 连续 %d 次「mod 回 %s 且局面未变」⇒ 判定动作无效，"
+                    "转入 end_turn 破局（source=solver_deadlock_breaker, "
+                    "reason=solver_deadlock_end_turn）" % (state.invalid_action_count, mod_status)
+                )
+            except Exception:
+                pass
+            state.invalid_action_signature = ""
+            state.invalid_action_count = 0
+        return False
+
+    def _note_potion_maybe_no_effect(self, snapshot: dict[str, Any], before_count: int) -> None:
+        """★ t20/D9 可观测性：同一 turn_key 下连续 3 次 `use_potion` 而**药水数量未减少** ⇒ 告警。
+
+        这是"静默"与"可观测"的分界：D9 症状就是药水被游戏侧 `Cancel()`（槽位纹丝不动）
+        而插件毫无表示。即使位移判据因故没触发，这条告警也必须让人一眼看见。
+        """
+        state = self._state
+        after_count = self._count_potions(snapshot)
+        if after_count < before_count:
+            state.potion_no_effect_turn_key = ""
+            state.potion_no_effect_count = 0
+            state.potion_no_effect_warned = False
+            return
+        turn_key = self._combat_turn_key(snapshot)
+        if turn_key != state.potion_no_effect_turn_key:
+            state.potion_no_effect_turn_key = turn_key
+            state.potion_no_effect_count = 0
+            state.potion_no_effect_warned = False
+        state.potion_no_effect_count += 1
+        if state.potion_no_effect_count >= 3 and not state.potion_no_effect_warned:
+            state.potion_no_effect_warned = True
+            try:
+                self.logger.warning(
+                    "[sts2_d9] ⚠ 同一回合（%s）连续 %d 次 use_potion 被派发但药水数量未减少"
+                    "（前=%d 后=%d）⇒ 药水很可能被游戏侧取消、插件未察觉"
+                    % (turn_key, state.potion_no_effect_count, before_count, after_count)
+                )
+            except Exception:
+                pass
+
+    @staticmethod
+    def _count_potions(snapshot: dict[str, Any] | None) -> int:
+        """数当前「还占着槽位的药水」数量（`None` 槽不计）。"""
+        if not isinstance(snapshot, dict):
+            return 0
+        raw = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        combat = raw.get("combat") if isinstance(raw.get("combat"), dict) else {}
+        potions = combat.get("potions")
+        if potions is None:
+            potions = raw.get("potions")
+        if not isinstance(potions, list):
+            return 0
+        n = 0
+        for item in potions:
+            if isinstance(item, dict):
+                if item.get("potion_id") or item.get("id") or item.get("name"):
+                    n += 1
+            elif item:
+                n += 1
+        return n
 
     async def get_status(self) -> dict[str, Any]:
         snapshot = self._state.snapshot if isinstance(self._state.snapshot, dict) else {}
@@ -3521,6 +4007,7 @@ class STS2AutoplayService:
         self._state.stop_reason = ""
         self._sync_background_polling()
         self._loop_runner.start_autoplay()
+        self._apply_mode_danmaku_policy()
         self._emit_status()
         message = self.t("autoplay.started", default="已启动尖塔自动运行。")
         return {"status": "ok", "message": message, "summary": message}
@@ -3533,6 +4020,7 @@ class STS2AutoplayService:
         self._state.autoplay_state = "paused"
         self._state.pause_reason = reason
         self._sync_background_polling()
+        self._apply_mode_danmaku_policy()
         self._emit_status()
         message = self.t("autoplay.paused", default="已暂停尖塔自动运行。")
         return {"status": "ok", "message": message, "summary": message, "pause_reason": reason}
@@ -3549,6 +4037,7 @@ class STS2AutoplayService:
         self._state.pause_reason = ""
         self._sync_background_polling()
         self._loop_runner.start_autoplay()
+        self._apply_mode_danmaku_policy()
         self._emit_status()
         message = self.t("autoplay.resumed", default="已恢复尖塔自动运行。")
         return {"status": "ok", "message": message, "summary": message}
@@ -3563,14 +4052,17 @@ class STS2AutoplayService:
         self._state.stop_reason = reason
         self._state.pause_reason = ""
         self._sync_background_polling()
+        self._apply_mode_danmaku_policy()
         self._emit_status()
         message = self.t("autoplay.stopped", default="已停止尖塔自动运行。")
         return {"status": "ok", "message": message, "summary": message, "stop_reason": reason}
 
     def set_host_digest_enabled(self, enabled: bool) -> dict[str, Any]:
-        """开关「尖塔速报」：是否把局势悄悄交给本体，让它自己主动跟观众讲一句。
+        """开关「尖塔速报」：是否把局势悄悄交给本体，让它自己主动讲一句。
 
         关掉只影响这一路（不可见、不进记忆的主动投递）；**游戏内弹幕、自动游玩、历史记录都不受影响**。
+
+        措辞不提"观众"：本插件是单人陪伴场景。等后续接直播插件时，听众称呼应由那边提供。
         """
         self._state.host_digest_enabled = bool(enabled)
         self._cfg["host_digest_enabled"] = bool(enabled)
@@ -3620,6 +4112,113 @@ class STS2AutoplayService:
     def set_standby(self, standby: bool) -> dict[str, Any]:
         normalized = self._apply_control_mode("standby" if standby else "program")
         return self._mode_controller.describe(normalized) | {"mode": normalized}
+
+    #: ════════════════════════════════════════════════════════════════════════
+    #: ★★ 弹幕 ⟷ 模式 的耦合规则（冻结区，改前必读）
+    #: ════════════════════════════════════════════════════════════════════════
+    #:
+    #: 玩家指示（2026-10-18）：
+    #:   「自动游玩的时候关闭弹幕，陪玩模式下才可以开启，
+    #:     然后弹幕保留出牌建议（陪玩是玩家自己玩，看不到求解器，
+    #:     所以用弹幕提醒）」
+    #:
+    #: ⇒ 判据不是"弹幕开关"，而是**玩家在不在场**：
+    #:
+    #:   ┌────────────┬──────────┬────────────┬────────────────────────────┐
+    #:   │ 模式       │ 谁在玩   │ 弹幕       │ 出牌建议                   │
+    #:   ├────────────┼──────────┼────────────┼────────────────────────────┤
+    #:   │ 自动游玩   │ 猫娘     │ **关闭**   │ —（她自己就是求解器的执行端）│
+    #:   │ 陪玩模式   │ **玩家** │ **开启**   │ ★ **必须有**                │
+    #:   └────────────┴──────────┴────────────┴────────────────────────────┘
+    #:
+    #: **为什么陪玩必须有出牌建议**：玩家自己在打，**看不到求解器**，
+    #: 弹幕是唯一的告知渠道。没有它，陪玩就只是"猫娘在旁边看"，
+    #: 而玩家拿不到任何决策支持。
+    #:
+    #: **为什么自动游玩要关**：没人在看弹幕，它只是屏幕噪声 + 白烧 LLM 调用。
+    #:
+    #: ★ 建议的**来源与口吻**（与战斗纯求解器改造一致）：
+    #:   * 来源 = **求解器**（和自动游玩同一个权威来源，不能是第二意见）
+    #:   * 口吻 = **第一人称**（"这回合我打『打击』"）
+    #:     —— 弹幕是猫娘在说，不是"插件转述求解器"。
+    #: ════════════════════════════════════════════════════════════════════════
+
+    def _apply_mode_danmaku_policy(self) -> dict[str, Any]:
+        """按当前模式同步弹幕开关。返回 {'changed': bool, 'enabled': bool, 'reason': str}。
+
+        ★ 触发点：`start_autoplay` / `stop_autoplay` / `pause_autoplay` /
+          `resume_autoplay` / `set_companion_mode`（另见 `set_coop_danmaku_context`）。
+        ★ 只在**开与关互斥**的两种主动模式下自动改；`advise`/`standby` 不动用户的选择
+          （那两种是"玩家在主导但没明确要陪玩"，擅自关掉会让人以为弹幕坏了）。
+
+        ★★ 优先级（玩家口径 2026-10-19，**从高到低**）：
+
+            coop（联机）  >  autoplay（自动游玩）  >  陪玩（companion）
+
+        玩家原话：「autoplay 优先，coop」＋「coop模式>autoplay>陪玩」。
+
+        为什么必须写明顺序（而不是各写一个 if）：这三个是**不同的轴**，
+        而且**可以同时成立**——
+          * `coop`  = **联机会话**（两人一起玩；见 `active_instance` / `open_coop_room`）
+          * `autoplay` = 插件**替你打**
+          * `陪玩`   = 插件**只点评、你自己打**
+        ⇒ 老实现是「陪玩 if 在前，autoplay elif 在后」，
+          于是**陪玩一开就压过 autoplay** ⇒ 自动游玩时弹幕反而开着，
+          与玩家指令「自动游玩的时候关闭弹幕」**正好相反**（实测 0 条 danmaku_policy
+          日志 + 93 条推送 = 弹幕确实没被关掉）。
+        ⇒ 现在按上表**从高到低**判，谁高听谁的：
+          * coop 且**没在**autoplay ⇒ **开**（联机时要让同伴看见猫娘点评）
+          * autoplay（不论是否 coop）⇒ **关**（★ autoplay 压过陪玩，也压过 coop 的"开"）
+          * 只有陪玩 ⇒ **开**
+          * 都没有 ⇒ 不动（`no_policy`）
+
+        ★ 注：`autoplay` 的语义是"没人看着屏幕"，弹幕刷出去没人读、还挤占 LLM 与日志，
+          所以它一旦在跑就关；这是玩家明确要求的方向。
+        """
+        companion = bool(self._cfg.get("companion_mode_enabled", False))
+        autoplay_running = self._state.autoplay_state in {"running", "paused"}
+        # ★ coop = 联机会话中。判据取"活动实例已是 coop 里的猫娘进程"或"联机房间已开"，
+        #   两者任一成立即视为联机（见 switch_active_instance / open_coop_room）。
+        coop_active = self._is_coop_active()
+
+        # ★★ 从高到低判，先命中者胜。
+        if autoplay_running:
+            # autoplay 最高优先（含压过 coop）⇒ 关。
+            want = False
+            reason = "autoplay"
+        elif coop_active:
+            want = True
+            reason = "coop"
+        elif companion:
+            want = True
+            reason = "companion_mode"
+        else:
+            return {"changed": False, "enabled": self._danmaku_enabled, "reason": "no_policy"}
+        if want == self._danmaku_enabled:
+            return {"changed": False, "enabled": want, "reason": reason}
+        self.set_danmaku_enabled(want)
+        self.logger.info(
+            "[sts2_danmaku_policy] 弹幕随模式自动%s（reason=%s；优先级 coop>autoplay>陪玩）",
+            "开启" if want else "关闭",
+            reason,
+        )
+        return {"changed": True, "enabled": want, "reason": reason}
+
+    def _is_coop_active(self) -> bool:
+        """当前是否处于**联机会话**中。
+
+        ★ 判据（任一成立即为联机）：
+          1. `active_instance == "catgirl"` —— 房间开好了、插件已接管被拉起的猫娘进程
+             （`open_coop_room(host=True)` 成功后 `adopt_coop_catgirl` 会切过去）；
+          2. `_coop_room_open` —— 显式记录的联机房间状态（open/close 时置位）。
+
+        ★ 保守方向：**取不准时返回 False**。
+          理由：coop 分支的后果是"开弹幕"，若误判成联机就会在单人局里凭空打开弹幕；
+          而 autoplay 关弹幕那一条**不依赖本函数**（它先判），所以保守不会削弱玩家指令。
+        """
+        if getattr(self._state, "active_instance", self.INSTANCE_HOST) == self.INSTANCE_CATGIRL:
+            return True
+        return bool(getattr(self, "_coop_room_open", False))
 
     def set_danmaku_enabled(self, enabled: bool) -> dict[str, Any]:
         """游戏内弹幕总开关（插件侧真闸门）。
@@ -3778,7 +4377,9 @@ class STS2AutoplayService:
             self._state.last_companion_combat_comment_key = ""
             self._state.last_companion_player_op_fingerprint = ""
             self._state.latest_sync_packet = {}
-        message = self.t("companion.enabled", default="已开启陪玩模式。") if enabled else self.t("companion.disabled", default="已关闭陪玩模式。")
+        message = self.t("companion.enabled", default="我来陪你玩，陪玩模式开启。") if enabled else self.t("companion.disabled", default="我先歇一会儿，陪玩模式关掉了。")
+        # ★ 陪玩 = 玩家自己在玩 ⇒ 弹幕要开（那是他唯一能看到出牌建议的渠道）。
+        self._apply_mode_danmaku_policy()
         if emit_status:
             self._emit_status()
         if enabled:
@@ -4157,6 +4758,27 @@ class STS2AutoplayService:
                 exc.action_name,
                 exc.screen,
             )
+        # ★★ D11（t28）：EVENT 屏「选项被锁」——**与上面的 retryable 分支互斥且互补**。
+        #
+        #   实测：mod 对 locked 明确回 `retryable: false`（真响应逐字见
+        #   `transport_client.STS2ActionRejected.LOCKED_OPTION_MESSAGE_MARKERS` 注释），
+        #   ⇒ 上面的分支**不会**执行（全日志 `[sts2_recover] 动作被拒` = **0** 条已独立证实）。
+        #   ⇒ 所以"重算"从未被触发；即便触发，EVENT 屏**没有战斗计划**可作废，
+        #      重算仍是按**同一未变局面**算 ⇒ 得到**同一被锁选项** ⇒ 永久卡死。
+        #
+        #   ★ 处置：游戏**精确点名**了哪个 index 被锁（`details.option_index`）
+        #     ⇒ 直接把它记入本屏禁用集，下一 tick 起自动改选次优**未锁**项。
+        elif isinstance(exc, STS2ActionRejected) and exc.is_locked_option_rejection:
+            locked_index = exc.locked_option_index
+            try:
+                self.logger.warning(
+                    "[sts2_d11] 事件选项被游戏锁定：code=%s action=%s option_index=%s "
+                    "⇒ 记入本屏禁用集，改选次优未锁项（重算不会改变结论）"
+                    % (exc.code, exc.action_name, locked_index)
+                )
+            except Exception:
+                pass
+            self._note_event_option_locked(locked_index)
         self._emit_status()
 
     def _invalidate_combat_plan_cache(self, *, reason: str = "") -> None:
@@ -4326,19 +4948,19 @@ class STS2AutoplayService:
         current_screen = str(current_snapshot.get("screen") or "unknown")
         delta_text = str(delta.get("text") or "").strip()
         if event_type == "combat_started":
-            return self.t("companion.player_operation.combat_started", default="玩家进入了新的战斗。")
+            return self.t("companion.player_operation.combat_started", default="你进新战斗了。")
         if event_type == "combat_ended":
-            return self.t("companion.player_operation.combat_ended", default="玩家刚结束这场战斗，局面已经切到后续结算。")
+            return self.t("companion.player_operation.combat_ended", default="你刚打完这场，局面切到结算了。")
         if event_type == "combat_turn_advanced":
-            return self.t("companion.player_operation.combat_turn_advanced", default="玩家已经推进到新的战斗回合。")
+            return self.t("companion.player_operation.combat_turn_advanced", default="你推进到新的战斗回合了。")
         if event_type == "player_card_or_action_committed":
-            return delta_text or self.t("companion.player_operation.action_committed", default="玩家刚在战斗中完成了一步操作。")
+            return delta_text or self.t("companion.player_operation.action_committed", default="你在战斗里走了一步。")
         if event_type == "choice_committed":
-            return self.t("companion.player_operation.choice_committed", default="玩家刚完成了一个关键选择，画面从 {previous_screen} 进入 {current_screen}。", previous_screen=previous_screen, current_screen=current_screen)
+            return self.t("companion.player_operation.choice_committed", default="你刚做完一个关键选择，画面从 {previous_screen} 进到 {current_screen} 了。", previous_screen=previous_screen, current_screen=current_screen)
         if event_type == "run_progressed":
-            return self.t("companion.player_operation.run_progressed", default="玩家推进了当前流程，楼层或章节发生了变化。")
+            return self.t("companion.player_operation.run_progressed", default="你推进了流程，楼层或章节变了。")
         if event_type == "screen_transition":
-            return self.t("companion.player_operation.screen_transition", default="玩家把画面从 {previous_screen} 切换到了 {current_screen}。", previous_screen=previous_screen, current_screen=current_screen)
+            return self.t("companion.player_operation.screen_transition", default="你把画面从 {previous_screen} 切到了 {current_screen}。", previous_screen=previous_screen, current_screen=current_screen)
         return delta_text
 
     def _is_recent_plugin_action(self, observation: dict[str, Any]) -> bool:
@@ -4610,7 +5232,32 @@ class STS2AutoplayService:
             if isinstance(hp, (int, float)):
                 lowest = int(hp) if not isinstance(lowest, (int, float)) else min(int(lowest), int(hp))
             current["lowest_hp"] = lowest
+            # ★★ t34 / D21 修：显式记录「这一段里到底读没读到过 hp」。
+            #
+            # 【为什么必须加这个标记】把本方法逐字抽出来跑（.dsh-artifacts/_t34_sim.py）证明：
+            #   · hp 可读时，本方法**产生不出** lowest_hp==0（实验1：0/2）
+            #   · 但 hp **读不到**时（`isinstance(hp,(int,float))` 为假），:2657 仍写
+            #     `lowest_hp = None`；`_close_route_room` 的 isinstance 为假 ⇒ `hp_lost` 静默留在 0
+            #   ⇒ 这个 0 与「这房间真的没掉血」的 0 **完全无法区分**
+            #   ⇒ 属 CANON 口径的「无痕迹的观察缺口」—— 死因判据无法知道哪条可信。
+            #
+            # 【★ 为什么不是「把 hp_lost 改成别的值」】契约（t30 §1）把 `hp_lost` 定义为
+            #   `max(0, hp_start - lowest_hp)`，且死因判据依赖它。**不许换定义**。
+            #   ⇒ 所以只**加一个可分辨标记**，`hp_lost` 的数值一个字节都不动
+            #     （`test_new_field_does_not_change_hp_lost_value` 锁住这点）。
+            #
+            # 【历史数据的说明】实测全库 322 条 COMBAT 的 lowest_hp==0 **全部落在
+            #   28 个「整局全 0」的历史局**（10-17 ~ 10-19）；22 个 mixed 局的 447 条 COMBAT
+            #   里 **0 条** 有 0 ⇒ 那些 0 是旧代码形态的产物，不是当前代码产生的。
+            #   详见 .dsh-artifacts/_t34_diag.log / _t34_root.log / _t34_verdict.log。
+            current["hp_seen"] = isinstance(hp, (int, float))
+            current["start_hp_seen"] = current.get("start_hp_seen")
             self._state.route_last = current
+            # ★ 房间起始时的可读性：开房那一刻记一次，结算时两段都要可读才算「损血已知」。
+            if not self._state.route_start.get("start_hp_seen"):
+                self._state.route_start["start_hp_seen"] = isinstance(
+                    self._state.route_start.get("hp"), (int, float)
+                )
         except Exception as exc:
             self.logger.info("[sts2_route] step failed (non-fatal): %s", exc)
 
@@ -4625,6 +5272,16 @@ class STS2AutoplayService:
         hp_lost = 0
         if isinstance(start_hp, (int, float)) and isinstance(lowest, (int, float)):
             hp_lost = max(0, int(start_hp) - int(lowest))
+        # ★★ t34 / D21：损血是否**真的量到了**。两个条件都满足才算已知：
+        #   · 开房那一刻读到了 hp（否则 hp_start 为 None，`max(0, ...)` 的输入就不完整）
+        #   · 本段至少有一次读到过 hp（否则 lowest 为 None）
+        # ★ 注意：这里**只标注**，不动 hp_lost 的值（契约要求定义不变）。
+        hp_loss_known = bool(
+            isinstance(start_hp, (int, float))
+            and isinstance(lowest, (int, float))
+            and start.get("start_hp_seen") is not False
+            and last.get("hp_seen") is not False
+        )
         new_cards = sorted(set(last.get("deck") or []) - set(start.get("deck") or []))
         new_relics = sorted(set(last.get("relics") or []) - set(start.get("relics") or []))
         new_potions = sorted(set(last.get("potions") or []) - set(start.get("potions") or []))
@@ -4636,6 +5293,10 @@ class STS2AutoplayService:
             "hp_end": last.get("hp"),
             "lowest_hp": lowest,
             "hp_lost": hp_lost,
+            # ★ t34 / D21 新增：`hp_loss_known=False` 表示「这段的损血**不知道**」，
+            #   与 `hp_lost == 0`（真的没掉血）必须可区分。
+            #   消费方（死因判据 / 六维反思）可以据此决定是否采信这一条。
+            "hp_loss_known": hp_loss_known,
             "gold_gained": max(0, int(last.get("gold") or 0) - int(start.get("gold") or 0)),
             "cards_gained": new_cards,
             "relics_gained": new_relics,
@@ -4728,6 +5389,87 @@ class STS2AutoplayService:
         except Exception as exc:
             self.logger.info("[sts2_character] announce failed (non-fatal): %s", exc)
 
+    def _final_deck_snapshot(self, raw_state: dict[str, Any]) -> list[dict[str, Any]]:
+        """取**局末牌组**的完整卡片（不是 id 列表）。
+
+        为什么要单独取：`_run_snapshot`（:2054）为了"算收获"把 deck 压成了
+        **排序后的 card_id 列表**（:2068）—— 那对差集够用，但**六维量化读不了**
+        （它要 card_type / upgraded / energy_cost / dynamic_values / rules_text）。
+
+        ⇒ 这里回到 `raw_state.run.deck` 原始数组（mod 的 `DeckCardPayload`，
+          `GameStateService.cs:4993`），那里字段是全的。
+
+        ⚠️ 兜底：终局屏如果没带 deck（例如 victory 屏的 payload 不同），
+           就返回空列表 —— `build_gap_lessons` 对空牌组**不产教训**，
+           不会编造，也不会抛错。
+        """
+        run = raw_state.get("run") if isinstance(raw_state.get("run"), dict) else {}
+        deck = run.get("deck")
+        if not isinstance(deck, list):
+            return []
+        return [dict(card) for card in deck if isinstance(card, dict)]
+
+    def _build_gap_lessons(
+        self,
+        deck: list[dict[str, Any]],
+        *,
+        route: list[dict[str, Any]],
+        floor: int,
+        hp_report: dict[str, Any],
+        outcome: str,
+    ) -> tuple[list[str], dict[str, Any] | None]:
+        """局末把牌组量化成「六维缺口」教训（`deck_gap_reflection`）。
+
+        ★ 死因与缺口**交叉**：死因决定"该重点看哪一维"，缺口决定"缺多少"。
+          这正是玩家要的「遇到群怪就死就反思有没有拿 aoe 卡，
+          遇到 boss 和精英就死需要反思选卡的数值和强化卡选择」。
+
+        ★★ t38：把**同一个** `build_death_attribution()` 产物一并返回
+          （``(lessons, attribution)``），供 `_maybe_record_run_memory` 落库。
+          为什么返回而不是在外面再算一次：**同一个判决只能有一个来源**。
+          在外面重算会让"用于决策的死因"与"落库的死因"变成两次独立求值，
+          一旦 route/hp 的时点不同就会漂移 —— 这正是本模块注释里反复强调的同源纪律。
+
+        ⚠️ 全程 try/except：**复盘绝不能因为量化失败而中断**。
+           terminal 屏会反复出现，这里抛错会让整局记忆丢失。
+        """
+        attribution_out: dict[str, Any] | None = None
+        try:
+            from .death_attribution import build_death_attribution
+
+            # 死因：用 route（此刻还没被清空）+ outcome 推。
+            # ★ 复用死亡归因模块，**不另写一套判据** —— 否则"死因"会有两个互相矛盾的说法。
+            attribution = build_death_attribution(
+                {
+                    "outcome": outcome,
+                    "floor": floor,
+                    "route": route,
+                    "hp": dict(hp_report or {}),
+                }
+            )
+            # ★ 即使没有牌组（下面 early-return），死因也照样要落库 ——
+            #   死因是**独立于牌组**的事实，"这局怎么死的"不该因为没有 deck 快照就丢。
+            attribution_out = attribution
+            if not deck:
+                return [], attribution_out
+            from .deck_gap_reflection import build_gap_lessons
+
+            hp_max = self._safe_int((hp_report or {}).get("max_hp")) or 0
+            hp_min = self._safe_int((hp_report or {}).get("min_hp")) or 0
+            lessons = build_gap_lessons(
+                {"cards": deck},
+                planner=self._planner,
+                floor=floor,
+                current_hp=hp_min,
+                max_hp=hp_max,
+                death_kind=str(attribution.get("kind") or ""),
+                outcome=outcome,
+            )
+            return lessons, attribution_out
+        except Exception:
+            self.logger.exception("[sts2_gap] 六维缺口反思失败（不影响复盘主链路）")
+            return [], attribution_out
+
     def _maybe_record_run_memory(self, snapshot: dict[str, Any]) -> None:
         """run 结束（死亡/通关）时，把本局决策痕迹总结成教训/偏好写进猫娘记忆。
 
@@ -4771,6 +5513,20 @@ class STS2AutoplayService:
             if self._companion_session.journal.data:
                 self._companion_session.journal.data.setdefault("telemetry", {})["route_log"] = deepcopy(route)
                 self._companion_session.journal.save()
+            # ★★ 六维缺口反思（2026-10-19）：把**局末牌组**量化成"缺哪一维"的教训。
+            #
+            # 为什么在这里算而不在 memory store 里算：
+            #   ① planner 实例在 service（`self._planner`，:99），store 拿不到
+            #   ② 死因要从 route 推，而 route 正要被清空（下面 `self._state.route_log = []`）
+            # ⇒ 两个输入都只在这一刻齐备。
+            deck_snapshot = self._final_deck_snapshot(raw_state)
+            gap_lessons, death_attribution = self._build_gap_lessons(
+                deck_snapshot,
+                route=route,
+                floor=floor,
+                hp_report=hp_report,
+                outcome=outcome,
+            )
             record = self._catgirl_memory.add_run(
                 run_id,
                 character=character,
@@ -4781,8 +5537,15 @@ class STS2AutoplayService:
                 hp_report=hp_report,
                 route=route,
                 process=self._companion_session.journal.run_context(),
+                deck=deck_snapshot,
+                extra_lessons=gap_lessons,
             )
             hp_report = record.get("hp") or {}
+            # ★★★ t38/§22：把死因判决**落库**（此前只现算即丢 ⇒ 死因分布无法从产物复算）。
+            #   ★ 必须在这里做，而不是在 add_run 里：`catgirl_memory.py` 不在本任务 scope，
+            #     且 add_run 内部 `save()` 后返回的是 `dict(run)` **副本** ⇒ 改返回值不会落盘。
+            #     所以走「attach 落库」这条路：写进 `_runs` 里那条真记录，再存一次。
+            self._persist_death_attribution(record, death_attribution)
             self._state.route_log = []
             self._state.route_room_key = ""
             self._state.route_start = {}
@@ -4821,6 +5584,52 @@ class STS2AutoplayService:
                 self._resume_after_reflection()
         except Exception as exc:
             self.logger.info("[sts2_memory] record run end failed (non-fatal): %s", exc)
+
+    def _persist_death_attribution(
+        self, record: dict[str, Any], attribution: dict[str, Any] | None
+    ) -> None:
+        """把死因判决写进记忆库里那条 run 记录，并落盘（t38）。
+
+        ★ 为什么要"attach 再 save"而不是给 `add_run` 加参数：
+          `catgirl_memory.py` **不在 t38 的 scope**（契约明确划出），
+          且 `add_run` 在内部 `save()` **之后**返回 `dict(run)`（**副本**）
+          ⇒ 改返回值不会进文件。所以只能写 `_runs` 里的**同一个对象**再存一次。
+
+        ★ 无 attribution 时**什么都不写**：让该局保持"**没有这个字段**"。
+          这正是契约要求的向后兼容语义 —— 旧数据（t38 之前 50 局）是 `absent`，
+          与"算出来是 unknown"**不是一回事**，绝不能补一个 `kind="unknown"` 去糊上
+          （那会把"系统没落库"伪装成"这局证据不足"，是 t30 里 zero vs null 的同款错误）。
+
+        ⚠️ 全程吞异常：落库失败**不得**影响记忆主链路（复盘/暂停/异步反思都在它后面）。
+        """
+        if not isinstance(attribution, dict):
+            return
+        try:
+            from .death_attribution import DEATH_RECORD_KEY, attribution_to_record
+
+            payload = attribution_to_record(attribution)
+            run_id = str((record or {}).get("run_id") or "")
+            target = None
+            for item in self._catgirl_memory.runs:
+                if isinstance(item, dict) and str(item.get("run_id") or "") == run_id:
+                    target = item
+                    break
+            if target is None:
+                return
+            target[DEATH_RECORD_KEY] = payload
+            self._catgirl_memory.save()
+            self.logger.info(
+                "[sts2_death] 死因已落库 run_id=%s kind=%s 依据(战斗房=%s 损血=%s 最重房=%s share=%s 群怪share=%s)",
+                run_id,
+                payload.get("kind"),
+                payload.get("combat_rooms"),
+                payload.get("combat_lost"),
+                payload.get("worst_room"),
+                payload.get("worst_share"),
+                payload.get("multi_enemy_share"),
+            )
+        except Exception as exc:
+            self.logger.info("[sts2_death] 死因落库失败 (non-fatal): %s", exc)
 
     def _write_history_view(self) -> None:
         """把历史投影成插件 static 目录下的 JSON，供前端"自动游玩历史"页读取。
@@ -5500,6 +6309,105 @@ class STS2AutoplayService:
             "reason": "potion_lethal_save" if decision.get("lethal") else "potion_incoming_damage",
         }
 
+    def _crystal_sphere_override(self, snapshot: dict[str, Any]) -> dict[str, Any] | None:
+        """占卜（水晶球）屏上代替规划器发 `divine_crystal_sphere`；不需要就返回 None。
+
+        ## 为什么必须由插件出这一手
+
+        `mod` 侧（t33 已改）给这一屏补了 `crystal_sphere` 状态层与 `divine_crystal_sphere` 动作，
+        但**规划器认不出它**：这一屏的 `screen` 是 `EVENT`（mod 用 `ResolveScreenFromStaticRoom()`
+        兜底猜的），而 `event` 层仍是 null ⇒ `heuristic_planner` 的 `state_name == "event"` 分支
+        找不到 `choose_event_option` ⇒ 规划不出动作 ⇒ 空转。
+
+        ⇒ 所以这里像 `_combat_potion_override` 一样**抢在规划器前面**出动作。
+
+        ## 为什么不能等它自己"掉进游标"
+
+        :meth:`_advance_custom_event_cursor` 作用在**已经规划出来的** `choose_event_option` 上，
+        可这一屏根本没有那个动作 ⇒ 游标机制够不着（它的早退条件不止 `:672`，
+        更根本的是上游压根没产出动作）。t33 契约里写的「若 mod 补了 event 层，
+        则 :672 早退应能自然放开」——**实测并不成立**：mod 补的是 `crystal_sphere` 层，
+        不是 `event.screen_progress`，所以那条路仍然不通。本方法就是补上的那一段。
+
+        ## 揭哪一块
+
+        mod 侧的 `crystal_sphere` 层给出两类清单：
+        · `revealed_cells` —— **已经揭开**的格子（含 `item_type`：CardReward/Curse/Gold/Potion/Relic）；
+        · `candidates` —— **可点候选**（当前隐藏格）的坐标清单。
+
+        ★ 为什么必须要有 `candidates` 而不只是 `cells_hidden` 这个数字：
+          占卜的核心决策就是"揭哪一块"，而**纯数量无法支撑决策** ——
+          只知道"还有 37 块没揭"时，插件只能按下标瞎点。
+          （这正是队长在 t33 里指出的能力缺口；与 CANON §23
+          「枚举要给出**有哪些可能**，不只是**有多少**」同源。）
+
+        ## 本方法的取格策略（**保守但可解释**）
+
+        按 `candidates` 顺序推进、到尾回绕，每次都记住自己揭的是哪一块。理由：
+        这一屏"哪块值得揭"在揭开前**信息不完全**（不知道是钱还是诅咒），
+        逐个扫过一定能穷尽，比"死盯一块反复空点"稳得多（与 :656 游标同款理由）。
+        ★ 诚实的边界：这是**扫格**，不是**选优** —— 现在没有依据判断"哪块更好"，
+          所以不假装在优化。有了 `candidates` 的坐标后，将来要按位置启发式选格时，
+          改这里一处即可。
+        """
+        raw = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        cs = raw.get("crystal_sphere") if isinstance(raw.get("crystal_sphere"), dict) else {}
+        if not cs.get("active"):
+            return None
+        if cs.get("is_finished"):
+            # 小游戏已结束：这一屏该走 proceed / choose_event_option，不该再揭格子。
+            return None
+        actions = snapshot.get("available_actions")
+        if not isinstance(actions, list):
+            actions = raw.get("available_actions") if isinstance(raw.get("available_actions"), list) else []
+        has_divine = any(
+            str(a.get("type") if isinstance(a, dict) else a).strip().lower() == "divine_crystal_sphere"
+            for a in actions
+        )
+        if not has_divine:
+            return None
+
+        # ★ 候选格子清单（队长 ② 补上的 `candidates`）：优先用它，拿不到才退回计数。
+        #   前者能说出"揭的是哪一块（x,y）"，后者只能说"第几块" —— 报告里要能读出决策依据。
+        candidates = cs.get("candidates") if isinstance(cs.get("candidates"), list) else []
+        hidden = cs.get("cells_hidden")
+        if candidates:
+            limit: int | None = len(candidates)
+        elif isinstance(hidden, int) and hidden > 0:
+            limit = hidden
+        else:
+            limit = None
+        screen_key = f"divine|{snapshot.get('screen')}|{snapshot.get('floor')}"
+        if screen_key != self._state.event_option_screen:
+            self._state.event_option_screen = screen_key
+            self._state.event_option_cursor = 0
+        index = self._state.event_option_cursor
+        if limit is not None:
+            index %= limit
+        self._state.event_option_cursor = index + 1
+        coord: dict[str, Any] = {}
+        if candidates and index < len(candidates):
+            cell = candidates[index]
+            if isinstance(cell, dict):
+                coord = {"x": cell.get("x"), "y": cell.get("y")}
+        try:
+            self.logger.info(
+                "[sts2_divine] 这一手揭第 %s 块%s（可选 %s 块，还剩 %s 次占卜）",
+                index,
+                f"（坐标 {coord.get('x')},{coord.get('y')}）" if coord else "",
+                len(candidates) if candidates else cs.get("cells_hidden"),
+                cs.get("divinations_left"),
+            )
+        except Exception:
+            pass
+        return {
+            "action_type": "divine_crystal_sphere",
+            "kwargs": {"option_index": index},
+            "confidence": 0.8,
+            "source": "heuristic",
+            "reason": "crystal_sphere_divine",
+        }
+
     def _log_potion_decision(self, snapshot: dict[str, Any], turn_key: str, decision: dict[str, Any]) -> None:
         """把这一 tick 的用药水判断用 info 级记一次（同一局面同一结论只记一次，避免刷屏）。
 
@@ -5519,7 +6427,7 @@ class STS2AutoplayService:
             pass
 
     def _situation_digest_text(self, snapshot: dict[str, Any], payload: dict[str, Any]) -> str:
-        """给本体的**局势速报**（它据此主动跟观众讲一句）。
+        """给本体的**局势速报**（它据此主动讲一句）。
 
         内容给足才有"互动味"：战斗里报敌人+意图+我方血量，其余界面报界面名与层级。
         以前这里刻意压到 30 字以内 —— 因为 dispatcher 会截断；现在优先走 SDK 的
@@ -5548,8 +6456,35 @@ class STS2AutoplayService:
         return f"{head}{screen}界面"
 
     def _push_host_situation_digest(self, snapshot: dict[str, Any], payload: dict[str, Any]) -> None:
-        """兼容旧调用入口，统一使用事件驱动的主动交流。"""
-        self._deliver_catgirl_sync(snapshot)
+        """旧调用入口：把局势**悄悄**交给本体，让它自己主动讲一句。
+
+        新链路已统一走事件驱动的主动交流（`_deliver_catgirl_sync`）；本方法保留为
+        兼容入口（现有生产代码不再调用它），语义与上游一致：场景/回合变化 + 时间节流。
+        """
+        notifier = self._frontend_notifier
+        if (notifier is None and self._sdk_ctx is None) or not self._danmaku_enabled:
+            return
+        if not getattr(self._state, "host_digest_enabled", True):
+            return
+        try:
+            key = self._instant_line_key(snapshot, payload)
+        except Exception:
+            return
+        if not key or key == self._state.last_host_digest_key:
+            return
+        now = time()
+        if now - self._state.last_host_digest_at < self.HOST_DIGEST_MIN_INTERVAL_SECONDS:
+            return
+        digest = self._situation_digest_text(snapshot, payload)
+        if not digest:
+            return
+        self._state.last_host_digest_key = key
+        self._state.last_host_digest_at = now
+        self._push_proactive_to_host(
+            f"当前对局情况：{digest}。用你自己的口吻说一句，别念稿、一两句就够。",
+            kind="situation_digest",
+            priority=4,
+        )
 
     def _maybe_emit_catgirl_llm(self, snapshot: dict[str, Any], companion_evaluation: dict[str, Any], payload: dict[str, Any]) -> None:
         """catgirl 轨道：猫娘 LLM 生成点评（优先）或启发式 primary_message 兜底。
@@ -5608,11 +6543,16 @@ class STS2AutoplayService:
         if self._avatar_b64 is not None and now - self._avatar_at < 300:
             return self._avatar_b64
         try:
-            import httpx
-
             url = f"http://127.0.0.1:{self._main_server_port()}/api/card-drop/active-character?include_avatar=true"
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                resp = await client.get(url)
+            # ★ 与 transport_client 同一口径：走宿主共享的 internal client
+            #   （proxy=None + trust_env=False），因为这也是**本机 127.0.0.1** 请求 ——
+            #   修复前用裸 httpx.AsyncClient，会被系统代理（实测 FlClash 127.0.0.1:7890）劫持成 502，
+            #   头像就永远取不到（静默降级成 None，只表现为"弹幕没头像"，很难查）。
+            #   ★ 不得 async with / aclose()：生命周期归宿主。timeout 逐请求传。
+            from utils.internal_http_client import get_internal_http_client
+
+            client = get_internal_http_client()
+            resp = await client.get(url, timeout=3.0)
             payload = resp.json()
             # 48911 card-drop 顶层直接返回 {name, dataUrl}；头像在 dataUrl 字段（可能带 data:...;base64, 前缀），
             # 不是 data 包装里的 avatar。Mod 端 DecodeAvatar.StripDataPrefix 会去掉前缀，直接传即可。
@@ -5863,12 +6803,12 @@ class STS2AutoplayService:
         if companion_evaluation and not bool(companion_evaluation.get("should_comment", True)):
             return
         strategy_context = snapshot.get("strategy_context") if isinstance(snapshot.get("strategy_context"), dict) else {}
-        strategy_name = str(strategy_context.get("strategy_name") or companion_evaluation.get("strategy_name") or self.t("companion.current_strategy", default="当前策略"))
+        strategy_name = str(strategy_context.get("strategy_name") or companion_evaluation.get("strategy_name") or self.t("companion.current_strategy", default="我现在用的策略"))
         commentary = str(companion_evaluation.get("commentary") or "").strip()
         if not commentary:
-            commentary = self.t("companion.enabled_default_commentary", default="陪玩已开启，我会给出简短建议。")
+            commentary = self.t("companion.enabled_default_commentary", default="我来了，会盯着局势随时给你提醒。")
         content = self._host_reply_text(
-            self.t("companion.enabled_announcement", default="陪玩模式已开启。{strategy_name}：{commentary}", strategy_name=strategy_name, commentary=commentary)
+            self.t("companion.enabled_announcement", default="我来了。{strategy_name}：{commentary}", strategy_name=strategy_name, commentary=commentary)
         )
         if notifier is not None:
             notifier(
