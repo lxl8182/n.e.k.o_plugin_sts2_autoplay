@@ -14,14 +14,14 @@
   仓库根目录。默认取本脚本所在目录（脚本放仓库根时即本目录）。
 
 .PARAMETER NekoPluginDir
-  NEKO 插件目录。默认 F:/game/N.E.K.O/.neko-plugin-installations/plugins/sts2_autoplay。
+  NEKO 插件目录。默认 F:/game/projectNEKO/nekodata/.neko-plugin-installations/plugins/sts2_autoplay。
 
 .PARAMETER UploadContentDir
   ModUploader content 目录（留空不刷新上传内容）。默认指向仓库内 NEKOSpire/content。
 #>
 param(
     [string]$ProjectRoot = "",
-    [string]$NekoPluginDir = "F:/game/N.E.K.O/.neko-plugin-installations/plugins/sts2_autoplay",
+    [string]$NekoPluginDir = "F:/game/projectNEKO/nekodata/.neko-plugin-installations/plugins/sts2_autoplay",
     [string]$UploadContentDir = ""
 )
 $ErrorActionPreference = "Stop"
