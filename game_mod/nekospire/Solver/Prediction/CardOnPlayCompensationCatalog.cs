@@ -41,7 +41,7 @@ internal static class CardOnPlayCompensationCatalog
         typeof(Afterlife), typeof(Backflip), typeof(BladeOfInk), typeof(Bodyguard), typeof(Cleanse),
         typeof(CloakAndDagger), typeof(DeadlyPoison), typeof(Dirge), typeof(DodgeAndRoll), typeof(Eidolon),
         typeof(Debris), typeof(Footwork), typeof(FranticEscape), typeof(HiddenCache), typeof(KnifeTrap),
-        typeof(Monologue), typeof(Malaise), typeof(NecroMastery), typeof(NeutronAegis), typeof(Nightmare),
+        typeof(LegionOfBone), typeof(Monologue), typeof(Malaise), typeof(NecroMastery), typeof(NeutronAegis), typeof(Nightmare),
         typeof(Neutralize), typeof(Outbreak), typeof(Reanimate), typeof(Resonance),
         typeof(Spur), typeof(Survivor), typeof(TheBomb), typeof(VoidForm), typeof(Automation),
         typeof(ForbiddenGrimoire), typeof(Oblivion), typeof(Orbit), typeof(Outmaneuver), typeof(Pagestorm),

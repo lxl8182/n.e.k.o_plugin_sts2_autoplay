@@ -120,7 +120,7 @@ class STS2SituationSummaryEngine:
         screen = payload.get("screen") or "unknown"
         actions = self._join_actions(payload.get("available_actions"))
         phase = payload.get("phase") or "unknown"
-        return self.t("summary.general", default="当前位于 {screen}，phase={phase}，可执行动作：{actions}。", screen=screen, phase=phase, actions=actions)
+        return self.t("summary.general", default="我现在在 {screen}，phase={phase}，能做的动作：{actions}。", screen=screen, phase=phase, actions=actions)
 
     def _summarize_menu(self, payload: dict[str, Any]) -> str:
         selected = payload.get("selected_character_id") or self.t("summary.menu.no_character", default="未选择角色")
@@ -129,21 +129,21 @@ class STS2SituationSummaryEngine:
         actions = self._join_actions(payload.get("available_actions"))
         embark_text = self.t("summary.menu.can_embark", default="可开始") if can_embark else self.t("summary.menu.cannot_embark", default="暂不可开始")
         asc_text = f"，ascension={ascension}" if ascension is not None else ""
-        return self.t("summary.menu", default="当前处于菜单/角色选择状态，当前角色：{selected}{asc_text}，{embark_text}，可执行动作：{actions}。", selected=selected, asc_text=asc_text, embark_text=embark_text, actions=actions)
+        return self.t("summary.menu", default="我在菜单/角色选择，角色：{selected}{asc_text}，{embark_text}，能做的动作：{actions}。", selected=selected, asc_text=asc_text, embark_text=embark_text, actions=actions)
 
     def _summarize_event(self, payload: dict[str, Any]) -> str:
         event_name = payload.get("event_name") or payload.get("event_id") or self.t("summary.event.unknown", default="未知事件")
         hp = self._hp_text(payload.get("current_hp"), payload.get("max_hp"))
         gold = payload.get("gold")
         actions = self._join_actions(payload.get("available_actions"))
-        return self.t("summary.event", default="当前事件：{event_name}，血量 {hp}，金币 {gold}，可执行动作：{actions}。", event_name=event_name, hp=hp, gold=gold, actions=actions)
+        return self.t("summary.event", default="我遇到事件：{event_name}，血量 {hp}，金币 {gold}，能做的动作：{actions}。", event_name=event_name, hp=hp, gold=gold, actions=actions)
 
     def _summarize_map(self, payload: dict[str, Any]) -> str:
         hp = self._hp_text(payload.get("current_hp"), payload.get("max_hp"))
         gold = payload.get("gold")
         nodes = payload.get("travelable_nodes") if isinstance(payload.get("travelable_nodes"), list) else []
         node_count = len(nodes)
-        return self.t("summary.map", default="当前地图选择状态，血量 {hp}，金币 {gold}，可前往节点数 {node_count}。", hp=hp, gold=gold, node_count=node_count)
+        return self.t("summary.map", default="我在选路线，血量 {hp}，金币 {gold}，能去 {node_count} 个节点。", hp=hp, gold=gold, node_count=node_count)
 
     def _summarize_combat(self, payload: dict[str, Any]) -> str:
         player = payload.get("player") if isinstance(payload.get("player"), dict) else {}
@@ -163,28 +163,28 @@ class STS2SituationSummaryEngine:
             intent = enemy.get("intent") or "unknown"
             enemy_bits.append(self.t("summary.combat.enemy_line", default="{name}({hp}，意图={intent})", name=name, hp=self._hp_text(current_hp, max_hp), intent=intent))
         enemy_text = "；".join(enemy_bits) if enemy_bits else self.t("summary.combat.no_enemy", default="无敌人信息")
-        return self.t("summary.combat", default="当前战斗状态，玩家血量 {hp}，能量 {energy}，护盾 {block}，手牌：{hand_names}，敌人：{enemy_text}。", hp=hp, energy=energy, block=block, hand_names=hand_names, enemy_text=enemy_text)
+        return self.t("summary.combat", default="我正在战斗，我的血量 {hp}，能量 {energy}，护盾 {block}，手牌：{hand_names}，敌人：{enemy_text}。", hp=hp, energy=energy, block=block, hand_names=hand_names, enemy_text=enemy_text)
 
     def _summarize_reward(self, payload: dict[str, Any]) -> str:
         hp = self._hp_text(payload.get("current_hp"), payload.get("max_hp"))
         gold = payload.get("gold")
         actions = self._join_actions(payload.get("available_actions"))
-        return self.t("summary.reward", default="当前奖励状态，血量 {hp}，金币 {gold}，可执行动作：{actions}。", hp=hp, gold=gold, actions=actions)
+        return self.t("summary.reward", default="我在选奖励，血量 {hp}，金币 {gold}，能做的动作：{actions}。", hp=hp, gold=gold, actions=actions)
 
     def _summarize_shop(self, payload: dict[str, Any]) -> str:
         hp = self._hp_text(payload.get("current_hp"), payload.get("max_hp"))
         gold = payload.get("gold")
-        return self.t("summary.shop", default="当前商店状态，血量 {hp}，金币 {gold}。", hp=hp, gold=gold)
+        return self.t("summary.shop", default="我在逛商店，血量 {hp}，金币 {gold}。", hp=hp, gold=gold)
 
     def _summarize_rest(self, payload: dict[str, Any]) -> str:
         hp = self._hp_text(payload.get("current_hp"), payload.get("max_hp"))
         actions = self._join_actions(payload.get("available_actions"))
-        return self.t("summary.rest", default="当前休息点状态，血量 {hp}，可执行动作：{actions}。", hp=hp, actions=actions)
+        return self.t("summary.rest", default="我在休息点，血量 {hp}，能做的动作：{actions}。", hp=hp, actions=actions)
 
     def _summarize_selection(self, payload: dict[str, Any]) -> str:
         hp = self._hp_text(payload.get("current_hp"), payload.get("max_hp"))
         actions = self._join_actions(payload.get("available_actions"))
-        return self.t("summary.selection", default="当前卡牌选择状态，血量 {hp}，可执行动作：{actions}。", hp=hp, actions=actions)
+        return self.t("summary.selection", default="我在选牌，血量 {hp}，能做的动作：{actions}。", hp=hp, actions=actions)
 
     def _hp_text(self, current_hp: Any, max_hp: Any) -> str:
         if current_hp is None and max_hp is None:

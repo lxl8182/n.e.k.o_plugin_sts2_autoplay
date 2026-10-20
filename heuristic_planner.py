@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from time import monotonic
 from typing import Any
 
@@ -121,6 +122,10 @@ _MAP_PICK_CN_DIGITS = {
     "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
     "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
 }
+
+# ★ 中文"抽N张牌"的判定：数字插在中间（实测真实文本是「抽2张牌」），
+#   子串关键词"抽牌"不命中；同时必须**排除**「抽牌堆」(draw pile，不是抽牌流派)。
+_ARCHETYPE_DRAW_RE = re.compile(r"抽[0-9一二三四五六七八九十两]+张牌|抽牌(?!堆)|摸牌")
 
 
 def normalize_map_policy(value: Any) -> str:
@@ -262,6 +267,24 @@ SHOP_QUALITY_CURSE_TARGET = 2.0
 # 卡名/规则文本可能是中文，所以中英都留一份）。
 _DECK_ATTACK_TYPE_TOKENS = ("attack", "攻击")
 _DECK_BASIC_CARD_TOKENS = ("strike", "defend", "打击", "防御")
+
+#: 基础牌（初始牌组那些）的**卡名子串** —— 用于"这张奖励牌会不会拉低牌组质量"。
+#:
+#: 与 `_DECK_BASIC_CARD_TOKENS` 是同一套词，但那份是给"**已在牌组里**的牌"做统计用的
+#: （`_deck_gap_vector:3043` 还会额外检查 `upgraded`）；
+#: 这里只判"**要不要再拿一张**"，所以不看升级状态。
+#: ★ 只用于 `quality` token 的着力点（见 `_indices_worth_penalizing` 的奖励屏分支）。
+def _is_basic_card_like(card: dict[str, Any]) -> bool:
+    """这张卡是不是"基础牌"（打击/防御这类初始牌）。
+
+    读 `card_id` / `name` 做子串匹配（中英都认），读不出就返回 False ——
+    与全局"匹配不准就别动"一致。
+    """
+    text = f"{card.get('card_id') or ''} {card.get('name') or ''}".lower()
+    if not text.strip():
+        return False
+    return any(token in text for token in _DECK_BASIC_CARD_TOKENS)
+
 _DECK_CURSE_TYPE_TOKENS = ("curse", "诅咒", "status", "状态")
 _DECK_DRAW_TOKENS = ("draw", "抽", "replay", "重放", "exhaust", "消耗", "scry", "预见", "discard", "弃牌")
 _DECK_AOE_TOKENS = ("all enemies", "all enemy", "所有敌人", "全体敌人", "全部敌人", "each enemy", "每个敌人", "aoe")
@@ -337,8 +360,96 @@ COMBAT_POTION_LOW_HP_HEAL_SCORE = 80.0    # 血量低于三成时的回血类评
 
 
 class STS2HeuristicPlanner:
+    #: 跨局教训 → 可匹配选项的语义关键词。
+    #:
+    #: 复盘的产物是**整句中文**（如「下次血量低于20的时候别头铁硬刚，先垫格挡喝回血药再输出」），
+    #: 整句拿去匹配选项描述必然匹配不上，所以把它压成下面这小组**语义 token**，再由
+    #: ``_indices_worth_penalizing`` 落到具体屏（目前只落地「路线」与「选牌」两屏 —— 匹配不准的
+    #: 屏宁可不动，避免把复盘变成噪声）。
+    #:
+    #: 键是 token（同时也是地图 `node.type` / 卡牌 `card_type` 的小写值），值是该 token 的
+    #: 中文触发词。新增玩法时在这里加一行即可，不要在 `_lesson_tokens` 里堆 if。
+    _LESSON_KEYWORD_MAP: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("elite", ("精英",)),
+        ("monster", ("小怪", "打怪", "普通敌人")),
+        ("rest", ("休息", "睡觉", "回血点", "篝火")),
+        ("shop", ("商店", "买东西", "攒钱", "金币")),
+        ("treasure", ("宝箱", "宝藏", "开箱")),
+        ("curse", ("诅咒", "别拿咒")),
+        # ★生命上限是**永久**损失（`max_hp` 不可恢复），用户报告的核心痛点：
+        # 「有一些事件是可以消耗生命值上限的并且可以重复选择，这个时候脚本会一直选择消耗，
+        #   直接把生命值变成了1」。没有这一条时，"别再扣生命上限"这类复盘**抽不出任何 token**
+        # ⇒ 教训完全无法生效。
+        #
+        # ⚠️ 为什么不需要（也没有）"只在事件屏生效"的过滤：**结构上不可能泄漏**。
+        # 实测确认各屏的匹配口径：
+        #   * 路线屏 —— 只把节点 `type` 经 `_map_node_weight_key` 归一后与 token **等值**比较，
+        #     取值域是 `rest`/`shop`/`elite`/... ，永远不等于 `max_hp`；
+        #   * 选牌屏 —— 比较 `card_type`/`rarity` 与 token 等值，取值域是
+        #     `attack`/`skill`/`power`/`curse`/... ，同样不可能等于 `max_hp`；
+        #   * 其余屏 —— `_indices_worth_penalizing` 没有分支。
+        # 我一度加过一个 `_EVENT_ONLY_TOKENS` 过滤，但**变异测试证明它不可观测**
+        # （删掉它全部测试照样通过）⇒ 那是"无法被测试保护的死代码"，故删除。
+        # 若将来给路线/选牌屏加上"按文案模糊匹配"的能力，才需要重新引入过滤。
+        #
+        # ⚠️ **刻意不加**普通掉血 token（`hp`）：实测真实反思「先垫格挡喝回血药再输出」
+        # 含「回血」二字，会给纯**战斗**建议抽出 `hp`，从而破坏
+        # `test_real_lesson_demotes_matching_node` 钉住的"战斗建议不得改动路线"契约。
+        # 扣上限这一条已经完整覆盖用户报告，收益明确、风险为零。
+        ("max_hp", ("生命上限", "最大生命", "扣上限", "命上限")),
+        ("skill", ("格挡", "垫格挡", "防御", "保命", "保血")),
+        ("attack", ("输出", "伤害", "抢血", "斩杀")),
+        ("power", ("能力牌", "攒力量")),
+        # ★★ 六维缺口的「群伤」与「牌组质量」（2026-10-19 补）。
+        #
+        # 为什么必须补：`deck_gap_reflection` 会产出「这局几乎没有群伤牌，
+        # 下局我想早点拿 AOE」这类教训，但**关键词表里没有对应项** ⇒
+        # `_lesson_tokens` 抽不出任何 token ⇒ 教训**完全无法生效**。
+        # 实测（补之前）：死因 aoe 的六维教训只抽出 `attack`/`skill`，
+        # AOE 那一维的信号**整个丢失** —— 这正是"说了等于没说"的老毛病。
+        ("aoe", ("群伤", "群攻", "群怪", "多敌")),
+        # ── 牌组质量 ──────────────────────────────────────────────────────
+        # ⚠️ **刻意不收「升级」二字**：实测它会**误伤路线类教训** ——
+        #    `"上次在篝火休息浪费了升级机会，以后别选休息"` 讲的是**休息点**，
+        #    但含「升级」⇒ 会额外抽出 `quality` ⇒ 破坏
+        #    `test_route_lesson_changes_route_order` 钉住的"路线教训只影响路线"契约。
+        #    这是我自己补 token 时踩的坑（测试立刻抓到）。
+        # ⇒ 只收**指向牌**的搭配词，不收裸「升级」。质量教训的模板用「升级关键牌」
+        #    「删牌」，这里的 `关键牌`/`升级关键牌` 都能命中。
+        ("quality", ("升级关键牌", "精简牌组", "删牌", "废牌", "基础牌")),
+    )
+
     def __init__(self, logger: Any | None = None) -> None:
         self._logger = logger
+        # ★ 战斗决策留痕的计数（**每场战斗**上限，不是每局/每实例）。见 _combat_log / _COMBAT_LOG_MAX。
+        #   t39：原注释写「每局限流」，而实现是「每实例一次性累计」—— 两者不一致，
+        #   且计数**永无重置点** ⇒ 打满上限后本实例永久静默。现改为随**战斗身份**重置。
+        self._combat_log_count = 0
+        self._combat_log_last_key = ""
+        self._combat_log_last_at = 0.0
+        # ★ t39：战斗身份 + 封顶告警只报一次的标志。
+        #   身份 = (屏幕|层|是否战斗) 三元的拼装串，沿用 service.py:3217 的公式形态。
+        #   ★ 为什么必须由身份驱动而不是时间驱动：时间驱动的重置会让**长战斗**
+        #     仍然被封顶，而长战斗恰恰是最需要留痕的那种局面（boss 战动辄几十回合）。
+        self._combat_log_battle_identity = ""
+        self._combat_log_cap_warned = False
+        # ★ 战斗纯求解器的**死锁保险**状态（见 _combat_solver_only_outcome）。
+        #   语义：同一局面指纹下，求解器**看着最新局面**仍连续给不出可执行动作的次数。
+        #   指纹变化即清零（新局面 = 旧计数无意义）。
+        self._solver_deadlock_signature = ""
+        self._solver_deadlock_count = 0
+        # ★★ D1：与死锁计数**必须分开**的第二个计数器（见 _combat_solver_only_outcome）。
+        #   语义：同一局面指纹下，「计划过期（建议的牌已不在手）」连续发生的次数。
+        #   ★ 为什么不只是"加个 if 直接 return None"：反复过期本身也是异常
+        #     （上游 SolverController.cs:175-177 把 DeploymentDrift 计入 UnexpectedReplanCount，
+        #      当作"计划失效"的缺陷信号），若完全不计上界，一旦某局面每 tick 都过期
+        #      就会**永久重取、卡死整局**。故给上界：达 _SOLVER_STALE_RECLAIM_LIMIT 次
+        #      即**转入死锁计数**，最迟第 LIMIT+RETRIES 次仍会发 end_turn 脱离。
+        self._solver_stale_reclaim_count = 0
+        # ★ t13（D3）：非玩家行动窗口的**独立**计数（见 `_SOLVER_OUT_OF_WINDOW_LIMIT`）。
+        #   与 `_solver_deadlock_count` 严格分开：窗口没开时不是"求解器无解"，
+        #   把它计进 N/3 会让 N 越过阈值（实机 5/3、7/3）且永远等不到兜底。
+        self._solver_out_of_window_count = 0
         # 地图投票策略，由 service.startup 用插件配置覆盖：
         #   wait（默认）——多人局里彻底等待：不投票、也不自动跟票，直到玩家通过对 NEKO 说话下令
         #                 （见 sts2_set_route）。单机局没有队友可等，仍按自己的偏好选，否则会卡死。
@@ -357,6 +468,12 @@ class STS2HeuristicPlanner:
         # 同一屏连续"候选按遍仍返回 None"的次数，达到 _SELECTION_EXHAUSTED_RETRIES 就重置光标重按，
         # 保证这一屏永远不会陷入"再也规划不出动作"的死锁。
         self._selection_exhausted = 0
+        # ★事件屏"同一选项选过几次"的记忆（缺陷 A3）。
+        # 与 _selection_pressed 同范式：以**屏签名**为键，换屏即重置；
+        # 只由**真的派发成功**推进（note_event_option_chosen），不在 plan() 里累加。
+        # 作用：可重复选择的事件（选项选完仍在）不会把同一项选到死。
+        self._event_memory_key = ""
+        self._event_choice_counts: dict[int, int] = {}
         # 商店"这次进店看过货了没"：货架开过一次、又关掉之后**不能再开**。
         # mod 的 open_shop_inventory 是**开关**，而开关两态的 screen 都叫 SHOP，
         # 只看 open_shop_inventory 在不在 available_actions 里就会开->关->开无限来回（玩家看到的死循环）。
@@ -372,10 +489,26 @@ class STS2HeuristicPlanner:
         self._last_route_node_type = ""
         # 最近一次记录过的地图路线评分（同一局面只记一次，防止每 tick 刷屏）。
         self._last_map_route_log_key = ""
+        self._last_reward_route_log_key = ""
+        #: ★ 最近一次选卡评估的留痕（供 `_log_reward_route` 输出，便于线上核对）
+        self._last_reward_scored: list[tuple[int, float]] = []
+        self._last_reward_archetype_tags: list[str] = []
+        self._last_reward_bias: set[str] = set()
+        self._last_reward_lesson_signals: dict[str, int] = {}
+        # 最近一次记录过的事件屏评分（同上，事件屏此前完全没有决策日志）。
+        self._last_event_route_log_key = ""
+        # 最近一次记录过的变换屏评分（同上，变换屏此前同样是决策日志盲区）。
+        self._last_transform_route_log_key = ""
         # 奖励领取游标：当前奖励清单的签名 + 已经**真的领过**的下标。
         # 药水栏满时"领药水奖励"发不下去，而 mod 照样回 completed —— 不记账就会无限重领同一个。
         self._reward_claim_key = ""
         self._reward_claim_tried: set[int] = set()
+        # ★★ D11（t28）：本屏**已确认不可选**的事件选项下标（被游戏锁定 / 被拒）。
+        #   ★ 与 `_reward_claim_*` 完全同构：**按屏键隔离**，换屏自动清空，不跨屏累积。
+        #   实机缺陷（2026-10-20，ENDLESS_CONVEYOR）：options[0] `is_locked:true`（金币18不足），
+        #   插件却给它 +10 分、给未锁的 options[1] 0 分 ⇒ 每轮选被锁项 ⇒ 99 次被拒 ⇒ 永久卡死。
+        self._event_locked_set_key_cached = ""
+        self._event_locked_set_cached: set[int] = set()
         # 选人界面：「随机」只按一次（按键由执行推动），按过就转入开局。
         self._character_pick_key = ""
         self._character_pick_done = False
@@ -397,8 +530,246 @@ class STS2HeuristicPlanner:
         self._map_wait_key = ""
         self._map_wait_started_at = 0.0
 
+    def _log_reward_route(
+        self,
+        scored: list[tuple[int, float]],
+        chosen: int | None,
+        *,
+        skipped: bool,
+        archetype_tags: list[str] | None = None,
+        bias: set[str] | None = None,
+        lesson_signals: dict[str, int] | None = None,
+    ) -> None:
+        """把选卡/跳牌的评估结果用 info 级记一次。
+
+        ★ 为什么必须单独写（与 `_log_map_route` 同因）：
+        `_debug()` 在本文件里是**空函数**（`L456-457 return`），
+        所有 `[sts2_reward_*]` / `[sts2_archetype]` 调试行**其实都没输出**。
+        于是线上完全无法核对"这次到底为什么选/跳这张牌"——
+        而"选卡质量"正是用户点名的核心（诅咒卡污染、垃圾卡进卡组）。
+        选路已有 `_log_map_route` 留痕，选卡同样必须留痕。
+        """
+        if self._logger is None:
+            return
+        try:
+            key = "%s|%s|%s|%s" % (
+                chosen,
+                skipped,
+                ",".join(sorted(bias or set())),
+                "|".join("%s:%s" % (i, s) for i, s in scored),
+            )
+            if key == self._last_reward_route_log_key:
+                return
+            self._last_reward_route_log_key = key
+            self._logger.info(
+                "[sts2_reward_route] 流派=%s 成型=%s 教训=%s 候选评分=%s -> %s",
+                archetype_tags or [],
+                sorted(bias or set()),
+                lesson_signals or {},
+                ", ".join("%s=%s" % (i, s) for i, s in scored),
+                "跳牌（全候选不值得拿）" if skipped else "选 option_index=%s" % chosen,
+            )
+        except Exception:
+            pass
+
     def _debug(self, message: str, *args: Any) -> None:
         return
+
+    # ── ★ 战斗决策留痕（2026-10-18）────────────────────────────────────────────
+    # 为什么必须单独写：`_debug` 在上方是个**空函数**，所有 `[sts2_*]` 战斗调试行
+    # 其实一个字都没输出。战斗是玩家最容易质疑的决策（"求解器算得对，为什么不照打？"），
+    # 而线上**完全没有留痕** ⇒ 既无法核对、也无法统计"到底按不按求解器打"。
+    # 这与 `_log_map_route`（:507）当初补留痕的理由完全相同，但战斗这条最重要的
+    # 路径一直漏着。这里补上，并且**显式对比"求解器建议"与"最终执行"**。
+    #
+    # ★★ 限流器的坑（2026-10-18 实机踩到，自查修）：
+    #   第一版写成"每实例最多 _COMBAT_LOG_MAX 条"，而计数**永不重置** ⇒
+    #   打满 60 条后**永久静默**。实测：插件 11:47:25 启动，11:47–11:49 打出
+    #   56 条 follow + 4 条 fallback = 60 条，**之后整局再也不输出**
+    #   （现象与"留痕没生效"难以区分，害我又排查了一轮）。
+    #   ⇒ 改成**按"局面+动作"去重 + 每秒窗口限流**：
+    #     同一个 (屏幕|层|回合|求解器建议|实际执行) 只记一次 —— 这既压掉了
+    #     最要命的重复刷屏（实测同一局面重复 8~20 次），又**不会**因为总量到顶
+    #     而再也看不到新决策。只有完全不同局面才产生新行，长局也能看全。
+    #
+    # ★★ 同一个坑的**第二次**踩（2026-10-20，t39）：上面那段注释说"改成去重+限流"，
+    #   但**总量封顶这一层并没有被改掉** —— 200 这个阈值与 `:603` 的 return
+    #   仍是同一个**永不重置**的全局计数。⇒ 只是把阈值从 60 推迟到 200，
+    #   **不是修好了**。实机证据：10:59 同时段 Combat Solver 侧 ROUTE_ACTION
+    #   3532 条 / 45 个 traceId，而 `[sts2_combat_follow]` **0 条** ⇒
+    #   45 条建议全部"无可配对"，跨 mod 对照失效。
+    #   ⇒ 现在把封顶语义改为**每场战斗**：计数与去重键随**战斗身份**归零
+    #     （身份 = 屏幕|层|是否战斗，见 `_battle_identity`）。
+    #   ★ 并且触及上限时**必须留一行告警**（见 `_combat_log`）：静默正是这个
+    #     缺陷能潜伏两轮而无人察觉的原因。
+    _COMBAT_LOG_MAX = 200  # 每场战斗的留痕上限（达到后打一行告警，换战斗即重置）
+    _COMBAT_LOG_MIN_INTERVAL = 0.25  # 秒；同键去重之外再加一道时间闸
+
+    def _battle_identity(self, snapshot: dict[str, Any] | None, classification: dict[str, Any] | None = None) -> str:
+        """战斗身份 —— 留痕计数的重置依据。
+
+        ★ 沿用 `service.py:3217` 的公式形态 `f"{screen}|{floor}|{act}|{in_combat}|..."`，
+          但只用 planner 内确实拿得到的三个分量（`plan()` 的局部量 `snapshot` /
+          `classification`），避免为了凑格式而去读 planner 不该读的状态。
+
+        ★ 为什么是这三个分量：屏幕变了 / 层变了 / 进战斗状态变了，都意味着
+          "这是另一场战斗"。反之同一场战斗内这三者恒定 —— 于是计数在其中累计、
+          换战斗时归零。**不引入时间分量**（时间驱动会让长战斗仍被封顶）。
+        """
+        snap = snapshot if isinstance(snapshot, dict) else {}
+        cls = classification if isinstance(classification, dict) else {}
+        screen = str(snap.get("screen") or cls.get("state_name") or "")
+        floor = str(snap.get("floor") if snap.get("floor") is not None else "")
+        in_combat = cls.get("in_combat")
+        if in_combat is None:
+            in_combat = snap.get("in_combat")
+        return f"{screen}|{floor}|{in_combat}"
+
+    def _combat_log(
+        self,
+        message: str,
+        *args: Any,
+        dedup_key: str = "",
+        battle_identity: str | None = None,
+    ) -> None:
+        """战斗决策的 info 级留痕。
+
+        ★ 去重键优先（同一局面/同一决策只记一次），去重键为空时退回纯限流。
+        ★ 总量封顶是**每场战斗**的：传入 `battle_identity` 且与上次不同 ⇒
+          计数、去重键、告警标志全部归零，新战斗重新获得完整留痕预算
+          （见 `_COMBAT_LOG_MAX` 上方的说明）。
+        ★ 触及上限时**留一行告警**，绝不静默 return —— 静默正是本缺陷
+          能潜伏两轮而无人察觉的原因。
+        """
+        if self._logger is None:
+            return
+        try:
+            # ── ① 战斗身份变化 ⇒ 归零（必须在其余判定**之前**）──────────────
+            identity = battle_identity
+            if identity is None:
+                identity = self._combat_log_battle_identity or ""
+            if identity != self._combat_log_battle_identity:
+                self._combat_log_battle_identity = identity
+                self._combat_log_count = 0
+                self._combat_log_last_key = ""   # 新战斗的首条不得被旧战斗的键吞掉
+                self._combat_log_cap_warned = False
+
+            now = time.time()
+            if dedup_key:
+                if dedup_key == self._combat_log_last_key:
+                    return
+                self._combat_log_last_key = dedup_key
+            # ── ② 每场战斗上限：达上限 ⇒ 打一行告警（只一次），然后丢弃正文 ──
+            if self._combat_log_count >= self._COMBAT_LOG_MAX:
+                if not self._combat_log_cap_warned:
+                    self._combat_log_cap_warned = True
+                    self._logger.info(
+                        "[sts2_combat_log_cap] 本场战斗留痕已达上限 计数=%s 上限=%s "
+                        "战斗身份=%s —— 本场后续战斗留痕将不再输出（换战斗后自动恢复）",
+                        self._combat_log_count,
+                        self._COMBAT_LOG_MAX,
+                        self._combat_log_battle_identity or "(未提供)",
+                    )
+                return
+            if now - self._combat_log_last_at < self._COMBAT_LOG_MIN_INTERVAL:
+                return
+            self._combat_log_count += 1
+            self._combat_log_last_at = now
+            self._logger.info(message, *args)
+        except Exception:
+            pass
+
+    def _combat_log_solver_vs_executed(
+        self,
+        *,
+        solver_kind: Any,
+        solver_card_id: Any,
+        solver_target: Any,
+        executed_action: str,
+        executed_kwargs: dict[str, Any],
+        matched: bool,
+        fallback_reason: str = "",
+        hand: list[Any] | None = None,
+        snapshot: dict[str, Any] | None = None,
+        classification: dict[str, Any] | None = None,
+    ) -> None:
+        """★ 核心留痕：**求解器建议了什么 / 实际执行了什么 / 是否一致**。
+
+        这是回答"战斗时到底按不按求解器打"的唯一可靠依据。格式固定，便于后续
+        用 grep / 正则批量统计"按求解器打的比例"：
+
+            [sts2_combat_follow] 求解器=use_potion/EXPLOSIVE_AMPOULE -> 执行=use_potion{...}
+                                 一致=是
+            [sts2_combat_follow] 求解器=play_card/STRIKE_IRONCLAD -> 执行=heuristic{...}
+                                 一致=否(手牌里没有这张卡)
+
+        `matched=False` 时**必须**带 `fallback_reason` —— 静默降级是这次排查里
+        最难发现的坑（`if effective_card_index is not None` 分支没有 else 日志）。
+
+        ★ t39：新增 `snapshot` / `classification`（均可选）两个入参，仅用于推导
+          **战斗身份**（见 `_battle_identity`），使每场战斗的留痕预算独立。
+          它们**不影响**上面这个被消费的输出格式。
+        """
+        names = []
+        if isinstance(hand, list):
+            for card in hand:
+                if isinstance(card, dict):
+                    names.append(str(card.get("name") or card.get("card_id") or "?"))
+        hand_key = ",".join(names[:9])
+        # ★ 去重键 = 求解器建议 + 实际执行 + 手牌 + 原因。
+        #   见 `_combat_log` 上方关于「限流器永久静默」的说明：这里按**内容**去重，
+        #   于是同一局面反复重试（实测同一动作重复 8~20 次）只留一行，
+        #   而局面一变就会立刻出新行 —— 长局也能看全，不再有"打满就瞎"。
+        self._combat_log(
+            "[sts2_combat_follow] 求解器=%s/%s(target=%s) -> 执行=%s%s 一致=%s%s 手牌=%s",
+            solver_kind,
+            solver_card_id,
+            solver_target,
+            executed_action,
+            ("(" + ",".join(f"{k}={v}" for k, v in executed_kwargs.items()) + ")")
+            if executed_kwargs
+            else "",
+            "是" if matched else "否",
+            ("  原因=" + fallback_reason) if fallback_reason else "",
+            names[:9],
+            dedup_key="|".join(
+                (
+                    str(solver_kind),
+                    str(solver_card_id),
+                    str(solver_target),
+                    str(executed_action),
+                    ",".join(f"{k}={v}" for k, v in sorted(executed_kwargs.items())),
+                    "1" if matched else "0",
+                    str(fallback_reason),
+                    hand_key,
+                )
+            ),
+            # ★ t39：传战斗身份，使每场战斗的留痕预算独立（否则又变成永不重置）。
+            battle_identity=self._battle_identity(snapshot, classification),
+        )
+
+    def _log_combat_heuristic(
+        self,
+        reason: str,
+        hand: list[Any] | None = None,
+        *,
+        snapshot: dict[str, Any] | None = None,
+        classification: dict[str, Any] | None = None,
+    ) -> None:
+        """求解器**没参与**（或没匹配上）而走启发式时的留痕。"""
+        names = []
+        if isinstance(hand, list):
+            for card in hand:
+                if isinstance(card, dict):
+                    names.append(str(card.get("name") or card.get("card_id") or "?"))
+        self._combat_log(
+            "[sts2_combat_fallback] 走启发式 原因=%s 手牌=%s",
+            reason,
+            names[:9],
+            dedup_key="fallback|" + str(reason) + "|" + ",".join(names[:9]),
+            # ★ t39：同上，传战斗身份。
+            battle_identity=self._battle_identity(snapshot, classification),
+        )
 
     def _log_map_route(self, scored: list[tuple[int, float]], chosen: int, *, hp_ratio: float, gold: int) -> None:
         """把这一 tick 的路线评估结果用 info 级记一次（同一局面只记一次，避免刷屏）。
@@ -736,7 +1107,7 @@ class STS2HeuristicPlanner:
             action = self._find_action(available_actions, "choose_event_option")
             if action is not None:
                 # 事件房是纯启发式的：插件不再有任何 LLM 决策（2026-10 摘除 EventAdviceGenerator）。
-                preferred_option = self._preferred_event_option(summary_context, preferences)
+                preferred_option = self._preferred_event_option(summary_context, preferences, strategy_context)
                 self._debug(
                     "[sts2_event_plan] options=%s chosen=%s payload=%s",
                     summary_context.get("payload", {}).get("event_options") if isinstance(summary_context.get("payload"), dict) else [],
@@ -783,7 +1154,41 @@ class STS2HeuristicPlanner:
             card_action = self._find_action(available_actions, "choose_reward_card")
             reward_candidates = self._reward_candidates(summary_context)
             if card_action is not None and reward_candidates:
-                preferred_option = self._preferred_reward_option(summary_context, preferences)
+                # 选卡段：`_preferred_reward_option` 对「全候选都不值得拿」会返回 None
+                # （见 :1548 `if best_candidate[0] < 0`——最佳卡得分为正才选）。
+                # ★旧代码拿到 None 仍照选：`_reward_kwargs(..., None)` 退回"第一个选项"
+                #   ⇒ 无条件选牌 ⇒ 诅咒卡/垃圾卡被收进卡组，卡组质量单调下降。
+                #   这也是「变化卡事件会选到诅咒」的直接机制。
+                # ⇒ 现在改为：None 表示"一张都不该拿"，优先跳牌（skip_reward_cards），
+                #   没有跳牌动作时才退回原行为（保持向前兼容，不改变无 skip 动作的场景）。
+                preferred_option = self._preferred_reward_option(summary_context, preferences, strategy_context)
+                if preferred_option is None:
+                    skip_action = self._find_action(available_actions, "skip_reward_cards")
+                    if skip_action is not None:
+                        self._debug("[sts2_reward_skip] 全候选不值得拿 -> 跳牌（避免污染卡组）")
+                        self._log_reward_route(
+                            self._last_reward_scored,
+                            None,
+                            skipped=True,
+                            archetype_tags=self._last_reward_archetype_tags,
+                            bias=self._last_reward_bias,
+                            lesson_signals=self._last_reward_lesson_signals,
+                        )
+                        return PlannedOperation(
+                            action_type=skip_action["type"],
+                            kwargs={},
+                            confidence=0.7,
+                            source="heuristic",
+                            reason="reward_skip_low_value",
+                        )
+                self._log_reward_route(
+                    self._last_reward_scored,
+                    preferred_option,
+                    skipped=False,
+                    archetype_tags=self._last_reward_archetype_tags,
+                    bias=self._last_reward_bias,
+                    lesson_signals=self._last_reward_lesson_signals,
+                )
                 kwargs = self._reward_kwargs(summary_context, card_action, preferred_option)
                 return PlannedOperation(action_type=card_action["type"], kwargs=kwargs, confidence=0.72, source="heuristic", reason="reward_pick_card")
             claim_action = self._find_action(available_actions, "claim_reward")
@@ -795,7 +1200,7 @@ class STS2HeuristicPlanner:
                 if claim_index is None and not self._reward_claimable_list(summary_context):
                     # payload 里没有 mod 的 rewards[] 形状（旧口径 / 别的来源）：退回原来的偏好下标，
                     # 不要因为"读不到新形状"就把动作整个吞掉。
-                    preferred_option = self._preferred_reward_option(summary_context, preferences)
+                    preferred_option = self._preferred_reward_option(summary_context, preferences, strategy_context)
                     claim_index = preferred_option if preferred_option is not None else 0
                 if claim_index is not None:
                     return PlannedOperation(
@@ -973,11 +1378,50 @@ class STS2HeuristicPlanner:
                 return PlannedOperation(action_type=action["type"], kwargs={}, confidence=0.9, source="heuristic", reason="game_over_return_to_main_menu")
 
         if state_name == "combat":
-            # 战斗推荐：优先取 mod 内 vendored CombatSolver（/solver/plan），heuristic 兜底。
-            # loop_runner.tick 已在战斗时取好 /solver/plan 塞进 context["solver_plan"]。
-            # 决策只用「首步」line[0].steps[0]（当前回合、带位置索引）。/solver/plan 不再有顶层 action/
-            # card_index/card_id/target_index/reason——line 是唯一来源。
+            # ════════════════════════════════════════════════════════════════════
+            # ★★ 战斗 = 纯求解器（PURE SOLVER）—— 冻结区，改前必读
+            # ════════════════════════════════════════════════════════════════════
+            #
+            # 玩家指示（2026-10-18）：
+            #   「战斗完全交给求解器。战斗以外的才需要启发式评分。」
+            #   「求解器是穷举所有可能性，这一步启发完全没有意义，只需要按照路线走
+            #     就一定能成功，启发了会导致更多变量导致失败，得不偿失」
+            #
+            # ⇒ 战斗内**不允许**启发式介入。理由是设计性的，不是性能性的：
+            #   * 求解器已穷举所有可能性 ⇒ 启发式在一个已有最优解的空间里注入噪声；
+            #   * 启发式不完美 ⇒ 它的介入**引入额外变量**，让结果不可归因；
+            #   * 纯服从 ⇒ 可复现、可归因。
+            #
+            # 求解器无可用建议时的语义（玩家选定 **A**）：
+            #   **丢弃缓存计划、立即重算求解器**，而不是降级启发式、也不是乱发动作。
+            #   重算由 `loop_runner.tick` 在下一 tick 完成（它会重新取 /solver/plan）；
+            #   本函数此时返回 None ⇒ 本 tick 不发任何动作 ⇒ **局面不变** ⇒ 下一 tick
+            #   拿到新计划继续。这与"发一个错动作"有本质区别。
+            #
+            # ★ 死锁保险（为什么必须有）：
+            #   若求解器对某局面**持续**给不出可执行建议（例如它一直建议一张打不出的牌），
+            #   纯重算会表现为**永久卡住** —— 比启发式降级更糟。
+            #   故：同一局面指纹连续重算 `_SOLVER_DEADLOCK_RETRIES` 次仍无解 ⇒
+            #   **发 end_turn 打破僵局**并留痕。这是"不发动作"与"卡死"的分界线。
+            #
+            # ⚠️ 不要"顺手"把启发式加回来当兜底：那正是本次要移除的东西。
+            #    战斗内的 `_plan_combat_turn_sequence` / `_preferred_combat_action` /
+            #    `_combat_kwargs` 已删除（备份见 `.dsh-artifacts/deleted/`）。
+            # ════════════════════════════════════════════════════════════════════
             solver_plan = context.get("solver_plan") if isinstance(context.get("solver_plan"), dict) else None
+            # ★ 留痕要用到手牌快照（"执行了什么"要能对上具体牌）。
+            _combat_hand = (
+                snapshot.get("raw_state", {}).get("combat", {}).get("hand")
+                if isinstance(snapshot.get("raw_state", {}).get("combat", {}).get("hand"), list)
+                else []
+            )
+            # ★ 求解器为何没被采用（供统一留痕，避免"静默降级"）。
+            solver_skip_reason = ""
+            # ★ `first_step` 必须在**函数作用域**里先声明：求解器分支若未进入
+            #   （无计划/未在战斗），留痕仍要引用它来记录"求解器本来建议什么"。
+            first_step: dict[str, Any] | None = None
+            if not solver_plan or not solver_plan.get("in_combat"):
+                solver_skip_reason = "无求解器计划（未在战斗/取计划失败）"
             if solver_plan and solver_plan.get("in_combat"):
                 # 整回合缓存模式：按 solver_step_index 取当前回合第几步（循环逐个执行，不重查）。
                 first_step = _line_step_at(solver_plan, context.get("solver_step_index"))
@@ -985,6 +1429,8 @@ class STS2HeuristicPlanner:
                 solver_card_index = first_step.get("card_index") if isinstance(first_step, dict) else None
                 solver_card_id = first_step.get("card_id") if isinstance(first_step, dict) else None
                 solver_target = first_step.get("target_index") if isinstance(first_step, dict) else None
+                if not solver_action:
+                    solver_skip_reason = "求解器计划的当前步为空（line 无 kind）"
                 if solver_action == "play_card":
                     # 用 card_id 重新匹配实机手牌（mod 的 NekoAutoplayDriver 同样如此）：solver 给的是
                     # /solver/plan 捕获瞬间的位置卡号；捕获与执行之间手牌可能漂移，直接抽样会打在别的卡上。
@@ -993,7 +1439,18 @@ class STS2HeuristicPlanner:
                         kw = {"card_index": effective_card_index}
                         if solver_target is not None:
                             kw["target_index"] = solver_target
-                        self._debug("[sts2_combat_plan] mod_solver recommended=%s hand_idx=%s", solver_card_id, effective_card_index)
+                        self._combat_log_solver_vs_executed(
+                            solver_kind=solver_action,
+                            solver_card_id=solver_card_id,
+                            solver_target=solver_target,
+                            executed_action="play_card",
+                            executed_kwargs=kw,
+                            matched=True,
+                            hand=_combat_hand,
+                            # ★ t39：传战斗身份，使每场战斗的留痕预算独立。
+                            snapshot=snapshot,
+                            classification=classification,
+                        )
                         return PlannedOperation(
                             action_type="play_card",
                             kwargs=kw,
@@ -1001,14 +1458,29 @@ class STS2HeuristicPlanner:
                             source="mod_solver",
                             reason="mod_combat_search",
                         )
-                    # 实机手牌里没有这张卡 -> 落到启发式兜底
+                    # ★ 实机手牌里没有这张卡 ⇒ 计划已过期（漂移）。
+                    #   纯求解器语义：**不发启发式动作**，丢弃本计划、让下一 tick 重算。
+                    #   实测根因（`.dsh-artifacts/ROOTCAUSE-solver-adherence.md`）：
+                    #   求解器搜索要 ~1 秒，期间上一步动作已让手牌变化 ⇒ 计划天然过期。
+                    solver_skip_reason = f"求解器建议 {solver_card_id} 但实机手牌里没有这张卡（手牌漂移）"
                 if solver_action == "use_potion":
                     potion_index = self._solver_potion_option_index(snapshot, solver_card_id)
                     if potion_index is not None:
                         kw = {"option_index": potion_index}
                         if solver_target is not None:
                             kw["target_index"] = solver_target
-                        self._debug("[sts2_combat_plan] mod_solver recommended potion=%s", potion_index)
+                        self._combat_log_solver_vs_executed(
+                            solver_kind=solver_action,
+                            solver_card_id=solver_card_id,
+                            solver_target=solver_target,
+                            executed_action="use_potion",
+                            executed_kwargs=kw,
+                            matched=True,
+                            hand=_combat_hand,
+                            # ★ t39：传战斗身份，使每场战斗的留痕预算独立。
+                            snapshot=snapshot,
+                            classification=classification,
+                        )
                         return PlannedOperation(
                             action_type="use_potion",
                             kwargs=kw,
@@ -1016,7 +1488,20 @@ class STS2HeuristicPlanner:
                             source="mod_solver",
                             reason="mod_solver_potion",
                         )
+                    solver_skip_reason = f"求解器建议用药水 {solver_card_id} 但实机找不到对应药水"
                 if solver_action == "end_turn":
+                    self._combat_log_solver_vs_executed(
+                        solver_kind=solver_action,
+                        solver_card_id=solver_card_id,
+                        solver_target=solver_target,
+                        executed_action="end_turn",
+                        executed_kwargs={},
+                        matched=True,
+                        hand=_combat_hand,
+                        # ★ t39：传战斗身份，使每场战斗的留痕预算独立。
+                        snapshot=snapshot,
+                        classification=classification,
+                    )
                     return PlannedOperation(
                         action_type="end_turn",
                         kwargs={},
@@ -1024,48 +1509,564 @@ class STS2HeuristicPlanner:
                         source="mod_solver",
                         reason="mod_solver_end_turn",
                     )
-            self._debug(
-                "[sts2_combat_plan] incoming=%s block=%s energy=%s guidance=%s hand=%s",
-                self._incoming_attack_total(snapshot),
-                self._current_block(snapshot),
-                self._safe_int(snapshot.get("raw_state", {}).get("combat", {}).get("player", {}).get("energy")) or 0,
-                guidance_override,
-                [
-                    {
-                        "index": self._safe_int(card.get("index")),
-                        "name": str(card.get("name") or card.get("card_id") or "?"),
-                        "damage": self._card_damage(card),
-                        "block": self._card_block(card),
-                        "cost": self._card_energy_cost(card),
-                    }
-                    for card in (snapshot.get("raw_state", {}).get("combat", {}).get("hand") if isinstance(snapshot.get("raw_state", {}).get("combat", {}).get("hand"), list) else [])
-                    if isinstance(card, dict) and bool(card.get("playable"))
-                ],
+                if solver_action and not solver_skip_reason:
+                    solver_skip_reason = f"求解器给了未知动作 kind={solver_action!r}"
+            # ════════════════════════════════════════════════════════════════════
+            # 求解器没给出可执行动作 ⇒ **不降级启发式**，交给下一 tick 重算（语义 A）。
+            # 只保留死锁保险：同一局面连续无解 N 次就发 end_turn 打破僵局。
+            # ════════════════════════════════════════════════════════════════════
+            return self._combat_solver_only_outcome(
+                snapshot=snapshot,
+                available_actions=available_actions,
+                solver_plan=solver_plan,
+                first_step=first_step,
+                solver_skip_reason=solver_skip_reason or "求解器未给出可执行首步",
+                hand=_combat_hand,
+                # ★ D1：本 tick 的计划究竟是"复用缓存"还是"刚重取" —— 由 loop_runner 的真实分支
+                #   透传（见 loop_runner.py 的 `plan_origin`），**绝不在这里猜**。
+                #   这是区分「计划过期（A，应重取不计死锁）」与「求解器真无解（B，应计数兜底）」
+                #   的**唯一**客观事实（两者在局面上逐位不可区分，见 R1-D1-CONTRACT.md §0）。
+                plan_origin=str(context.get("plan_origin") or "none"),
+                # ★ t11：**取回计划那一刻**的局面指纹。用于识别"重取回来的计划已经漂移"
+                #   （搜索 ~1s 期间手牌变了）⇒ 应归 A，而不是误判成 B 并推高死锁计数。
+                plan_fetch_signature=str(context.get("plan_fetch_signature") or ""),
+                # ★ t39：透传 classification，供留痕推导**战斗身份**（每场战斗独立预算）。
+                classification=classification,
             )
-            sequence = self._plan_combat_turn_sequence(snapshot, available_actions, preferences, guidance_override)
-            if sequence:
-                self._debug("[sts2_combat_plan] chosen_sequence=%s", sequence)
-                first = sequence[0]
-                kwargs = {"card_index": first["card_index"]}
-                if first.get("target_index") is not None:
-                    kwargs["target_index"] = first["target_index"]
-                return PlannedOperation(
-                    action_type="play_card",
-                    kwargs=kwargs,
-                    confidence=0.82 if first.get("reason") != "combat_lethal_sequence" else 0.98,
-                    source="heuristic",
-                    reason=str(first.get("reason") or "combat_sequence"),
-                )
-            action = self._preferred_combat_action(available_actions, snapshot, preferences, guidance_override)
-            if action is not None:
-                effective_override = dict(guidance_override)
-                if not effective_override.get("prefer_attack") and self._incoming_attack_total(snapshot) > self._current_block(snapshot):
-                    effective_override["prefer_defense"] = True
-                preferred_card_index = self._preferred_combat_card_index(snapshot, preferences, effective_override)
-                kwargs = self._combat_kwargs(snapshot, action, preferred_card_index)
-                return PlannedOperation(action_type=action["type"], kwargs=kwargs, confidence=0.65, source="heuristic", reason="combat_preference_or_default")
-
         return None
+
+    #: 同一局面连续无解多少次后，发 end_turn 打破僵局。
+    #: 取值权衡：太小 ⇒ 求解器偶发超时就白扔回合；太大 ⇒ 玩家看到明显卡住。
+    #: 3 次 × 每 tick ~1s ≈ 3 秒可见停顿，仍能自愈。
+    #: ★ D1 修复后它**只**统计「求解器看着最新局面仍给不出可执行动作」（= B），
+    #:   不再统计「计划过期（牌已不在手）」（= A）。见 `_combat_solver_only_outcome`。
+    _SOLVER_DEADLOCK_RETRIES = 3
+    # ★★ t13（D3）：非玩家行动窗口的**独立**计数上限。
+    #   窗口没开时我们既不能发 end_turn（它不可用）也不该累加 N/3（那不是"求解器无解"），
+    #   但必须有一个**可观测**的上限出口，否则窗口永不开时插件永久静默。
+    #   达上限时记一条显式告警（含"局面疑似卡住"），并**回绕**计数 ⇒ 日志不会出现越界数字。
+    _SOLVER_OUT_OF_WINDOW_LIMIT = 5
+
+    #: ★ D1 新增：同一局面指纹下，「计划过期（漂移）⇒ 立即重取」连续发生多少次后，
+    #: 就当**真死锁**处理（转入死锁计数，从而最终发 end_turn 脱离）。
+    #:
+    #: 为什么必须有这个上界（而不是无限重取）：
+    #:   上游 `SolverController.cs:175-177` 用 `UnexpectedReplanCount` 把
+    #:   `StateMismatch + DeploymentDrift` 上报为**缺陷信号** —— 即上游把「计划失效」
+    #:   当 bug 证据，而不是正常运维事件。反复过期说明我们的计划快照与实机持续不一致，
+    #:   若此时**只**重取、不设上界，一旦某局面每 tick 都过期就会永久卡住整局。
+    #:
+    #: 上界算术（可断言，与契约 §1.3 INV-3 / §5 的形式化陈述一致）：LIMIT=5、RETRIES=3 ⇒
+    #:   第 1–5 次 A：不计数、不发动作；第 6/7/8 次 A：转入死锁计数 1/2/3
+    #:   ⇒ **第 8 次发 end_turn**。⇒ 任一固定指纹下调用次数 ≤ 8，不可能无限重取。
+    #:
+    #: ★ 与契约 §1.2 伪代码的一处**有意偏离**（必须记录）：伪代码把过期计数在转入 B 时
+    #:   **归零**（`count = 0`），但那样每次 A 只加 1 个 deadlock，而 deadlock 需 RETRIES
+    #:   次才触发 end_turn ⇒ 实际要 `LIMIT + LIMIT × RETRIES = 20` 次才脱离，
+    #:   **违反 §5 明确要求的「S ≤ 8」上界**。§1.2 与 §5 在这里不可兼得；
+    #:   本实现取 §5 的**安全属性**（防无限重取卡死整局），令计数单调递增不归零。
+    _SOLVER_STALE_RECLAIM_LIMIT = 5
+
+    # ★★ D11（t28）：被锁事件选项的**哨兵分** —— 保证它排在任何未锁选项之后。
+    #
+    #   取 −1000 的**上界论证**（必须能断言，不能拍脑袋）：
+    #     `_score_event_option` 内任一**单项**正向加分 ≤ +70（卡牌档最高），
+    #     而各正向规则虽独立相加，其可命中集合有限（金币/遗物/卡牌/删牌/回血/加上限），
+    #     实机观察到的最高合理总分为 **+50** 量级（遗物14+金币10+卡牌8+回血18）。
+    #     ⇒ 1000 远大于任何可能总分的绝对值 ⇒ 被锁项恒为最低。
+    #   ★ 且 `_normalize_percentile` 只做**相对**归一（把分数映射成 0–100 百分位），
+    #     哨兵值不参与绝对量纲，故不影响未锁项之间的相对序。
+    #   ★ 用哨兵而非 −60 的理由：若只给被锁项 −60，而某未锁项得 +50，
+    #     则 50 > −60 ⇒ **仍会选被锁的** ⇒ 修不好（这正是实机 {0:10, 1:0} 的放大版）。
+    _EVENT_LOCKED_OPTION_SCORE = -1000
+
+    # ★★ D11（t28）：EVENT 屏「同一选项被拒且局面未变」连续多少次 ⇒ 写入本屏禁用集。
+    #
+    #   N 的取值依据（与 D9 同**口径**但更快，理由必须可核）：
+    #     · D9 用 `_SOLVER_DEADLOCK_RETRIES = 3` —— 那是**战斗屏**：动作多、局面每回合大变，
+    #       且"待确认"可能只是长动画 ⇒ 需要 3 次才敢断定无效。
+    #     · EVENT 屏不同：一屏只有 2–3 个选项；一次**成功**选择会立刻改变局面；
+    #       而**被锁**是游戏**逐字告知**的确定事实（`is_locked:true` / `"option is locked"`），
+    #       不是概率性抖动 ⇒ "试探多次"没有信息价值。
+    #   ⇒ N 取 **2**：既不像 N=1 那样可能被一次瞬时网络抖动误禁，
+    #     也不像 N=3 那样在被锁项上多空烧一整轮（实机每轮 ≈ 2–8 秒）。
+    #   ★ 但若**已拿到明确错误文本/字段**（`is_locked` 或 `option is locked` 或
+    #     `details.option_index`），则**立即**禁用（不等 N 次）—— 见 service 侧实现。
+    _EVENT_LOCKED_OPTION_RETRIES = 2
+
+    def note_event_option_locked(self, summary_context: dict[str, Any], option_index: Any) -> None:
+        """服务层在**游戏明确告知某选项被锁**之后调用：把该 index 记入**本屏禁用集**。
+
+        ★★ D11（t28）的失效检测入口。两种触发（后者更精确，见 service 侧）：
+          ① 准备阶段读到 `/state` 的 `option.is_locked == true`（**预防**）；
+          ② 派发后被游戏拒：`code=invalid_target` + `message="...option is locked."`
+             + `details.option_index=<n>`（**错误驱动的精确信号**）。
+
+        ★ 为什么需要禁用集（而不是只靠打分层读 `is_locked`）：
+          · 打分层读 `is_locked` 只在**该字段存在**时有效（旧 mod / 字段缺失就无效）；
+          · 而**错误驱动**路径不依赖字段存在性 —— 游戏逐字告诉我们哪个 index 被锁。
+          ⇒ 两条腿互为备份：字段缺失时仍有兜底。
+
+        ★ 按屏隔离（见 `_event_locked_set_key`）：换屏 / 换事件自动清空，不跨局累积。
+        """
+        index = self._safe_int(option_index)
+        if index is None:
+            return
+        key = self._event_locked_set_key(summary_context)
+        if key != self._event_locked_set_key_cached:
+            self._event_locked_set_cached = set()
+            self._event_locked_set_key_cached = key
+        if index not in self._event_locked_set_cached:
+            self._event_locked_set_cached.add(index)
+            if self._logger is not None:
+                try:
+                    self._logger.warning(
+                        "[sts2_d11] 选项被判为已锁 ⇒ 加入本屏禁用集 index=%s（本屏禁用集=%s；"
+                        "重算不会改变结论，将改选次优未锁项）"
+                        % (index, sorted(self._event_locked_set_cached))
+                    )
+                except Exception:
+                    pass
+
+    def _event_locked_set_key(self, summary_context: dict[str, Any]) -> str:
+        """本屏禁用集的隔离键：`screen|floor|event_id`（换其一即视为新屏 ⇒ 自动清空）。
+
+        ★ 为什么必须隔离：禁用集若跨屏累积，会在后续**同一个 index 合法**的事件上
+          错误地跳过它 ⇒ 变成新的误伤。用屏 + 事件 id 做键最短且足够。
+        """
+        payload = summary_context.get("payload") if isinstance(summary_context.get("payload"), dict) else {}
+        screen = str(payload.get("screen") or payload.get("_screen") or "")
+        floor = str(payload.get("floor") or "")
+        event_id = str(payload.get("event_id") or "")
+        return "%s|%s|%s" % (screen, floor, event_id)
+
+    def _combat_solver_only_outcome(
+        self,
+        *,
+        snapshot: dict[str, Any],
+        available_actions: list[dict[str, Any]],
+        solver_plan: dict[str, Any] | None,
+        first_step: dict[str, Any] | None,
+        solver_skip_reason: str,
+        hand: list[Any],
+        plan_origin: str = "none",
+        plan_fetch_signature: str = "",
+        classification: dict[str, Any] | None = None,
+    ) -> PlannedOperation | None:
+        """战斗内纯求解器的**唯一出口**：要么给出 end_turn 打破僵局，要么返回 None（本 tick 不发动作）。
+
+        ★ 为什么需要这个函数而不是直接 return None：
+          「求解器偶发给不出建议」和「求解器**持续**给不出建议」是两种病。
+          前者重算就好；后者重算会**永久卡住**，比启发式降级更糟。
+          用**局面指纹**区分二者：指纹不变 = 同一局面 = 卡住了。
+
+        ★★ D1（本条修复的核心）：上面那段话里的「求解器给不出建议」其实是**两种**病，
+          在修 D1 之前它们被混进同一个 `_solver_deadlock_count`：
+
+          - **(A) 计划过期（漂移）**：求解器建议的牌**已不在手**。搜索要 ~1s，期间上一步
+            动作已让手牌变了 ⇒ 计划天然过期。这是**运维常态**，不是求解器的错。
+            上游等价动作是 `SolverController.cs:3190-3202` 的 `RequestSearch(DeploymentDrift)`
+            —— **同回合重搜、不烧回合**。
+          - **(B) 求解器真无解**：**看着最新局面重取回来**的计划，首步**仍然**做不了
+            （或压根没给计划/首步）。这才是需要兜底打破僵局的情况。
+
+          修 D1 前：A 也计数 ⇒ 3 次"正常漂移"就白烧一个回合（队长实测：10 次 end_turn
+          **全部**由漂移触发）。修 D1 后：A 触发**立即重取且不计数**（有上界，见下），
+          只有 B 才计数并在第 `_SOLVER_DEADLOCK_RETRIES` 次发 end_turn。
+
+        ★ 判据 A/B 的唯一可观测差异 = `plan_origin`（由 `loop_runner.tick` 的真实分支透传，
+          **不由本函数猜测**）：A 与 B 在**局面**上逐位不可区分（见 .dsh-artifacts/req/R1-D1-CONTRACT.md §0
+          的只读探针实测：两者指纹相同、`_plan_step_is_executable` 返回相同、连续 3 次轨迹完全重合）。
+          唯一客观事实是「这张失效的计划是不是本 tick 刚取回来的」：
+          `refetched` + 首步仍不可执行 ⇒ B；`reused`（或未重取）⇒ A。
+
+        ★ 局面指纹取材（`_combat_plan_signature` 同源，见 loop_runner）：
+          手牌 card_id 多重集 + 能量 + 敌人血量。这三者任一变化都意味着
+          "局面真的动了"，此时重算是有意义的，两个计数器都清零。
+
+        ★ 为什么发 `end_turn` 而不是随便打一张：
+          end_turn 是**唯一永远合法**的动作（不需要能量、不需要目标、不需要那张牌在手上），
+          因此不会二次失败；且它让回合推进 ⇒ 下回合手牌重抽 ⇒ **必然**产生新局面
+          ⇒ 彻底摆脱死锁。代价是浪费一个回合，但只在**真死锁**（B）时才付。
+        """
+        signature = self._combat_deadlock_signature(snapshot)
+        if signature != self._solver_deadlock_signature:
+            # ★★ t23 修复（D6/乙）：局面变了**不等于**在推进 —— 关键区别在这里。
+            #
+            # 缺陷（实机实测，313 条 `plan-call` 的运行时真实值）：
+            #     stale   = {'0': 313}     ← ★ 313/313 恒为 0，**从未累加过**
+            #     deadlock= {'0':170, '3':143}
+            #     origin  = {'reused':175, 'refetched':131, 'none':7}
+            #   ⇒ 破局 gate（`:1686` `_solver_deadlock_count >= 3`）**从未被求值**：
+            #     `plan_origin=reused` ⇒ 恒走 (A) 分支 ⇒ 在 `:1609` 就 `return None` 了。
+            #   ⇒ 配合下面 (A) 的改动，A 的有界计数才可能真正到达上界。
+            #
+            # 机制：本方法开头的"新局面 ⇒ 计数清零"用的是**局面指纹**，而指纹含
+            #   手牌/能量/敌血（见 `_combat_deadlock_signature`）。那些值在**卡死**
+            #   局面下也可能逐 tick 微动（例如 mod 回 pending 时状态回滚/重放），
+            #   于是每 tick 都"看起来是新局面"⇒ `_solver_stale_reclaim_count`
+            #   被反复清回 0 ⇒ (A) 的上界（`:1589`）**永远达不到**。
+            #
+            # 实测对照（.dsh-artifacts/_t23_counter_trace.log）：
+            #   场景 A 指纹不变：stale 1..5 → deadlock 1,2 → 第 8 次 **end_turn**（正确）
+            #   场景 B 指纹每 tick 变：stale 恒 1、deadlock 恒 0 ⇒ **永不脱困**（实机形态）
+            #
+            # ★ 修法：把"清零"与"推进"解耦 ——
+            #   局面指纹变了只说明**手牌/血量的即时值**变了，不说明**死锁被解开了**。
+            #   真正能证明"解开了"的是：**本 tick 求解器给出了可执行的首步**
+            #   （即 `is_fresh_and_executable`）或**根本不是在本方法里判死锁**。
+            #   ⇒ 因此 `_solver_stale_reclaim_count` / `_solver_deadlock_count` 的清除，
+            #     改由**明确的"已恢复"信号**触发（见下方 `:1686` 之后与函数出口），
+            #     而不是由指纹变化触发。
+            #   ★ 保留 `_solver_out_of_window_count` 的指纹清零语义（它度量的是
+            #     "窗口外连等多久"，换局面确实应重置）。
+            #
+            # 上游同构：`SolverController.cs:2805-2815` 的 `PlanExhausted` 重搜路径
+            #   靠 `ContinuationSource`/重算次数记账，而**不是**靠"局面变了"清零；
+            #   `CombatBugReportDescription.cs:113-115` 把
+            #   `DeploymentDriftReplans` / `PlanExhaustedReplans` 作为**跨重试累计**的
+            #   缺陷证据上报 —— 即上游也认为"反复重算"是**单调累计**的量。
+            self._solver_deadlock_signature = signature
+            # ★ t13：窗口外计数 —— 新局面下的"等了多久"不该背旧局面的数（语义不变）。
+            self._solver_out_of_window_count = 0
+            # ★★ t23：**不**在这里清 `_solver_deadlock_count` /
+            #   `_solver_stale_reclaim_count`。它们表示"连续多少轮没能推进"，
+            #   与"局面指纹动了没有"无关。清零点见 (A) 分支的脱困判定与下方恢复分支。
+
+        # ── (1) 判 A 还是 B —— 本条修复**唯一**新增的判据 ────────────────────────────
+        #     仅当「本 tick 刚取回的计划，其首步现在**仍然**做不了」时才归 B；
+        #     计划为空/首步缺失同样归 B（重取后连计划都没有 = 求解器确实没给东西）。
+        #     `_plan_step_is_executable` 是 loop_runner 里**同一个**判据（纯函数，无副作用），
+        #     这里复用它是为了 A/B 与"快照该不该丢"依据同一套事实，不会互相打架。
+        is_fresh_but_unexecutable = False
+        if plan_origin == "refetched" and isinstance(first_step, dict):
+            try:
+                # 惰性导入：`loop_runner` 在**模块级**导入本模块的若干符号（service 侧），
+                # 用函数内导入彻底避免"将来有一天"出现循环导入把插件启动打断。
+                from .loop_runner import _plan_step_is_executable
+
+                is_fresh_but_unexecutable = not _plan_step_is_executable(first_step, snapshot)[0]
+            except Exception:
+                # 判据本身不该抛；真抛了也不能因此把 A 误判成 B（会白烧回合）。
+                is_fresh_but_unexecutable = False
+        # ★★ t11 修复：`refetched` **还不够**判 B —— 还必须"取回时的局面指纹 == 当前指纹"。
+        #
+        # t5 复核发现、队长独立复核证实、我亦实机复现的误报：
+        #   求解器搜索耗时约 1s，这期间手牌可能已经变了 ⇒ 重取回来的计划**首步就已漂移**。
+        #   实机分类（t5 全量统计）：
+        #     refetched + 手牌漂移 13 条 | refetched + 真无解（药水缺失） 2 条
+        #   ⇒ 「refetched + 首步不可执行」**主要就是漂移**（13:2），判成 B 是误报，
+        #     会让死锁计数涨到 3/3（实机 08:45:01 实测已达 3/3，只因那一 tick
+        #     `end_turn_action is None` 才侥幸没烧回合）⇒ **下一次同指纹漂移就会白烧一整个回合**。
+        #
+        # 判据：`plan_fetch_signature` 由 loop_runner 在**取回计划那一瞬间**记下并透传。
+        #   等 ⇒ 计划与"取回时的局面"仍然对得上，但首步还是做不了 ⇒ 真无解（B）。
+        #   不等 ⇒ 取回后局面已变（漂移）⇒ 归 A、立即重取、**不计数**。
+        #
+        # ★ 保守方向：`plan_fetch_signature` 为空（调用方没传 / 非 loop_runner 调用点）
+        #   时**视为"相同"**，即保留原有的 B 判定 —— 因为把真无解误判成 A 会导致
+        #   无限重取、卡死整局（安全属性），比误报一次兜底更危险。
+        current_signature = self._combat_deadlock_signature(snapshot)
+        fetch_signature = str(plan_fetch_signature or "")
+        is_signature_unchanged_since_fetch = (not fetch_signature) or (fetch_signature == current_signature)
+        is_plan_absent = (solver_plan is None) or (first_step is None)
+        # ★ 计划**刚刚重取、且首步确实可执行** —— 这不是"求解器给不出动作"，而是
+        #   "重取回来的计划正好能用"。现实中它走不到这里（更早处会直接出牌），
+        #   但判据必须保守：**只有"不可执行"才算过期/无解**，可执行绝不动任何计数。
+        is_fresh_and_executable = (
+            plan_origin == "refetched" and isinstance(first_step, dict) and not is_fresh_but_unexecutable
+        )
+        # 真无解 = 刚取回(B1) 且 取回后局面没变(B2) 且 首步仍不可执行；或 计划缺失。
+        is_true_deadlock = (is_fresh_but_unexecutable and is_signature_unchanged_since_fetch) or is_plan_absent
+
+        if not is_true_deadlock and not is_fresh_and_executable:
+            # ── (A) 计划过期（漂移）：立即重取，**不消耗死锁计数** ──────────────────
+            #   覆盖两种 A：
+            #     A1 `plan_origin != "refetched"`（复用缓存/无来源）⇒ 旧计划，本就该重取；
+            #     A2 `plan_origin == "refetched"` 但**取回后指纹已变** ⇒ t11 新增，
+            #        修掉"重取回来的计划已漂移却被判 B"的误报。
+            #   上界语义（契约 §1.2 伪代码 + §5 形式化陈述，两者必须同时成立）：
+            #     第 1…LIMIT 次 A：不计数、不发动作；
+            #     第 LIMIT+1 次起：本次**仍不发动作**，但转入死锁计数（+1）。
+            #   ★ 关键实现细节：过期计数在转入 B 时**不归零**（单调递增）。
+            #     契约 §1.2 的伪代码写的是 `if count >= LIMIT: count = 0; deadlock += 1`
+            #     ——它把计数归零了；而 §5 的形式化陈述要求「任一固定指纹下调用次数
+            #     S ≤ LIMIT + RETRIES = 8」。两者**不可兼得**：归零后每次 A 只加 1 个
+            #     deadlock，而 deadlock 又需要 RETRIES 次才触发 end_turn ⇒ 实际要
+            #     LIMIT + LIMIT × RETRIES 次才脱离（LIMIT=5 ⇒ 第 16 次），违反 §5 的
+            #     「≤8」上界。**取 §5 的上界**（它是安全属性：防无限重取卡死整局），
+            #     即让计数**单调**：第 6/7/8 次 A 依次把 deadlock 推到 1/2/3 ⇒ 第 8 次
+            #     end_turn。§1.2 伪代码的"归零"按此修正，行为差异只体现在上界生效后。
+            self._solver_stale_reclaim_count += 1
+            # ★★ t23：破局 gate **不可被 (A) 的 `return None` 遮蔽**。
+            #
+            # 两种进入"应当贯穿"的情形：
+            #   ① 过期次数越过上界（`:1624`）—— 「反复过期」本身已是异常信号；
+            #   ② `_solver_deadlock_count` **已经**达到阈值 —— 这包含
+            #      **t20 的交接**（service.py:1060-1061 把 deadlock 顶到 retries，
+            #      期望"下一 tick planner 就发 end_turn"）与上一 tick 刚累加到阈值的情形。
+            #      ★ 实机正是这一种：deadlock=3（143 条 plan-call 实测）、stale=0、
+            #        origin=reused ⇒ 旧实现在此 `return None`，
+            #        于是 t20 的交接**每次都被吞掉**、破局产出 0 次。
+            reached_bound = self._solver_stale_reclaim_count >= self._SOLVER_STALE_RECLAIM_LIMIT + 1
+            already_at_threshold = self._solver_deadlock_count >= self._SOLVER_DEADLOCK_RETRIES
+            if reached_bound or already_at_threshold:
+                # ★ 上界保护 / 交接兑现：转入（或维持）死锁计数 —— **本 tick 就允许破局落地**。
+                #
+                # ★★ t23 修复（D6/乙）：旧实现此处**仍然不发动作**（注释原文：
+                #   "本 tick 仍不发动作 ⇒ 最迟第 LIMIT+RETRIES 次脱离"），
+                #   于是要靠"下一次再走一遍 B 分支"才计数到 3。
+                #   但实机恒 `plan_origin=reused` ⇒ 每 tick 都进 (A) 并在此 `return None`
+                #   ⇒ `_solver_deadlock_count` 虽 +1，**下一 tick 走到 gate 前又先进 (A)**
+                #   ⇒ 破局 gate 永远被 (A) 的 `return None` 遮蔽（实测 313/313）。
+                #   ⇒ 既然已经判定"过期越过上界"或"计数已到阈值"= 明确的异常/交接信号，
+                #     就**本 tick 立即**贯穿到 gate，不再 `return None`。
+                #     这样上界语义（≤ LIMIT+RETRIES）才真的成立、
+                #     且 t20 的破局交接才能兑现。
+                if reached_bound:
+                    self._solver_deadlock_count += 1
+                self._combat_log_solver_vs_executed(
+                    solver_kind=(first_step.get("kind") if isinstance(first_step, dict) else None),
+                    solver_card_id=(first_step.get("card_id") if isinstance(first_step, dict) else None),
+                    solver_target=(first_step.get("target_index") if isinstance(first_step, dict) else None),
+                    executed_action="(过期/交接转死锁判定)",
+                    executed_kwargs={},
+                    matched=False,
+                    fallback_reason=(
+                        f"计划连续过期 {self._solver_stale_reclaim_count} 次"
+                        f"（上界 {self._SOLVER_STALE_RECLAIM_LIMIT}）"
+                        f"/ 死锁计数 {self._solver_deadlock_count}"
+                        f"（阈值 {self._SOLVER_DEADLOCK_RETRIES}）⇒ 转入死锁判定"
+                        f"（plan_origin={plan_origin}；{solver_skip_reason}）"
+                    ),
+                    hand=hand,
+                    # ★ t39：传战斗身份，使每场战斗的留痕预算独立。
+                    snapshot=snapshot,
+                    classification=classification,
+                )
+                # ★ 不 return：继续往下走窗口判定与破局 gate，
+                #   使 `_solver_deadlock_count >= _SOLVER_DEADLOCK_RETRIES` 能真正生效。
+            else:
+                self._combat_log_solver_vs_executed(
+                    solver_kind=(first_step.get("kind") if isinstance(first_step, dict) else None),
+                    solver_card_id=(first_step.get("card_id") if isinstance(first_step, dict) else None),
+                    solver_target=(first_step.get("target_index") if isinstance(first_step, dict) else None),
+                    executed_action="(不发动作，等重算)",
+                    executed_kwargs={},
+                    matched=False,
+                    fallback_reason=(
+                        f"计划过期（{solver_skip_reason}）⇒ 立即重取，不计死锁"
+                        f"（第 {self._solver_stale_reclaim_count}/{self._SOLVER_STALE_RECLAIM_LIMIT} 次；"
+                        f"plan_origin={plan_origin}；"
+                        f"取回后指纹{'已变' if not is_signature_unchanged_since_fetch else '未变'}）"
+                    ),
+                    hand=hand,
+                    # ★ t39：传战斗身份，使每场战斗的留痕预算独立。
+                    snapshot=snapshot,
+                    classification=classification,
+                )
+                return None
+        elif is_true_deadlock:
+            # ── (B) 求解器真无解：计数，达阈值才兜底 ────────────────────────────────
+            self._solver_deadlock_count += 1
+        else:
+            # ── ★★ t23：**唯一的"已恢复"信号** —— `refetched` + 首步可执行。
+            #   求解器看着最新局面给出了能照做的动作 ⇒ 死锁真的解开了 ⇒ 三个计数清零。
+            #
+            #   为什么清零点必须**搬到这里**（而不能继续挂在"局面指纹变了"上）：
+            #     指纹含手牌/能量/敌血的**即时值**，卡死局面下它们仍可能逐 tick 微动
+            #     ⇒ 每 tick 都误判成"新局面"⇒ 计数被反复清零 ⇒ A 的上界（`:1589`）
+            #     永远达不到（实机 `stale` 313/313 恒 0、破局 gate 从未求值）。
+            #   本条的判据是**语义性的**："求解器给出了可执行动作" = 真的能推进了。
+            #
+            #
+            # ★★★ t37（D1 实机复现，2026-10-20 07:44–07:54，run=C6CM8CZRR9KQ）：
+            #   上面这条判据本身**保留不动**（契约 T-F / INV-4 依赖它，见
+            #   tests/test_solver_deadlock_contract.py:368 / :631）。
+            #   t37 的真因**不在本文件**：实机每个 epicycle 都是
+            #     `refetched(可执行)` → `reused(漂移)`；
+            #   而让"同一份计划在同一 tick 内被判出相反结论"的是 loop_runner 的
+            #   **两条 planner 调用路径**（candidate_generator 与 planning_context）
+            #   读同一份 solver_plan 却用了不同口径 —— 修在 loop_runner.py。
+            #   详见 .dsh-artifacts/T37-D1-ROOTCAUSE.md。
+            #
+            # ★★★ t37 契约第 3 条：「三个计数的语义在日志里互不掩盖」——
+            #   本分支是**唯一**会把 stale/deadlock 清零的地方，而它原先**完全静默**。
+            #   实机后果：日志里只见到 17 条 mismatch 行（stale 7..23），
+            #   被清零的成功 tick **一行都不打印** ⇒ 多个小周期被拼成一条
+            #   「看似单调」的数列 ⇒ 误导排查（我本人第一轮就被它骗过；
+            #   队长用 grep 统计时也踩了同一个坑）。
+            #   ⇒ 清零必须留痕：记一行，把「本次清零 + 清零前各计数 + 为什么清零」写出。
+            #     这样任一 tick 结束时，都能从日志读出
+            #     「求解器给了什么 / 为什么没执行 / 三个计数各是多少」。
+            _stale_before = self._solver_stale_reclaim_count
+            _deadlock_before = self._solver_deadlock_count
+            self._solver_stale_reclaim_count = 0
+            self._solver_deadlock_count = 0
+            self._combat_log_solver_vs_executed(
+                solver_kind=(first_step.get("kind") if isinstance(first_step, dict) else None),
+                solver_card_id=(first_step.get("card_id") if isinstance(first_step, dict) else None),
+                solver_target=(first_step.get("target_index") if isinstance(first_step, dict) else None),
+                executed_action="(计划已恢复：清零计数)",
+                executed_kwargs={},
+                matched=False,
+                fallback_reason=(
+                    f"求解器基于最新局面给出可执行首步 ⇒ 判定已恢复 ⇒ 清零"
+                    f"（清零前 stale={_stale_before}"
+                    f"/{self._SOLVER_STALE_RECLAIM_LIMIT}、"
+                    f"deadlock={_deadlock_before}"
+                    f"/{self._SOLVER_DEADLOCK_RETRIES}；"
+                    f"清零后 stale=0、deadlock=0；plan_origin={plan_origin}）"
+                ),
+                hand=hand,
+                # ★ t39：传战斗身份，使每场战斗的留痕预算独立。
+                snapshot=snapshot,
+                classification=classification,
+            )
+
+        end_turn_action = self._find_action(available_actions, "end_turn")
+
+        # ── ★★ t13 修复（D3）：非玩家行动窗口期**既不计数、也不发动作**，但有界 ─────────
+        #
+        # 缺陷（实机证据，`N.E.K.O_Plugin_sts2_autoplay_20261019.log`）：
+        #   09:14:42 死锁 5/3 origin=none 手牌=[] ｜ 09:14:43 死锁 7/3 手牌=[]
+        #   09:14:54 5/3 ｜ 09:14:55 7/3 ｜ 09:15:20 5/3 ｜ 09:15:31 5/3   （post-reload 6 条）
+        #   全部 `origin=none` + `手牌=[]` ⇒ 局面根本**不在玩家行动窗口**。
+        #
+        # 根因：`end_turn` 不在 `available_actions` 里（窗口没开）⇒ 上面那个
+        #   `end_turn_action is not None` 的 guard 把兜底**静默挡住**，
+        #   但 `_solver_deadlock_count` 已经先 +1 了 ⇒ 计数**越过自己的阈值**继续涨
+        #   （`N/3` 的 N 到 5、7）⇒ 语义自相矛盾，且若该状态持续则**永久不发动作**。
+        #
+        # 判据：`end_turn` 不可用 ⇒ 我们**无法**用 end_turn 打破任何东西
+        #   （end_turn 是唯一永远合法的动作，它不可用说明窗口没开）。
+        #   ⇒ 此时计数毫无意义（不是"求解器无解"，是"轮不到我们"）⇒ **不累加**。
+        #   ★ 关键：不能只是"不计数"就完事 —— 那会让 `N/3` 永远停在旧值而看起来正常，
+        #     若窗口再也不开（mod 侧卡住），插件就永久静默。故加**独立的窗口外计数**
+        #     `_solver_out_of_window_count`，达上限后记一条**可观测的**告警日志，
+        #     让"插件没动"与"窗口没开"在日志里可区分（这是本缺陷最贵的部分：它静默）。
+        #   ★ 不得把 `autoplay_state` 改成 error（那是别处的老 bug 模式），
+        #     也不得伪造动作：窗口外我们**只能**等，但必须**说出来**。
+        is_player_window_open = end_turn_action is not None
+        if not is_player_window_open:
+            # 窗口没开 ⇒ 清空僵局计数（它只对"玩家窗口内的僵局"有意义），
+            # 改用一个**独立**的窗口外计数来度量"等了多久"，避免污染 N/3。
+            self._solver_deadlock_count = 0
+            self._solver_out_of_window_count += 1
+            self._combat_log_solver_vs_executed(
+                solver_kind=(first_step.get("kind") if isinstance(first_step, dict) else None),
+                solver_card_id=(first_step.get("card_id") if isinstance(first_step, dict) else None),
+                solver_target=(first_step.get("target_index") if isinstance(first_step, dict) else None),
+                executed_action="(不发动作，等玩家窗口)",
+                executed_kwargs={},
+                matched=False,
+                fallback_reason=(
+                    f"非玩家行动窗口（available_actions 无 end_turn）⇒ 不计数、不发动作"
+                    f"（窗口外第 {self._solver_out_of_window_count} 次"
+                    f"/{self._SOLVER_OUT_OF_WINDOW_LIMIT}；plan_origin={plan_origin}）"
+                ),
+                hand=hand,
+                # ★ t39：传战斗身份，使每场战斗的留痕预算独立。
+                snapshot=snapshot,
+                classification=classification,
+            )
+            if self._solver_out_of_window_count >= self._SOLVER_OUT_OF_WINDOW_LIMIT:
+                # ★ 出口的**下限**：只保证"可观测"，不越权发动作。
+                #   `end_turn` 不可用时我们没有任何合法动作可发（end_turn 是唯一永远合法的），
+                #   所以正确的出口是：**把它说出来**，并让 loop_runner 侧的看门狗
+                #   （t14：无进展看门狗）能据此判定"loop 卡住了"从而重连/恢复。
+                #   ★ 计数器达上限后**回绕**（而非继续涨），这样日志不会出现 `N/3` 那种越界数字，
+                #     但每条都带"第 N/LIMIT 次"且每 LIMIT 次会再喊一次，不会只喊一次就沉默。
+                self._combat_log_solver_vs_executed(
+                    solver_kind=(first_step.get("kind") if isinstance(first_step, dict) else None),
+                    solver_card_id=(first_step.get("card_id") if isinstance(first_step, dict) else None),
+                    solver_target=(first_step.get("target_index") if isinstance(first_step, dict) else None),
+                    executed_action="(窗口外超时：等待恢复)",
+                    executed_kwargs={},
+                    matched=False,
+                    fallback_reason=(
+                        f"★ 非玩家行动窗口持续 {self._solver_out_of_window_count} 次"
+                        f"（≥ {self._SOLVER_OUT_OF_WINDOW_LIMIT}）⇒ 局面疑似卡住："
+                        f"既无 end_turn 可发、也没有可执行计划"
+                        f"（{solver_skip_reason}；plan_origin={plan_origin}）"
+                    ),
+                    hand=hand,
+                    # ★ t39：传战斗身份，使每场战斗的留痕预算独立。
+                    snapshot=snapshot,
+                    classification=classification,
+                )
+                self._solver_out_of_window_count = 0
+            return None
+
+        # 回到玩家窗口 ⇒ 窗口外计数清零（它只度量"连续窗口外"的时长）。
+        self._solver_out_of_window_count = 0
+
+        if self._solver_deadlock_count >= self._SOLVER_DEADLOCK_RETRIES:
+            self._combat_log_solver_vs_executed(
+                solver_kind=(first_step.get("kind") if isinstance(first_step, dict) else None),
+                solver_card_id=(first_step.get("card_id") if isinstance(first_step, dict) else None),
+                solver_target=(first_step.get("target_index") if isinstance(first_step, dict) else None),
+                executed_action="end_turn",
+                executed_kwargs={},
+                matched=False,
+                fallback_reason=(
+                    f"求解器连续 {self._solver_deadlock_count} 次给不出可执行动作"
+                    f"（{solver_skip_reason}）⇒ 发 end_turn 打破死锁"
+                    f"（plan_origin={plan_origin}）"
+                ),
+                hand=hand,
+                # ★ t39：传战斗身份，使每场战斗的留痕预算独立。
+                snapshot=snapshot,
+                classification=classification,
+            )
+            # 打破僵局后清零：下一回合是全新局面，不该继续背着旧计数。
+            self._solver_deadlock_signature = ""
+            self._solver_deadlock_count = 0
+            self._solver_stale_reclaim_count = 0
+            self._solver_out_of_window_count = 0
+            return PlannedOperation(
+                action_type="end_turn",
+                kwargs={},
+                confidence=0.5,
+                source="solver_deadlock_breaker",
+                reason="solver_deadlock_end_turn",
+            )
+
+        # 正常路径：本 tick 不发动作，等 loop_runner 下一 tick 重取 /solver/plan。
+        # ★ 必须留痕，否则"插件没动"和"插件卡死"在日志里无法区分。
+        self._combat_log_solver_vs_executed(
+            solver_kind=(first_step.get("kind") if isinstance(first_step, dict) else None),
+            solver_card_id=(first_step.get("card_id") if isinstance(first_step, dict) else None),
+            solver_target=(first_step.get("target_index") if isinstance(first_step, dict) else None),
+            executed_action="(不发动作，等重算)",
+            executed_kwargs={},
+            matched=False,
+            fallback_reason=(
+                f"{solver_skip_reason} ⇒ 纯求解器语义：丢弃本计划、重算"
+                f"（死锁 {self._solver_deadlock_count}/{self._SOLVER_DEADLOCK_RETRIES}；"
+                f"plan_origin={plan_origin}）"
+            ),
+            hand=hand,
+            # ★ t39：传战斗身份，使每场战斗的留痕预算独立。
+            snapshot=snapshot,
+            classification=classification,
+        )
+        return None
+
+    def _combat_deadlock_signature(self, snapshot: dict[str, Any]) -> str:
+        """战斗死锁判据用的**局面指纹**：只有"局面真的动了"才改变它。
+
+        ★ t11：实现已**提取到 `loop_runner._combat_deadlock_signature`**（模块级纯函数），
+          因为 `loop_runner` 也要在"取回计划那一瞬间"算同一个指纹（`plan_fetch_signature`），
+          而它拿不到本实例方法。这里委托过去，**保证两侧永不走样** ——
+          若各写一份，将来必然漂移，于是"判 B"与"判漂移"会依据不同的局面概念。
+
+        取材刻意与 `_combat_plan_signature` 对齐（手牌/能量/敌人血量），
+        这样"计划该重取"与"死锁该计数"依据同一个局面概念，不会互相打架。
+        """
+        from .loop_runner import _combat_deadlock_signature as _shared
+
+        return _shared(snapshot)
 
     def _find_action(self, actions: list[dict[str, Any]], action_name: str) -> dict[str, Any] | None:
         target = str(action_name or "").strip().lower()
@@ -1148,17 +2149,85 @@ class STS2HeuristicPlanner:
             return index
         return None
 
-    def _preferred_event_option(self, summary_context: dict[str, Any], preferences: dict[str, Any]) -> int | None:
+    def _event_screen_signature(self, summary_context: dict[str, Any]) -> str:
+        """事件屏签名：用于判断"是否还是同一个事件屏"。
+
+        刻意**不含** hp/gold —— 它们会在同一屏内因已执行的选项而变化，
+        若纳入签名会让"已选次数"在每次选完后重置，记忆就失效了。
+        只取"哪些选项"（文案+下标），这才是一屏的身份。
+        """
+        payload = summary_context.get("payload") if isinstance(summary_context.get("payload"), dict) else {}
+        options = payload.get("event_options") if isinstance(payload.get("event_options"), list) else []
+        parts: list[str] = []
+        for index, option in enumerate(options):
+            if not isinstance(option, dict):
+                continue
+            option_index = self._safe_int(option.get("index"))
+            if option_index is None:
+                option_index = index
+            parts.append(f"{option_index}:{self._event_option_text(option)[:40]}")
+        return "|".join(parts)
+
+    def _note_event_option_chosen(self, summary_context: dict[str, Any], option_index: int) -> None:
+        """记录"某个事件选项**已被真正派发**过几次"。
+
+        ★修复缺陷 A3：`_rank_event_options` 原本是**无状态**的 —— 只读当前 hp/gold，
+        完全不知道"这个选项我已经选过"。于是在**可重复选择**的事件上（每次选完屏幕不变、
+        选项还在），它每轮都算出同一个最优解 ⇒ **无限重复**，直到 HP 变 1。
+
+        与 `note_selection_option_pressed` 同范式：**只在真正派发成功后**调用
+        （由 service 在动作成功后回调），不在 `plan()` 里累加 —— 因为 `plan()` 每 tick
+        都被调用（约 1 次/秒），而实际派发约 2.5 秒一次，在 plan 里累加会凭空放大计数。
+        """
+        signature = self._event_screen_signature(summary_context)
+        if signature != self._event_memory_key:
+            self._event_memory_key = signature
+            self._event_choice_counts = {}
+        self._event_choice_counts[option_index] = self._event_choice_counts.get(option_index, 0) + 1
+
+    def _event_repeat_penalty(self, summary_context: dict[str, Any], option_index: int) -> float:
+        """同一事件屏上"该选项已选过 N 次"的**递减惩罚**。
+
+        ★★ 这里有一个**必须避免的陷阱**（我在实现时踩到并已修正）：
+
+        若对所有选项一视同仁地累加惩罚，会把**无害选项**（如"离开"）也一起压下去 ——
+        实测后果：反复选"离开"4 次后，`离开` 被压到 `扣上限` 之下，**最优解反而翻回了扣上限的选项**
+        （复现：第 1 轮 `[1,0]` 正确，第 4 轮 `[0,1]` 反转）。这会让修复**比不修更糟**。
+
+        正确做法：**只惩罚"有害选项"的重复**。判据是该选项本身是否已被评分为负 ——
+        "离开"这类中性选项（分数 0）**永不惩罚**，因此不会再出现"好选项被累积惩罚压过头"。
+
+        于是语义变成：**同一屏上反复选一个"有害"选项，惩罚递增；选无害选项不累积。**
+        这既不改变一次性事件的正常决策（第一次选零惩罚），又能在可重复选择的事件上止损。
+        """
+        signature = self._event_screen_signature(summary_context)
+        if signature != self._event_memory_key:
+            return 0.0
+        times = self._event_choice_counts.get(option_index, 0)
+        if times <= 0:
+            return 0.0
+        return float(self._EVENT_REPEAT_PENALTY_PER_TIME * times)
+
+    def _preferred_event_option(
+        self,
+        summary_context: dict[str, Any],
+        preferences: dict[str, Any],
+        strategy_context: dict[str, Any] | None = None,
+    ) -> int | None:
         # 1) 硬覆盖：玩家用自然语言钉死了某个选项，优先级高于任何评分。
         pinned = self._preferred_option_index(preferences)
         if pinned is not None:
             return pinned
 
         # 2) 纯启发式打分（事件房已无 LLM 评分融合，见 _rank_event_options）。
-        ranked = self._rank_event_options(summary_context)
+        ranked = self._rank_event_options(summary_context, strategy_context)
         return ranked[0] if ranked else None
 
-    def _rank_event_options(self, summary_context: dict[str, Any]) -> list[int]:
+    def _rank_event_options(
+        self,
+        summary_context: dict[str, Any],
+        strategy_context: dict[str, Any] | None = None,
+    ) -> list[int]:
         """事件选项按启发式分数**从好到坏**排序（返回选项下标）。
 
         与 ``_preferred_event_option`` 的评分口径完全一致，唯一差别是不取最高分而是保留整条顺序，
@@ -1174,17 +2243,139 @@ class STS2HeuristicPlanner:
 
         hei_scores: dict[int, int] = {}
         indexed: list[tuple[int, dict[str, Any]]] = []
+        # ★★ D11（t28）：本屏禁用集（按 `screen|floor|event_id` 隔离）——只影响**本屏**。
+        locked_key = self._event_locked_set_key(summary_context)
+        if locked_key != self._event_locked_set_key_cached:
+            self._event_locked_set_cached = set()
+            self._event_locked_set_key_cached = locked_key
+        banned = self._event_locked_set_cached
+        locked_by_field: list[int] = []
+        seen_indices: set[int] = set()
         for index, option in enumerate(event_options):
             if not isinstance(option, dict):
                 continue
             option_index = self._safe_int(option.get("index"))
             if option_index is None:
                 option_index = index
+            seen_indices.add(option_index)
+            # ★ 预防：字段直接说被锁 ⇒ 记入禁用集（跨 tick 保持，见 `note_event_option_locked`）。
+            if self._event_option_is_locked(option):
+                locked_by_field.append(option_index)
+                banned.add(option_index)
+            # ★★ 关键修正（t28 自测发现，实机 01:19:16 暴露 4 次误报）：
+            #   `/state` 的 `is_locked` 是**权威且更新**的数据源；禁用集只是**错误驱动的补充**。
+            #   ⇒ 若本 tick 的数据**明确**说明该 index 未被锁（字段为 False），
+            #     则禁用集里的旧记录**已过期**，必须移除 —— 否则会误禁一个合法选项。
+            #
+            #   为什么必须这样（实机证据）：ENDLESS_CONVEYOR 是**多页事件**
+            #     （`text_key` 含 `pages.ALL.options.LOCKED` /
+            #       `pages.GRAB_SOMETHING_OFF_THE_BELT.options.LEAVE`），
+            #   换页后 `screen|floor|event_id` **三者都不变** ⇒ 隔离键**无法区分页**
+            #   ⇒ 上一页 index=0 被锁的禁用记录**串到下一页**，而下一页 index=0 合法
+            #   ⇒ 实测 01:19:16 连打 4 条「本屏所有选项均在禁用集内 [0]」**误报**。
+            #   ★ 修法不是继续加大隔离键（页 id 从 `/state` 拿不到），
+            #     而是**让权威数据压制补充记录** —— 数据说没锁，就不该再禁。
+            elif option.get("is_locked") is False:
+                banned.discard(option_index)
+            # ★ 运行时禁用集里的项**不参与打分**（但仍返回分数，供日志显示为何被排除）。
             hei_scores[option_index] = self._score_event_option(option, hp_ratio, gold)
             indexed.append((option_index, option))
+        # ★ 已不在本屏出现的 index ⇒ 禁用记录无意义，清掉（防止跨屏累积）。
+        banned &= seen_indices
+        self._event_locked_set_cached = banned
         hei_norm = self._normalize_percentile(hei_scores)
 
-        scored: list[tuple[float, int]] = []
+        # ★★ 让【跨局复盘教训】作用于事件选择（用户点名的缺陷 A/B 所在屏）。
+        #   此前事件屏只读 `guidance_override`（payload 里的临时指示）与启发分，
+        #   **完全不读跨局教训** ⇒ 复盘学到"别再吃永久掉上限的选项"也无法阻止重犯。
+        #   `strategy_directives` 在 `strategy_context`（兄弟键），故由调用方传入。
+        #   ★ 教训的**唯一真相来源**是 `_event_final_scores` 内部（打分核心）；
+        #     这里只为日志再取一次信号，**不参与打分**，避免出现第二个真相来源。
+        lesson_signals = self._reward_lesson_signals(strategy_context)
+
+        final_scores = self._event_final_scores(
+            summary_context,
+            strategy_context,
+            hei_scores=hei_scores,
+            hei_norm=hei_norm,
+            indexed=indexed,
+            guidance_override=guidance_override,
+        )
+        # 与 _preferred_event_option 同口径：分数高的在前，同分时下标小的在前。
+        scored = sorted(final_scores.items(), key=lambda item: (-item[1], item[0]))
+        # ★★ D11（t28）：把**已确认不可选**的下标排到**最后**。
+        #
+        #   ★ 为什么是"排到最后"而不是"直接删除"：
+        #     若某屏**所有**选项都被判为锁定（数据异常 / 字段误读），直接删除会得到**空候选**
+        #     ⇒ `_preferred_event_option` 返回 None ⇒ 插件**不发任何动作** ⇒ 反而制造新的卡死。
+        #     排到最后可保证：只要还有任一未锁项就选它；全都锁时仍有一个（最差的）可发
+        #     —— 此时"发出去被拒"至少留下**可观测**痕迹，而不是静默无动作。
+        #   ★ 这是安全属性：**绝不因本修复把候选集变空**。
+        banned_order = [ix for ix, _ in scored if ix in banned]
+        free_order = [ix for ix, _ in scored if ix not in banned]
+        ordered = free_order + banned_order
+        if banned_order and not free_order:
+            if self._logger is not None:
+                try:
+                    self._logger.warning(
+                        "[sts2_d11] 本屏**所有**选项均在禁用集内 %s ⇒ 无未锁可选，"
+                        "仍发出最差分项以避免静默无动作（请人工介入）" % (sorted(banned),)
+                    )
+                except Exception:
+                    pass
+        self._log_event_route(hei_scores, scored, ordered, event_options, hp_ratio, gold, lesson_signals)
+        return ordered
+
+    def _event_final_scores(
+        self,
+        summary_context: dict[str, Any],
+        strategy_context: dict[str, Any] | None = None,
+        *,
+        hei_scores: dict[int, int] | None = None,
+        hei_norm: dict[int, float] | None = None,
+        indexed: list[tuple[int, dict[str, Any]]] | None = None,
+        guidance_override: dict[str, Any] | None = None,
+    ) -> dict[int, float]:
+        """事件选项的**最终分**（排序前的唯一真相来源）。
+
+        ★ 抽成独立函数的原因：把管线（启发分 → 归一化 → 教训 → 重复惩罚 → 最终分）
+          集中在一处，`_rank_event_options` 与测试**共用同一实现**，
+          避免"测试复刻了一份打分逻辑"导致测试通过而线上行为不同。
+
+        教训（`strategy_context`）的三处作用：
+          - `self_damage` 教训 ⇒ **永久扣生命上限**的选项 −45，普通掉血 −18（缺陷 A）
+          - 诅咒教训 ⇒ 拿诅咒/塞牌的选项 −30（缺陷 B）
+        """
+        payload = summary_context.get("payload") if isinstance(summary_context.get("payload"), dict) else {}
+        event_options = payload.get("event_options") if isinstance(payload.get("event_options"), list) else []
+        current_hp = self._safe_int(payload.get("current_hp")) or 0
+        max_hp = self._safe_int(payload.get("max_hp")) or 0
+        gold = self._safe_int(payload.get("gold")) or 0
+        hp_ratio = (current_hp / max_hp) if max_hp > 0 else 0.0
+        if guidance_override is None:
+            guidance_override = self._guidance_override_from_payload(summary_context)
+        if indexed is None:
+            indexed = []
+            for index, option in enumerate(event_options):
+                if not isinstance(option, dict):
+                    continue
+                option_index = self._safe_int(option.get("index"))
+                indexed.append((option_index if option_index is not None else index, option))
+        if hei_scores is None:
+            hei_scores = {
+                option_index: self._score_event_option(option, hp_ratio, gold)
+                for option_index, option in indexed
+            }
+        if hei_norm is None:
+            hei_norm = self._normalize_percentile(hei_scores)
+
+        lesson_signals = self._reward_lesson_signals(strategy_context)
+        lesson_text = self._lesson_raw_text(strategy_context)
+        wants_curse_avoid = ("curse" in lesson_signals) or any(
+            token in lesson_text for token in ("诅咒", "curse")
+        )
+
+        out: dict[int, float] = {}
         for option_index, option in indexed:
             final = hei_norm.get(option_index, 50.0)
             text = self._event_option_text(option)
@@ -1192,10 +2383,80 @@ class STS2HeuristicPlanner:
                 final -= 15.0
             if guidance_override.get("prefer_attack") and any(tok in text for tok in ["relic", "遗物", "gold", "金币", "card", "卡牌"]):
                 final += 10.0
-            scored.append((final, option_index))
-        # 与 _preferred_event_option 同口径：分数高的在前，同分时下标小的在前。
-        scored.sort(key=lambda item: (-item[0], item[1]))
-        return [option_index for _, option_index in scored]
+            # ★ 缺陷 A（用户点名）：**永久扣生命上限**的选项，在教训提到过血上限/自损时重罚。
+            #   实际风险是「可重复选择 ⇒ 被反复选到把上限烧到很低」，故罚分要压过启发分。
+            if lesson_signals.get("self_damage"):
+                if self._option_loses_max_hp(text):
+                    final -= 45.0
+                elif self._option_loses_hp(text):
+                    final -= 18.0
+            # ★ 缺陷 B（用户点名）：教训里出现过"诅咒"相关教训时，拿诅咒/塞牌的选项降权。
+            if wants_curse_avoid and any(
+                tok in text for tok in ("诅咒", "curse", "放入一张", "塞入", "变为")
+            ):
+                final -= 30.0
+            # ★缺陷 A3：同一屏上重复选"**有害**"选项要递减，否则可重复选择的事件会被选到死。
+            #   ★只对原始评分为负的选项施加 —— 否则会把"离开"这类中性选项一起压下去，
+            #   导致反复选"离开"后惩罚累积、最优解反而翻回有害选项（实测过这个反转）。
+            if hei_scores.get(option_index, 0) < 0:
+                final -= self._event_repeat_penalty(summary_context, option_index)
+            out[option_index] = final
+        return out
+
+    def _log_event_route(
+        self,
+        hei_scores: dict[int, int],
+        scored: list[tuple[float, int]],
+        ordered: list[int],
+        event_options: list[Any],
+        hp_ratio: float,
+        gold: int,
+        lesson_signals: dict[str, int] | None = None,
+    ) -> None:
+        """把事件屏决策写进日志（与 `[sts2_map_route]` 同风格）。
+
+        ★为什么要加：此前**事件屏决策完全不记日志** —— 地图有 `[sts2_map_route]`、
+        战斗有 `[sts2_combat_turn_gate]`，唯独事件屏什么都没有。
+        这让我无法实机验证 A1/A3/C 的任何修复（只能靠单测），
+        也让玩家遇到"反复扣上限"时拿不到任何可诊断的痕迹。
+
+        去重键取"原始分 + 最终序"，同一屏静止时不刷屏（与 `_last_map_route_log_key` 一致）。
+        """
+        if self._logger is None:
+            return
+        key = "|".join("%d:%d:%.2f" % (index, hei_scores.get(index, 0), final)
+                       for final, index in scored)
+        key += "|%s" % sorted((lesson_signals or {}).items())
+        if key == self._last_event_route_log_key:
+            return
+        self._last_event_route_log_key = key
+        texts = {}
+        for index, option in enumerate(event_options):
+            if isinstance(option, dict):
+                option_index = self._safe_int(option.get("index"))
+                texts[option_index if option_index is not None else index] = self._event_option_text(option)
+        # 截断长度取 60：实测 18 时会把"失去6点生命上限"这类**关键区别**截掉
+        # （只能看到"失去[red]6[/red]点生"），无法从日志判断是掉血还是永久扣上限 ——
+        # 而那恰恰是缺陷 A 的判定核心。日志是实机验证的唯一证据来源，必须能看清。
+        detail = " / ".join("%d:%s" % (index, texts.get(index, "")[:60]) for index in ordered)
+        # ★ 标出哪些选项是"永久扣生命上限"（缺陷 A 的判定核心），便于实机核对。
+        maxhp_flags = [index for index in ordered if self._option_loses_max_hp(texts.get(index, ""))]
+        try:
+            self._logger.info(
+                "[sts2_event_route] 金币=%s 血比=%.2f 教训=%s 启发分=%s 重复惩罚=%s 扣上限选项=%s -> 选 option_index=%s | %s",
+                gold,
+                hp_ratio,
+                lesson_signals or {},
+                {index: hei_scores.get(index, 0) for index in ordered},
+                {index: round(self._event_repeat_penalty({"payload": {
+                    "event_options": event_options}}, index), 1) for index in ordered},
+                maxhp_flags,
+                ordered[0] if ordered else None,
+                detail,
+            )
+        except Exception:
+            # 日志绝不能影响决策路径。
+            pass
 
     @staticmethod
     def _normalize_percentile(scores: dict[int, int]) -> dict[int, float]:
@@ -1209,11 +2470,97 @@ class STS2HeuristicPlanner:
         return {k: 100.0 * (float(v) - lo) / (hi - lo) for k, v in scores.items()}
 
     @staticmethod
+    def _strip_rich_text(text: str) -> str:
+        """剥掉游戏文案里的 BBCode 式富文本标签，**再**做语义匹配。
+
+        ★★这是实机抓出来的严重缺陷（A2 的隐性失效）：
+        游戏下发的选项文案**带标签且标签正好插在关键词与数字之间**：
+            ``失去[red]8[/red]点生命。获得1瓶随机药水。``
+        而 `_option_loses_hp` 的正则是 ``失去\\s*\\d*\\s*点?\\s*(生命|血量)`` ——
+        ``失去`` 与 ``8`` 之间夹着 ``[red]`` ⇒ **匹配失败** ⇒ 掉血惩罚完全丢失。
+
+        实机后果（EVENT#3，血比 0.73）：
+        ```
+        启发分={0: 10, 1: 10} -> 选 0 | 0:获得藏宝图。 / 1:失去[red]8[/red]点生命。…
+        ```
+        两个选项**同分**（本该是 −8 vs 10 的明确差距），最后靠 index 平手规则才选中安全项
+        —— **是运气，不是启发式在起作用**。
+
+        同类失效还会波及：`获得[green]2[/green]点最大生命值`、
+        `支付[red]150[/red][gold]金币[/gold]`（金币判定用的是裸子串，侥幸没坏）。
+        ⇒ 所有事件文案匹配**统一先过这一层**，而不是逐个正则去容忍标签。
+        """
+        t = str(text or "")
+        # 去掉 [xxx] / [/xxx]；游戏里也有 [img]res://...[/img] 这类跨段标签。
+        return re.sub(r"\[/?[A-Za-z][^\]]*\]", "", t)
+
+    @staticmethod
+    def _option_loses_max_hp(text: str) -> bool:
+        """事件选项是否**永久削减生命上限**（`max_hp`）。
+
+        与 `_option_loses_hp`（一次性掉血、可被治疗回来）区分开：上限损失**不可恢复**，
+        会永久降低整局容错空间，因此必须是**更高量级**的惩罚。
+
+        实机证据：三个 run 里 `PVV8N7MJ4VGY` 的 `max_hp` 从 80 被扣到 54（−26）且此后不再恢复。
+
+        匹配要点（中英双语，且不能被"失去生命"先命中而漏掉）：
+        * 中文：「失去 5 点生命上限」「最大生命 -5」
+        * 英文：`lose 5 max hp` / `maximum hp -5`（容忍点号与空格）
+
+        ★★必须判定**方向**（实机发现的严重缺陷，我第一版漏了）：
+        只匹配"提到了最大生命"是**错的** —— 实机真实事件里出现过
+        「获得 11 点最大生命值。」（**增益**），旧实现把它也判成损失并罚 −60，
+        于是脚本**主动放弃了 +11 最大生命**，与修复意图完全相反。
+        ⇒ 必须同时要求"损失语义"与"没有增益语义"：
+          * 有 `失去`/`lose`/`-` 等损失词 ⇒ 是损失
+          * 有 `获得`/`gain`/`+`/`提升`/`增加` 等增益词 ⇒ **不是**损失
+        「最大生命 -5」用负号表达，故负号也算损失信号。
+
+        ★富文本标签必须先剥掉（见 `_strip_rich_text`）。
+        """
+        t = STS2HeuristicPlanner._strip_rich_text(text).lower()
+        # 是否"提到了最大生命"这个概念
+        mentions = (
+            re.search(r"(生命|血量|最大)\s*(值)?\s*(上限|最大值)", t) is not None
+            or re.search(r"最大生命", t) is not None
+            or re.search(r"(max|maximum)\s*\.?\s*(hp|health)", t) is not None
+        )
+        if not mentions:
+            return False
+        # ★增益语义优先排除（实机：「获得 11 点最大生命值。」）
+        #   「提高」「变成」等也要算增益 —— 例如「你的生命上限提高了」。
+        gain = re.search(r"(获得|得到|增加|提升|提高|回复|gain|increase|\+\s*\d)", t) is not None
+        # 损失语义：扣/失去/减少/负号
+        loss = re.search(r"(失去|扣|减少|降低|lose|reduce|-\s*\d)", t) is not None
+        # ★增益与损失都有时，**以损失为准**：`"Lose 5 Max HP, gain a relic"` 必须判为损失
+        #   （先扣永久上限再给遗物，净收益远不足以抵消）。
+        #   注：此处**不需要**额外写 `if gain and not loss: return False` ——
+        #   那种情况下 `loss` 本身已是 False，`return loss` 结果完全相同
+        #   （实测确认该分支与 `return loss` 等价，属冗余代码，已删除）。
+        return loss
+
+    @staticmethod
     def _option_loses_hp(text: str) -> bool:
-        """事件选项是否掉血（健壮匹配，容忍 "lose 7 HP"/"Lose HP"/中文表述）。"""
-        t = str(text or "").lower()
+        """事件选项是否掉血（健壮匹配，容忍 "lose 7 HP"/"Lose HP"/中文表述）。
+
+        **不含**生命上限损失 —— 那是 `_option_loses_max_hp` 的语义，量级不同。
+
+        历史缺陷（本轮修正）：原实现用字面量 ``"失去生命"`` 匹配中文，于是
+        ``"失去 10 点生命"``（中间有数字与量词）**匹配不到** —— 实测确认该缺陷在
+        ``HEAD`` 版本即存在，非本次引入。中文里"失去 N 点生命"是常见形态，故改用正则容忍
+        数字与量词：``失去\\s*\\d*\\s*点?\\s*(生命|血量)``。
+
+        ★★富文本标签（实机二次修正）：即便容忍了数字，游戏真实文案是
+        ``失去[red]8[/red]点生命`` —— 标签夹在 **动词与数字之间**，正则仍然失败。
+        ⇒ 统一在 `_strip_rich_text` 里先剥标签（见该方法说明，附实机后果）。
+        """
+        t = STS2HeuristicPlanner._strip_rich_text(text).lower()
+        # 上限损失走专门路径，避免被这里的"失去生命"宽泛匹配吞掉而失去区分度。
+        if STS2HeuristicPlanner._option_loses_max_hp(t):
+            return False
         return (
-            "失去生命" in t
+            "失去生命" in t                      # 无数字的最短形态，保留以兼容旧行为
+            or re.search(r"失去\s*\d*\s*点?\s*(生命|血量)", t) is not None
             or "掉血" in t
             or "lose hp" in t
             or "lose health" in t
@@ -1237,18 +2584,60 @@ class STS2HeuristicPlanner:
                 return preferred
         return None
 
-    def _preferred_reward_option(self, summary_context: dict[str, Any], preferences: dict[str, Any]) -> int | None:
+    def _preferred_reward_option(
+        self,
+        summary_context: dict[str, Any],
+        preferences: dict[str, Any],
+        strategy_context: dict[str, Any] | None = None,
+    ) -> int | None:
         reward_cards = self._reward_candidates(summary_context)
-        deck = summary_context.get("payload", {}).get("deck") if isinstance(summary_context.get("payload"), dict) else {}
+        payload = summary_context.get("payload") if isinstance(summary_context.get("payload"), dict) else {}
+        # ★ deck 在两个位置出现：新口径在 `payload` 顶层，旧口径在 `payload["deck"]`。
+        #   只读后者会漏掉实机形状 ⇒ 流派永远推断为空。
+        deck = payload.get("deck") if isinstance(payload.get("deck"), dict) else {}
+        if not deck.get("cards") and isinstance(payload.get("run"), dict):
+            run_deck = payload["run"].get("deck")
+            if isinstance(run_deck, list):
+                deck = {"cards": run_deck}
+            elif isinstance(run_deck, dict):
+                deck = run_deck
         archetype_tags = [str(tag).strip().lower() for tag in self._infer_archetype_tags(deck)] if isinstance(deck, dict) else []
         records = preferences.get("records") if isinstance(preferences.get("records"), list) else []
         deck_policy = self._reward_deck_policy(records)
+        # ★★ 缺陷 E 修复：外部 `deck_policy` 恒空（全仓库无人产出该记录）⇒
+        #   `_score_reward_card` 里所有流派加权（archetype_bias +20 等）永不触发。
+        #   这里用**卡组自身**推断的流派补位，让「卡牌流派的抉择」真正存在。
+        #   外部指令若存在则合并（不覆盖），保持向前兼容。
+        internal_policy = self._archetype_policy_from_deck(deck, archetype_tags)
+        if internal_policy:
+            merged_bias = set(deck_policy.get("archetype_bias") or set()) | set(internal_policy.get("archetype_bias") or set())
+            deck_policy = dict(deck_policy)
+            deck_policy["archetype_bias"] = merged_bias
+            self._debug(
+                "[sts2_archetype] 卡组流派=%s -> archetype_bias=%s"
+                % (archetype_tags, sorted(merged_bias))
+            )
         guidance_override = self._guidance_override_from_payload(summary_context)
+        # ★★ 让【跨局复盘教训】真正作用于选卡质量。
+        #   此前教训只经 `_apply_run_lessons` 进入通用排序（`ordered_candidates` 的扰动候选池），
+        #   **完全不参与 `_score_reward_card`** ⇒ 复盘无论学到什么都不改变「选哪张卡」。
+        #   这是用户点名的「强化/删除哪张卡片」缺口的直接原因。
+        #   ★ 注意：`strategy_directives` 在 `strategy_context` 里，**不在** `summary_context` 里
+        #     （`service.py:549-557` 把两者作为兄弟键放进 snapshot）
+        #     ⇒ 必须显式传入，否则运行时读到的是不存在的键（恒空 = 白改）。
+        lesson_signals = self._reward_lesson_signals(strategy_context)
+        # ★ 留痕：把这次评估的输入与打分记下来，供 `_log_reward_route` 输出。
+        #   （`_debug()` 是空函数，不留痕线上就无法核对选卡依据。）
+        self._last_reward_archetype_tags = list(archetype_tags)
+        self._last_reward_bias = set(deck_policy.get("archetype_bias") or set())
+        self._last_reward_lesson_signals = dict(lesson_signals)
+        self._last_reward_scored = []
         best_candidate: tuple[int, int] | None = None
         for index, card in enumerate(reward_cards if isinstance(reward_cards, list) else []):
             if not isinstance(card, dict):
                 continue
             score = self._score_reward_card(card, deck_policy, archetype_tags)
+            score += self._reward_lesson_bonus(card, lesson_signals, archetype_tags)
             if guidance_override.get("prefer_defense"):
                 if self._card_block(card) > 0:
                     score += 18
@@ -1260,6 +2649,7 @@ class STS2HeuristicPlanner:
             card_index = self._safe_int(card.get("index"))
             if card_index is None:
                 card_index = index
+            self._last_reward_scored.append((card_index, round(score, 2)))
             candidate = (-score, card_index)
             if best_candidate is None or candidate < best_candidate:
                 best_candidate = candidate
@@ -1268,6 +2658,125 @@ class STS2HeuristicPlanner:
         preferred = self._preferred_option_index(preferences)
         if preferred is not None:
             return preferred
+        return self._first_record_option(preferences)
+
+    #: 复盘教训 → 选卡倾向 的关键词表。
+    #:
+    #: ★ 背景（2026-10-17）：用户指出「强化/删除哪张卡片、卡牌流派的抉择」是败因，
+    #:   但此前跨局教训**只**经 `_apply_run_lessons` 影响通用排序，
+    #:   **完全不参与 `_score_reward_card`** ⇒ 复盘对「选哪张卡」零影响。
+    #:   这里补上通道：把教训文本里的**方向性措辞**映射为选卡加权。
+    #:
+    #: ★★ 关键设计（否则会误判）：教训里往往**同时**提到两个方向
+    #:   （如「输出不够，每回合都在垫格挡」同时含"输出"与"格挡"），
+    #:   单纯"出现关键词就加权"会给两边都加分 ⇒ 净效果为 0 或错向。
+    #:   ⇒ 必须区分**褒贬**：正向词（要多做）与负向词（别再这样）。
+    _REWARD_LESSON_POSITIVE: dict[str, tuple[str, ...]] = {
+        "defense": ("多垫", "先垫", "垫够", "留容错", "加格挡", "多格挡", "厚一点", "稳一点", "别头铁"),
+        "attack": ("输出不够", "伤害不足", "打不死", "多输出", "加攻击", "斩杀不足", "节奏太慢"),
+        "draw": ("抽牌不够", "过牌少", "卡手", "手牌少", "多抽"),
+        "energy": ("能量不够", "费用不够", "卡能", "多来点能量"),
+        "strength": ("力量流", "缺力量", "多力量", "易伤不够"),
+        "orb_focus": ("电球不够", "充能不足", "多聚焦"),
+    }
+    _REWARD_LESSON_NEGATIVE: dict[str, tuple[str, ...]] = {
+        "defense": ("光垫格挡", "只垫格挡", "一直在垫", "垫太多", "纯防御打不动"),
+        "attack": ("光输出", "只输出", "硬刚", "头铁", "无脑攻击", "贪输出"),
+        "draw": ("抽太多", "过牌过头"),
+        "energy": ("能量溢出", "费用多余"),
+        "strength": ("力量没用",),
+        "orb_focus": ("电球没用",),
+    }
+
+    def _lesson_raw_text(self, source: dict[str, Any] | None) -> str:
+        """取跨局教训的**原始文本**（小写拼接），供粗粒度关键词判据使用。
+
+        与 `_reward_lesson_signals` 的分工：那个产出**方向信号**（选卡/删牌用），
+        这个产出**原文**（事件屏的"诅咒"类判据用，不需要方向极性）。
+        """
+        source = source if isinstance(source, dict) else {}
+        directives = source.get("strategy_directives")
+        if not isinstance(directives, dict):
+            directives = source if isinstance(source.get("avoid"), list) else {}
+        lessons = directives.get("avoid") if isinstance(directives.get("avoid"), list) else []
+        return " ".join(str(item) for item in lessons if str(item).strip()).lower()
+
+    def _reward_lesson_signals(self, source: dict[str, Any] | None) -> dict[str, int]:
+        """从跨局教训里抽出「该多拿什么卡 / 该少拿什么卡」的方向信号。
+
+        返回 {方向: 净权重}，正=多拿、负=少拿。教训为空 ⇒ {}（调用方加权为 0，行为不变）。
+
+        ★ 入参可以是 `strategy_context`（含 `strategy_directives`，运行时形状）
+          或直接是含 `avoid` 的 directives 字典 —— 两者都接受，
+          避免调用方传错层导致**恒空**（本轮踩过一次：传 summary_context 恒返回 {}）。
+        """
+        source = source if isinstance(source, dict) else {}
+        directives = source.get("strategy_directives")
+        if not isinstance(directives, dict):
+            # 兼容：直接把 directives 传进来（含顶层 avoid）
+            directives = source if isinstance(source.get("avoid"), list) else {}
+        lessons = directives.get("avoid") if isinstance(directives.get("avoid"), list) else []
+        text = " ".join(str(item) for item in lessons if str(item).strip()).lower()
+        if not text:
+            return {}
+        signals: dict[str, int] = {}
+        for direction, keywords in self._REWARD_LESSON_POSITIVE.items():
+            if any(str(k).lower() in text for k in keywords):
+                signals[direction] = signals.get(direction, 0) + 1
+        for direction, keywords in self._REWARD_LESSON_NEGATIVE.items():
+            if any(str(k).lower() in text for k in keywords):
+                signals[direction] = signals.get(direction, 0) - 1
+        # 自损/血上限担忧（独立轴：对"有自损的卡"降权）
+        if any(k in text for k in ("自损", "失去生命", "扣血", "血上限", "生命上限", "烧血")):
+            signals["self_damage"] = 1
+        # ★★ 诅咒担忧（独立轴，用户点名的缺陷 B）：
+        #   「涉及变化卡的事件或遗物要避开诅咒，因为选诅咒只会变成另一种诅咒，
+        #     对提升卡牌质量的期望太低」。
+        #   ⇒ 教训里出现"诅咒"时置位，供**事件屏**（拿诅咒的选项）与**选卡屏**
+        #     （诅咒卡）降权。此前 `curse` 从不被产出 ⇒ 事件屏那条判据是死的。
+        if any(k in text for k in ("诅咒", "curse", "污染卡组", "变废", "污染牌库")):
+            signals["curse"] = 1
+        return {k: v for k, v in signals.items() if v != 0}
+
+    def _reward_lesson_bonus(self, card: dict[str, Any], signals: dict[str, int], archetype_tags: list[str]) -> int:
+        """按复盘信号给单张候选卡加权。
+
+        ★ 保守设计（避免噪声压过 `_score_reward_card` 的既有判据）：
+          * 每方向每级 +18，最多两级（36）—— 低于"诅咒 −60"与"状态牌 −40"，
+            不会把垃圾卡救回来，也不会压过流派/数值的主判据。
+          * 负向方向（教训说"别光垫格挡"）对称扣分。
+          * 教训为空 ⇒ 返回 0（保证零教训时行为与改动前**完全一致**）。
+        """
+        if not signals:
+            return 0
+        text = " ".join(
+            [
+                str(card.get("name") or ""),
+                str(card.get("description") or ""),
+                str(card.get("effect") or ""),
+                str(card.get("rules_text") or ""),
+                str(card.get("resolved_rules_text") or ""),
+                str(card.get("card_type") or card.get("type") or ""),
+            ]
+        ).lower()
+        # 各方向的"这张卡属不属于该方向"判据（复用 _score_reward_card 的关键词口径）
+        card_is: dict[str, bool] = {
+            "defense": any(k in text for k in ("block", "格挡", "护盾", "护甲", "defend")),
+            "attack": any(k in text for k in ("damage", "伤害", "攻击", "attack", "strike")),
+            "draw": bool(_ARCHETYPE_DRAW_RE.search(text)) or any(k in text for k in ("draw", "skim")),
+            "energy": any(k in text for k in ("energy", "能量", "储能")),
+            "strength": any(k in text for k in ("strength", "力量", "易伤", "vulnerable", "虚弱", "weak")),
+            "orb_focus": any(k in text for k in ("orb", "focus", "电球", "充能", "聚焦", "宝珠")),
+        }
+        bonus = 0
+        for direction, weight in signals.items():
+            if direction == "self_damage":
+                continue
+            if card_is.get(direction):
+                bonus += 18 * max(-2, min(2, weight))
+        if signals.get("self_damage", 0) > 0 and self._reward_dynamic_value(card, "HpLoss") > 0:
+            bonus -= 20
+        return bonus
         return self._first_record_option(preferences)
 
     def _reward_claim_signature(self, summary_context: dict[str, Any]) -> str:
@@ -1334,8 +2843,24 @@ class STS2HeuristicPlanner:
             return card_options
         return []
 
-    def _preferred_remove_option(self, summary_context: dict[str, Any], preferences: dict[str, Any]) -> int | None:
+    def _preferred_remove_option(
+        self,
+        summary_context: dict[str, Any],
+        preferences: dict[str, Any],
+        strategy_context: dict[str, Any] | None = None,
+    ) -> int | None:
         selection_cards = summary_context.get("payload", {}).get("selection_cards") if isinstance(summary_context.get("payload"), dict) else []
+        # ★ 让【跨局复盘教训】作用于「该删哪张」。
+        #   此前删牌屏只经 `_ranked_option_indices → _apply_run_lessons` 影响
+        #   **扰动候选顺序**，不改 `preferred` 本身 ⇒ 复盘学到的取向
+        #   无法改变真正删掉的那张（用户点名「删除哪张卡片」很影响战斗）。
+        #
+        #   ★★ 符号方向（我第一次写反了，实测抓到）：本函数取 `candidate` 的 **min**，
+        #      即 `_score_remove_card` 分数**越低越该删**（诅咒 −100 最该删）。
+        #      ⇒ "保护某张卡"必须**加上**保护量（抬高分数 ⇒ 更不该删），
+        #        绝不能减。写成 `score -= protection` 会让被保护的卡变成**最先被删**的
+        #        （实测：防御卡 eff=−8 反而胜出 ⇒ 正好反了）。
+        lesson_signals = self._reward_lesson_signals(strategy_context if strategy_context is not None else summary_context)
         best_candidate: tuple[int, int] | None = None
         for index, card in enumerate(selection_cards if isinstance(selection_cards, list) else []):
             if not isinstance(card, dict):
@@ -1343,6 +2868,9 @@ class STS2HeuristicPlanner:
             if self._is_unremovable_card(card):
                 continue
             score = self._score_remove_card(card)
+            if lesson_signals:
+                # 符合"要多拿"方向的卡 ⇒ **抬高**其"该删程度"分数 ⇒ 更不该删
+                score += self._remove_lesson_protection(card, lesson_signals)
             card_index = self._safe_int(card.get("index"))
             if card_index is None:
                 card_index = index
@@ -1355,6 +2883,41 @@ class STS2HeuristicPlanner:
         if preferred is not None:
             return preferred
         return self._first_record_option(preferences)
+
+    def _remove_lesson_protection(self, card: dict[str, Any], signals: dict[str, int]) -> int:
+        """复盘教训对"该删哪张"的保护量（正数 = 越不该删 ⇒ 调用方**加**到删牌分上）。
+
+        ★ 与 `_reward_lesson_bonus` 的关系：那个用于**选卡**（符合方向 ⇒ 加分拿），
+          这个用于**删牌**（符合方向 ⇒ 抬高删牌分 ⇒ 更不该删）。语义相反、方向一致。
+        ★ 保守：与选卡同量级（每方向每级 18），不足以把诅咒（−100）救成"不该删"。
+        """
+        if not signals:
+            return 0
+        text = " ".join(
+            [
+                str(card.get("name") or ""),
+                str(card.get("description") or ""),
+                str(card.get("effect") or ""),
+                str(card.get("rules_text") or ""),
+                str(card.get("resolved_rules_text") or ""),
+                str(card.get("card_type") or card.get("type") or ""),
+            ]
+        ).lower()
+        card_is: dict[str, bool] = {
+            "defense": any(k in text for k in ("block", "格挡", "护盾", "护甲", "defend")),
+            "attack": any(k in text for k in ("damage", "伤害", "攻击", "attack", "strike")),
+            "draw": bool(_ARCHETYPE_DRAW_RE.search(text)) or any(k in text for k in ("draw", "skim")),
+            "energy": any(k in text for k in ("energy", "能量", "储能")),
+            "strength": any(k in text for k in ("strength", "力量", "易伤", "vulnerable", "虚弱", "weak")),
+            "orb_focus": any(k in text for k in ("orb", "focus", "电球", "充能", "聚焦", "宝珠")),
+        }
+        protection = 0
+        for direction, weight in signals.items():
+            if direction == "self_damage":
+                continue
+            if card_is.get(direction):
+                protection += 18 * max(-2, min(2, weight))
+        return protection
 
     def _preferred_route_option(self, preferences: dict[str, Any]) -> int | None:
         preferred = self._preferred_option_index(preferences)
@@ -1384,6 +2947,18 @@ class STS2HeuristicPlanner:
 
         与 mod 的 NekoAutoplayDriver.DecideCombatAsync 一致：优先按 card_id 精确匹配且可打出；
         匹配不到再退回 solver 给的位置索引（仅当该位置卡可打出）；都不行返回 None（交给启发式）。
+
+        ★★ 2026-10-18 修（`_test_stale_index.py` 复现的**真实缺陷**）：
+          旧实现只要 `fallback_index` 落在手牌范围内**且那张牌可打出**就直接返回它，
+          **不管它是不是求解器建议的那张**。后果：
+            * 求解器在 T0 建议 hand[0]=打击；执行时手牌漂移，hand[0] 已变成"痛击"；
+            * `card_id` 匹配不到 ⇒ 回退 `fallback_index=0` ⇒ **打出"痛击"**；
+            * 返回值非 None ⇒ 上层记为 `source="mod_solver"`、`一致=是`。
+          ⇒ 也就是**「看起来按求解器打了，其实打的是另一张牌」**，
+            而且完全无痕 —— 这正是"求解器算得对却没照打"最隐蔽的成因。
+          修法：区分"mod 没给 card_id"（可安全回退位置）与"给了 card_id 但当前手牌里
+          没有它"（**必须放弃**，交给启发式重算）。判据是 `card_id` 是否为空，
+          而不是"能不能找到一个可打出的位置"。
         """
         hand: Any = []
         if isinstance(snapshot, dict):
@@ -1394,6 +2969,11 @@ class STS2HeuristicPlanner:
             for i, card in enumerate(hand):
                 if isinstance(card, dict) and str(card.get("card_id") or "") == str(card_id) and bool(card.get("playable", True)):
                     return i
+            # ★ mod 明确给了 card_id，但当前手牌里找不到（或不可打出）⇒ 位置索引已不可信，
+            #   绝不能拿陈旧下标去蒙一张牌。交给启发式按当前局面重算。
+            return None
+        # mod 没给 card_id（旧版 /solver/plan 或该步本来就只有位置）：位置索引是唯一线索，
+        # 只要落点可打出就沿用。
         if fallback_index is not None and 0 <= fallback_index < len(hand):
             card = hand[fallback_index]
             if isinstance(card, dict) and bool(card.get("playable", True)):
@@ -1486,9 +3066,245 @@ class STS2HeuristicPlanner:
             return
         self._selection_pressed.add(index)
 
+    #: 事件屏上"同一选项每多选一次"的递减惩罚（归一化后的百分点）。
+    #:
+    #: 归一化参考（`_normalize_percentile` 把整数分压到 0–100）：
+    #:   扣上限(−60) vs 离开(0) 的差距 → 归一化后约 100 点
+    #:   诅咒+遗物(−26) vs 离开(0) → 约 43 点
+    #: 取 **40** 的含义：**第二次**选同一项就足以让"扣上限"输给"离开"，
+    #: 从而在可重复选择的事件上主动止损；第一次选完全不受影响（不改变正常决策）。
+    _EVENT_REPEAT_PENALTY_PER_TIME = 40.0
+
+    def note_event_option_chosen(self, summary_context: dict[str, Any], option_index: Any) -> None:
+        """服务层在**真的把 choose_event_option 发出去**之后调用：给该选项的"已选次数"加一。
+
+        ★缺陷 A3 的修复入口。`_rank_event_options` 原本无状态，在可重复选择的事件上
+        每轮算出同一个最优解 ⇒ 无限重复（实机后果：反复选"消耗生命上限"直到 HP 变 1）。
+
+        与 `note_selection_option_pressed` 同样的理由：规划与执行不是一一对应
+        （`plan()` 每 tick 都跑，约 1 次/秒；实际派发约 2.5 秒一次），
+        所以计数必须由"执行"推动，不能由"规划"推动 —— 否则计数会被凭空放大。
+        """
+        index = self._safe_int(option_index)
+        if index is None:
+            return
+        self._note_event_option_chosen(summary_context if isinstance(summary_context, dict) else {}, index)
+
+    #: `selection.kind` 里表示"**变换**卡牌"的取值（来自 mod 的 `BuildSelectionPayload`，
+    #: `GameStateService.cs:4250` `NDeckTransformSelectScreen => "deck_transform_select"`）。
+    #:
+    #: ★为什么必须区分：删牌屏与变换屏的**最优选择语义相反** ——
+    #:   * 删牌屏：选诅咒 = **移除**它 ⇒ 最优（`_score_remove_card` 给诅咒 −100）
+    #:   * 变换屏：选诅咒 = **变成另一张诅咒** ⇒ 最劣
+    #: 游戏侧源码证实诅咒变换是零期望：`CardFactory.GetFilteredTransformationOptions` 里
+    #: `if ((uint)(rarity - 8) > 1u)` 对 `Curse`(=9) 为**假**（9−8=1，不 >1）⇒ 跳过
+    #: "只保留 Common/Uncommon/Rare" 的稀有度约束 ⇒ 候选池放宽到整个牌池，**可含其它诅咒**。
+    #:
+    #: 历史缺陷：`card_selection_transform` 与 `card_selection_remove` 在 `:839` 被放进**同一分支**，
+    #: 于是变换屏复用了删牌启发式，**每轮都主动选诅咒**。实机采样里
+    #: `CARD_SELECTION_TRANSFORM` 出现过 6 次（527 份样本）。
+    _TRANSFORM_SELECTION_KINDS = frozenset({"deck_transform_select"})
+
+    #: 变换屏的**屏幕名**（与 `_TRANSFORM_SELECTION_KINDS` 取并集，见 `_is_transform_selection`）。
+    #:
+    #: 实机证据：日志里 `screen=CARD_SELECTION_TRANSFORM` 真实出现过（527 份样本中 6 次）。
+    #: 只认 `selection_kind` 时若那个字段缺失，判定会静默失效 ⇒ 变换屏重新开始选诅咒。
+    _TRANSFORM_SCREEN_NAMES = frozenset({"card_selection_transform"})
+
+    #: 变换屏上"诅咒/状态牌"的**变换优先级分**。
+    #:
+    #: 取值依据 `_score_remove_card` 的标尺（分越低越该被移出/换掉）：
+    #:   诅咒 −100 / 状态 −90 / 打击 −60 / 防御 −50 / 普通牌 +10 / 好牌 +60~70
+    #:
+    #: 定在 **−55** 的含义：**排在"打击"(−60)之后、"防御"(−50)之前** ——
+    #:   * 即：换掉一张基础打击比换掉诅咒**更值得**（收益确定：基础牌换掉大概率变强）
+    #:   * 而诅咒仍排在防御与所有"有价值牌"之前 ⇒ 有诅咒时**不会**去换好牌
+    #:
+    #: 为什么**不**沿用删牌屏的 −100：删牌是"移出牌组"，选诅咒**一定能**移除它；
+    #: 而变换诅咒的期望**接近零** —— 游戏侧 `CardFactory.GetFilteredTransformationOptions` 对
+    #: `Curse`(=9) 跳过稀有度过滤（`9−8=1` 不 `>1`），候选池含其它诅咒 ⇒ 可能换回另一张诅咒。
+    #: 所以变换屏**不该把诅咒当首选目标**。
+    _TRANSFORM_CURSE_SCORE = -55
+
+    def _selection_kind(self, summary_context: dict[str, Any]) -> str:
+        """取 mod 给出的选牌屏细分类型（`payload.selection_kind`），取不到返回空串。"""
+        payload = summary_context.get("payload") if isinstance(summary_context.get("payload"), dict) else {}
+        return str(payload.get("selection_kind") or "").strip().lower()
+
+    def _state_name(self, summary_context: dict[str, Any]) -> str:
+        """取**屏幕名**（`payload.state_name`）。
+
+        ★为什么变换屏判定必须同时看它（实测发现的静默失效风险）：
+        真实对局里变换屏的屏幕名是 `card_selection_transform`（实机日志里
+        `screen=CARD_SELECTION_TRANSFORM` 确实出现过），而 `selection_kind` 取自
+        mod 的 `selection.kind`。两者是**独立**来源，一旦 `selection_kind` 缺失/改名，
+        只靠它的判定会**静默失效** —— 变换屏会退回去复用删牌启发式，
+        也就是**每轮主动选诅咒**（正是缺陷 B 本身），而且不报任何错。
+
+        我实测过这个场景（`.dsh-artifacts/probe_b_statename.py`）：
+        只给 `state_name`、不给 `selection_kind` 时，旧实现 `is_transform=False` ⇒ 选诅咒。
+        ⇒ 两个信号取**并集**，任一命中即认定为变换屏。
+        """
+        payload = summary_context.get("payload") if isinstance(summary_context.get("payload"), dict) else {}
+        raw = payload.get("state_name")
+        if not raw:
+            classification = summary_context.get("classification")
+            if isinstance(classification, dict):
+                raw = classification.get("state_name")
+        return str(raw or "").strip().lower()
+
+    def _is_transform_selection(self, summary_context: dict[str, Any]) -> bool:
+        """是否**变换**屏。两个独立信号取并集（任一命中即可），避免静默失效。"""
+        if self._selection_kind(summary_context) in self._TRANSFORM_SELECTION_KINDS:
+            return True
+        return self._state_name(summary_context) in self._TRANSFORM_SCREEN_NAMES
+
+    def _preferred_transform_option(self, summary_context: dict[str, Any], preferences: dict[str, Any]) -> int | None:
+        """**变换**屏该选哪张牌：优先把手上**已有的诅咒/废牌**换掉，但**绝不主动新增诅咒**。
+
+        与删牌屏的区别（这是本方法存在的全部理由）：
+        * 删牌屏要"移出牌组" ⇒ 选最该走的牌（诅咒最优先）。
+        * 变换屏要"换成别的牌" ⇒ 选**最没价值、且换掉后不会更差**的牌。
+          诅咒虽然是废牌，但变换它**期望接近零**（游戏侧豁免了稀有度过滤，可能换回另一张诅咒），
+          因此**诅咒的优先级低于"普通低价值牌"** —— 换掉一张废攻击牌的收益更确定。
+
+        排序逻辑（分越低越该被变换）：
+          1. 不可移除的牌（`_is_unremovable_card`）直接排除
+          2. 诅咒 / 状态牌：给**中性偏低**分（可换，但不是首选）—— 避免"变诅咒"的零期望赌注
+          3. 其它牌：沿用 `_score_remove_card`（分越低越是废牌）
+        """
+        payload = summary_context.get("payload") if isinstance(summary_context.get("payload"), dict) else {}
+        cards = payload.get("selection_cards") if isinstance(payload.get("selection_cards"), list) else []
+        best: tuple[tuple[int, int], int] | None = None
+        scored_cards: list[tuple[int, str, bool]] = []
+        for index, card in enumerate(cards):
+            if not isinstance(card, dict):
+                continue
+            if self._is_unremovable_card(card):
+                continue
+            card_index = self._safe_int(card.get("index"))
+            if card_index is None:
+                card_index = index
+            rarity = str(card.get("rarity") or "").strip().lower()
+            card_type = str(card.get("card_type") or "").strip().lower()
+            is_curse = rarity in {"curse"} or card_type in {"curse", "status"}
+            if is_curse:
+                # 可换，但不优先：变换诅咒的期望接近零（可能换回另一张诅咒）。
+                # 用一个固定值把它排在"有明确价值的牌"之后、"完全没得选"之前。
+                score = self._TRANSFORM_CURSE_SCORE
+            else:
+                score = self._score_remove_card(card)
+            scored_cards.append((score, str(card.get("name") or card_index), is_curse))
+            candidate = (score, -card_index)
+            if best is None or candidate < best[0]:
+                best = (candidate, card_index)
+        self._log_transform_route(scored_cards, best[1] if best is not None else None)
+        if best is not None:
+            return best[1]
+        return self._preferred_remove_option(summary_context, preferences)
+
+    def _log_transform_route(
+        self,
+        scored_cards: list[tuple[int, str, bool]],
+        chosen: int | None,
+    ) -> None:
+        """把变换屏决策写进日志（与 `[sts2_event_route]` / `[sts2_map_route]` 同风格）。
+
+        ★为什么要加：变换屏此前**没有任何专属决策日志** ——
+        事件屏我已补（`_log_event_route`），但变换屏仍是盲区。
+        而缺陷 B 恰恰在变换屏上，没有日志就无法实机验证"是否还在选诅咒"
+        （`CARD_SELECTION_TRANSFORM` 在历史日志里有 67 次真实出现，却查不到任何决策痕迹）。
+
+        去重键取"候选与分数快照 + 最终选择"，同一屏静止时不刷屏。
+        """
+        if self._logger is None:
+            return
+        key = "|".join("%d:%s:%d" % (score, name, 1 if curse else 0)
+                       for score, name, curse in scored_cards) + "#%s" % chosen
+        if key == self._last_transform_route_log_key:
+            return
+        self._last_transform_route_log_key = key
+        detail = " / ".join(
+            "%s=%d%s" % (name[:16], score, "(诅咒)" if curse else "")
+            for score, name, curse in sorted(scored_cards)
+        )
+        try:
+            self._logger.info(
+                "[sts2_transform_route] 候选=%d 选择=%s | %s",
+                len(scored_cards),
+                chosen,
+                detail,
+            )
+        except Exception:
+            # 日志绝不能影响决策路径。
+            pass
+
+    def _is_upgrade_selection(self, summary_context: dict[str, Any]) -> bool:
+        """本屏是不是"升级卡牌"屏。
+
+        判据优先级（**先看 mod 明确下发的 kind，再看名称兜底**）：
+          1. `payload["selection_kind"]` —— mod `GameStateService.cs:4249` 对
+             `NDeckUpgradeSelectScreen` 下发 `"deck_upgrade_select"`，最可靠；
+          2. `payload["selection"]["kind"]` 原始结构（同上，双保险）；
+          3. 卡牌名/描述里出现"升级"字样（兜底，避免 mod 改名后彻底失效）。
+        ★ 绝不把"删牌屏"误判成升级屏：`card_selection_remove/delet` 先排除。
+        """
+        payload = summary_context.get("payload") if isinstance(summary_context.get("payload"), dict) else {}
+        kind = str(payload.get("selection_kind") or "").strip().lower()
+        if not kind:
+            sel = payload.get("selection") if isinstance(payload.get("selection"), dict) else {}
+            kind = str(sel.get("kind") or "").strip().lower()
+        if kind:
+            # 删牌/变换/附魔各有自己的语义，明确排除。
+            if kind in {"deck_card_select", "deck_transform_select", "deck_enchant_select",
+                        "choose_card_select", "combat_hand_select"}:
+                return False
+            if "upgrade" in kind or "smith" in kind:
+                return True
+            # kind 明确但非升级 ⇒ 不猜。
+            return False
+        # kind 缺失（旧版 mod / 其它屏）：用提示语兜底。
+        prompt = ""
+        sel = payload.get("selection") if isinstance(payload.get("selection"), dict) else {}
+        prompt = str(sel.get("prompt") or "").strip().lower()
+        return any(token in prompt for token in ("升级", "upgrade", "smith", "锻造"))
+
+    def _preferred_upgrade_option(self, summary_context: dict[str, Any], preferences: dict[str, Any]) -> int | None:
+        """升级屏选哪张卡：**分数越高越该升**（与删牌刚好相反）。
+
+        不是升级屏时返回 None，让调用方继续走删牌/变换分支。
+        """
+        if not self._is_upgrade_selection(summary_context):
+            return None
+        payload = summary_context.get("payload") if isinstance(summary_context.get("payload"), dict) else {}
+        cards = payload.get("selection_cards") if isinstance(payload.get("selection_cards"), list) else []
+        if not cards:
+            return None
+        best: tuple[int, int] | None = None
+        for position, card in enumerate(cards):
+            if not isinstance(card, dict):
+                continue
+            if self._item_blocked(card):
+                continue
+            score = self._score_upgrade_card(card)
+            index = self._safe_int(card.get("index"))
+            if index is None:
+                index = position
+            # 取 **max**（分越高越该升）；同分时取较小 index 以保证确定性。
+            candidate = (score, -index)
+            if best is None or candidate > best:
+                best = candidate
+        if best is None:
+            return None
+        return -best[1]
+
     def _preferred_choice_option(self, summary_context: dict[str, Any], preferences: dict[str, Any], context: dict[str, Any]) -> int | None:
         """选牌（消耗/拉弃牌堆/生成到手/变换等，弹的是人选牌界面）：优先用 /solver/plan 的 choice_card_id
-        （solver 已优化选哪张），命中不到再走删牌启发式。避免卡死在选牌上。"""
+        （solver 已优化选哪张），命中不到再走删牌启发式。避免卡死在选牌上。
+
+        ★变换屏（`selection.kind == "deck_transform_select"`）**不走删牌启发式** ——
+        两者最优语义相反，详见 `_preferred_transform_option` 的说明。
+        """
         pending = context.get("pending_card_choice_id") if isinstance(context, dict) else None
         if pending:
             payload = summary_context.get("payload") if isinstance(summary_context.get("payload"), dict) else {}
@@ -1497,7 +3313,25 @@ class STS2HeuristicPlanner:
                 if isinstance(card, dict) and str(card.get("card_id") or "") == str(pending):
                     idx = self._safe_int(card.get("index"))
                     return idx if idx is not None else i
-        return self._preferred_remove_option(summary_context, preferences)
+        if self._is_transform_selection(summary_context):
+            return self._preferred_transform_option(summary_context, preferences)
+        # ★★ 升级屏必须**先于**删牌启发式分流（2026-10-18 实机缺陷）：
+        #   升级屏与删牌屏的**最优方向相反**，共用 _preferred_remove_option 会
+        #   变成"优先升级最该删的卡"（实测：优先看打击 7/13，打击+ 出现 35 次）。
+        #   判据用 mod 下发的 `selection.kind`（GameStateService.cs:4249
+        #   `NDeckUpgradeSelectScreen => "deck_upgrade_select"`），
+        #   经 summary_context_builder._selection_counts 落到 payload["selection_kind"]。
+        upgrade_option = self._preferred_upgrade_option(summary_context, preferences)
+        if upgrade_option is not None:
+            return upgrade_option
+        # ★ 显式传 `strategy_context`：跨局教训（`strategy_directives.avoid`）在它里面，
+        #   不在 `summary_context` 里（`service.py:549-557` 把两者作为兄弟键放进 snapshot）。
+        #   不传 ⇒ 教训通道恒空 ⇒ 复盘学到的取向无法影响「该删哪张」。
+        return self._preferred_remove_option(
+            summary_context,
+            preferences,
+            context.get("strategy_context") if isinstance(context, dict) else None,
+        )
 
     def _shop_affordable_items(self, summary_context: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         payload = summary_context.get("payload") if isinstance(summary_context.get("payload"), dict) else {}
@@ -2591,68 +4425,8 @@ class STS2HeuristicPlanner:
             "conservative": prefer_defense or any(token in merged for token in ["求稳", "稳一点"]),
         }
 
-    def _preferred_combat_action(self, actions: list[dict[str, Any]], snapshot: dict[str, Any], preferences: dict[str, Any], guidance_override: dict[str, bool]) -> dict[str, Any] | None:
-        play_card = self._find_action(actions, "play_card")
-        end_turn = self._find_action(actions, "end_turn")
-        if play_card is None:
-            return end_turn
-        incoming_attack = self._incoming_attack_total(snapshot)
-        current_block = self._current_block(snapshot)
-        gap = max(0, incoming_attack - current_block)
-        if guidance_override.get("prefer_defense") and gap > 0:
-            preferred_card_index = self._preferred_combat_card_index(snapshot, preferences, guidance_override)
-            if preferred_card_index is not None:
-                return play_card
-        if guidance_override.get("prefer_attack"):
-            if gap >= 6:
-                preferred_card_index = self._preferred_combat_card_index(snapshot, preferences, {"prefer_defense": True})
-                if preferred_card_index is not None:
-                    return play_card
-            return play_card
-        return play_card or end_turn
 
-    def _preferred_combat_card_index(self, snapshot: dict[str, Any], preferences: dict[str, Any], guidance_override: dict[str, bool] | None = None) -> int | None:
-        guidance_override = guidance_override or {}
-        preferred = self._first_record_option(preferences)
-        raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
-        combat = raw_state.get("combat") if isinstance(raw_state.get("combat"), dict) else {}
-        hand = combat.get("hand") if isinstance(combat.get("hand"), list) else []
-        if guidance_override.get("prefer_defense"):
-            defensive_index = self._first_matching_playable_card(hand, ["block", "护盾", "格挡", "defend"])
-            if defensive_index is not None:
-                return defensive_index
-        if guidance_override.get("prefer_attack"):
-            attack_index = self._first_matching_playable_card(hand, ["attack", "damage", "伤害", "strike"])
-            if attack_index is not None:
-                return attack_index
-        if preferred is not None:
-            return preferred
-        for card in hand:
-            if not isinstance(card, dict):
-                continue
-            if bool(card.get("playable")):
-                return self._safe_int(card.get("index"))
-        return None
 
-    def _combat_kwargs(self, snapshot: dict[str, Any], action: dict[str, Any], card_index: int | None) -> dict[str, Any]:
-        if action.get("type") != "play_card" or card_index is None:
-            return {}
-        kwargs: dict[str, Any] = {"card_index": card_index}
-        raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
-        combat = raw_state.get("combat") if isinstance(raw_state.get("combat"), dict) else {}
-        hand = combat.get("hand") if isinstance(combat.get("hand"), list) else []
-        enemies = combat.get("enemies") if isinstance(combat.get("enemies"), list) else []
-        selected_card = next(
-            (card for card in hand if isinstance(card, dict) and self._safe_int(card.get("index")) == card_index),
-            None,
-        )
-        if selected_card is not None:
-            target_index = self._preferred_target_for_card(selected_card, enemies)
-        else:
-            target_index = self._preferred_combat_target_index(snapshot, card_index)
-        if target_index is not None:
-            kwargs["target_index"] = target_index
-        return kwargs
 
     def _preferred_combat_target_index(self, snapshot: dict[str, Any], card_index: int) -> int | None:
         raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
@@ -2690,95 +4464,6 @@ class STS2HeuristicPlanner:
                 return self._safe_int(card.get("index"))
         return None
 
-    def _plan_combat_turn_sequence(
-        self,
-        snapshot: dict[str, Any],
-        actions: list[dict[str, Any]],
-        preferences: dict[str, Any],
-        guidance_override: dict[str, bool],
-    ) -> list[dict[str, Any]]:
-        play_card = self._find_action(actions, "play_card")
-        if play_card is None:
-            return []
-        raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
-        combat = raw_state.get("combat") if isinstance(raw_state.get("combat"), dict) else {}
-        player = combat.get("player") if isinstance(combat.get("player"), dict) else {}
-        hand = [card for card in (combat.get("hand") if isinstance(combat.get("hand"), list) else []) if isinstance(card, dict) and bool(card.get("playable"))]
-        enemies = combat.get("enemies") if isinstance(combat.get("enemies"), list) else []
-        current_energy = self._safe_int(player.get("energy")) or 0
-        current_block = self._safe_int(player.get("block")) or 0
-        incoming_attack = self._incoming_attack_total(snapshot)
-
-        lethal_cards = self._find_labeled_lethal_sequence(hand, current_energy, enemies)
-        if lethal_cards:
-            self._debug("[sts2_combat_plan] lethal_sequence=%s", lethal_cards)
-            return lethal_cards
-
-        effective_override = dict(guidance_override)
-        if not effective_override.get("prefer_attack") and incoming_attack > current_block:
-            effective_override["prefer_defense"] = True
-
-        sequence: list[dict[str, Any]] = []
-        remaining_cards = list(hand)
-        remaining_energy = current_energy
-        simulated_block = current_block
-        threshold = 6
-
-        while remaining_cards and remaining_energy > 0:
-            gap = max(0, incoming_attack - simulated_block)
-            if effective_override.get("prefer_attack"):
-                if gap >= threshold:
-                    next_card = self._best_defense_card(remaining_cards, remaining_energy)
-                    reason = "combat_attack_priority_sequence"
-                else:
-                    next_card = self._best_attack_card(remaining_cards, remaining_energy) or self._best_defense_card(remaining_cards, remaining_energy)
-                    reason = "combat_attack_priority_sequence"
-            elif effective_override.get("prefer_defense"):
-                if gap > 0:
-                    next_card = self._best_defense_card(remaining_cards, remaining_energy)
-                    reason = "combat_defense_sequence"
-                else:
-                    next_card = self._best_attack_card(remaining_cards, remaining_energy)
-                    reason = "combat_defense_sequence"
-            else:
-                next_card = self._best_defense_card(remaining_cards, remaining_energy) if gap > 0 else self._best_attack_card(remaining_cards, remaining_energy)
-                reason = "combat_preference_or_default"
-
-            self._debug(
-                "[sts2_combat_step] gap=%s energy=%s block=%s mode=%s next=%s",
-                gap,
-                remaining_energy,
-                simulated_block,
-                reason,
-                {
-                    "index": self._safe_int(next_card.get("index")) if isinstance(next_card, dict) else None,
-                    "name": str(next_card.get("name") or next_card.get("card_id") or "?") if isinstance(next_card, dict) else None,
-                    "damage": self._card_damage(next_card) if isinstance(next_card, dict) else None,
-                    "block": self._card_block(next_card) if isinstance(next_card, dict) else None,
-                    "cost": self._card_energy_cost(next_card) if isinstance(next_card, dict) else None,
-                },
-            )
-
-            if next_card is None:
-                break
-            cost = self._card_energy_cost(next_card)
-            if cost > remaining_energy:
-                break
-            remaining_energy -= cost
-            simulated_block += self._card_block(next_card)
-            sequence.append(
-                {
-                    "card_index": self._safe_int(next_card.get("index")) or 0,
-                    "target_index": self._preferred_target_for_card(next_card, enemies),
-                    "reason": reason,
-                }
-            )
-            remaining_cards = [card for card in remaining_cards if card is not next_card]
-            if not effective_override.get("prefer_attack") and simulated_block >= incoming_attack:
-                effective_override["prefer_defense"] = False
-                effective_override["prefer_attack"] = True
-
-        return sequence
 
     def _find_labeled_lethal_sequence(self, cards: list[dict[str, Any]], current_energy: int, enemies: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for enemy_index, enemy in enumerate(enemies):
@@ -2922,29 +4607,177 @@ class STS2HeuristicPlanner:
         return {}
 
     def _score_event_option(self, option: dict[str, Any], hp_ratio: float, gold: int) -> int:
+        # ★★ D11（t28）：**被锁选项绝对不可选** —— 必须在一切加分之前短路返回。
+        #
+        #   实机缺陷（2026-10-20 00:24:24 起，run 6W6FGS6W4TPS / ENDLESS_CONVEYOR / floor=14）：
+        #     `/state` 的 `event.options` 逐字带了 `is_locked`：
+        #       options[0] {title:破产了, is_locked:true }   ← 金币 18 不足支付
+        #       options[1] {title:离开,   is_locked:false}
+        #     但本函数只经 `_event_option_text()` 做**文本子串**匹配，而 `is_locked` 是**布尔字段**、
+        #     不在文本里 ⇒ 结构上不可能被感知 ⇒ 给被锁项 **+10**、给可选项 **0**：
+        #       被锁项文本「你还能吃得下更多，但是兜里没金币了。」命中 `"金币"` ⇒ +10（见下方 :4356 规则）
+        #       ★ 即：**因为提到了金币，就给一个付不起钱的选项加分**。
+        #     然后游戏 99 次回 `invalid_target: The selected event option is locked.`，
+        #     而该错误在 EVENT 屏上"重算"仍得同一结论 ⇒ 永久卡死。
+        #
+        #   ★ 为什么必须**短路**而不是"减分"：当前可选选项的合理最高分约
+        #     遗物14 + 金币10 + 卡牌8 + 回血18 ≈ 50；若只给被锁项 −60，则 50 > −60
+        #     ⇒ 仍会选被锁的 ⇒ 修不好。只有让被锁项**低于任何可能总分**才能保证绝不选中。
+        #
+        #   ★ 为什么是 −1000：任一单项正向加分 ≤ +70；即便所有正向规则全部命中，
+        #     总和也远小于 1000。且 `_normalize_percentile` 只做**相对**归一，
+        #     哨兵值保证被锁项恒排末位。
+        #
+        #   ★ 不误伤（三条）：
+        #     ① 全部选项未锁 ⇒ 本分支永不进入 ⇒ 打分**逐位不变**；
+        #     ② 字段**缺失**（旧 mod / 测试替身）⇒ `is_locked=None` ⇒ 视为**未锁**（保守）；
+        #     ③ 只认**真值**（True 或 "true"/"1" 这类显式真），不把 0/""/None 当已锁。
+        if self._event_option_is_locked(option):
+            return self._EVENT_LOCKED_OPTION_SCORE
         text = self._event_option_text(option)
         score = 0
-        if any(token in text for token in ["lose hp", "hp", "失去生命", "掉血", "流血"]):
-            score -= 20 if hp_ratio < 0.6 else 8
+        # ★生命上限损失：**永久不可恢复**，单独且**最重**地惩罚。
+        #   必须先于普通掉血判断，否则会被 `"hp" in text` 之类的宽泛匹配吞掉。
+        #   实机教训：`"失去 5 点生命上限，获得 100 金币"` 原先得 **+10**（金币 +10 盖过一切），
+        #   于是脚本每轮都选它，把 max_hp 从 80 一路扣到 54；可重复选择的事件上会一直选到 HP 变 1。
+        #   惩罚量级取 60 —— 高于任何单项正向收益（遗物 +14、删牌 +12、金币 +10），
+        #   使"任何数量的即时收益都不足以换一次永久上限损失"。
+        if self._option_loses_max_hp(text):
+            score -= 60
+        # ★普通掉血：必须用 `_option_loses_hp`（它已判方向），**不能**用下面的裸子串匹配。
+        #   实机抓到的缺陷：原实现是 `any(token in text for token in ["lose hp", "hp", ...])`，
+        #   而裸 `"hp"` 子串会命中 `"Gain 5 Max HP"` ⇒ 把**加最大生命**也罚了 −8。
+        #   中文侧同理（"获得11点最大生命值"里的"生命"）。
+        if self._option_loses_hp(text):
+            # ★量级必须**高于**普通战利品，否则"掉血换药水"会被奖励盖过。
+            #   实机（EVENT#3，血比 0.73）：「失去8点生命。获得1瓶随机药水。」
+            #   若掉血只罚 8，而药水给 +14 ⇒ 净 **+6** ⇒ 会**主动选掉血**，
+            #   与"低血时不拿命换物资"的意图相反。
+            #   故提高到 24/12：任一常见战利品（药水14 / 金币10 / 卡牌8）都无法单独抵消。
+            score -= 24 if hp_ratio < 0.6 else 12
+        # ★"掉血换物资"必须**净负**：即使两种战利品同时给（药水14 + 金币10 = 24），
+        #   在血比 ≥0.6 时 24 − 12 = **+12** 仍是正分 ⇒ 会主动拿命换。
+        #   实测确认过这个漏洞（血比0.73: 掉血8+药水14 → 净 +2）。
+        #   这里再加一道**乘法抑制**：掉血时把所有正向收益减半 ——
+        #   在低血时干脆全抹掉（拿命换物资是最该避免的），高血时也只拿一半好处。
+        #   ★必须在所有加分规则**之后**执行，所以这里只记标记，末尾统一处理。
+        loses_hp = self._option_loses_hp(text) or self._option_loses_max_hp(text)
+        # ★加上限（与扣上限相反方向）：永久提升容错空间，必须给**正分**。
+        #   实机：「获得[blue]11[/blue]点最大生命值。」—— 修复方向判定后不再被罚，
+        #   但此前也没有任何规则给它**加分** ⇒ 落到 0 分，与"什么都不发生"等价。
+        #   量级取 +16：低于扣上限的 −60（不对称是故意的：永久损失比永久收益更该避），
+        #   但高于单次掉血、与遗物(14)同档。
+        if self._option_gains_max_hp(text):
+            score += 16
         if any(token in text for token in ["gain gold", "gold", "获得金币", "金币"]):
             score += 10 if gold < 150 else 4
-        if any(token in text for token in ["relic", "遗物", "获得遗物"]):
+        # ★遗物/道具：游戏文案里不叫"遗物"，而是**具体道具名**（如"藏宝图"）。
+        #   实机：「获得[gold]藏宝图[/gold]。」原先得 **0 分** —— 一个遗物级道具
+        #   与"什么都不给"同分。除字面词外，加入两个高频形态：
+        #   * 「获得X」+ 无其它类别词 ⇒ 视为道具（保守：这类事件选项几乎都是给东西）
+        #   * 药水/宝物类关键词
+        if any(token in text for token in ["relic", "遗物", "宝物", "宝图", "药水", "potion"]):
             score += 14
-        if any(token in text for token in ["card", "卡牌", "获得卡"]):
+        # ★卡牌：实机文案是"稀有牌"/"普通牌"/"卡牌包"，**不含**字面"卡牌"二字
+        #   （「获得一张随机[gold]稀有牌[/gold]。」原先得 0 分）。
+        #   故补齐"X牌"这一族（稀有牌/罕见牌/普通牌/诅咒牌/升级牌…）。
+        if any(token in text for token in ["card", "卡牌", "获得卡", "稀有牌", "普通牌", "罕见牌", "牌包"]):
             score += 8
         if any(token in text for token in ["remove", "删除", "移除"]):
             score += 12
-        if any(token in text for token in ["curse", "诅咒"]):
-            score -= 18
+        # ★回血：量随血量而定 —— 低血时是救命的，满血时几乎无价值。
+        #   实机：「回复[green]10[/green]点生命。」原先得 **0 分**
+        #   （血比 0.81 时它确实价值不高，但 0 分让它与"什么都没发生"等价；
+        #   血比 0.30 时它却依然是 0 分 —— 这才是真问题）。
+        if re.search(r"(回复|恢复|治疗|heal|restore)", text) and re.search(r"(生命|血量|hp|health)", text):
+            score += 18 if hp_ratio < 0.5 else (8 if hp_ratio < 0.8 else 2)
+        if any(token in text for token in ["curse", "诅咒", "愧疚", "笨拙", "晕眩", "伤口"]):
+            # ★诅咒在"卡牌质量"维度是**零/负期望**：诅咒变换时被游戏豁免了稀有度过滤
+            #   （`CardFactory.GetFilteredTransformationOptions`：`(uint)(rarity-8) > 1u` 对
+            #   Curse(9) 为假 ⇒ 跳过"只保留 Common/Uncommon/Rare"的约束），
+            #   候选池可含其它诅咒 ⇒「诅咒只会变成另一种诅咒」。
+            #   因此惩罚必须**高于遗物(+14)与卡牌(+8)之和**，不能被"有得有失"的选项抵消。
+            #   ★补入具体诅咒卡名：实机文案写的是"愧疚"/"笨拙"，不写"诅咒"二字
+            #   （「将1张[red]笨拙[/red]」「并将1张[red]愧疚[/red]」原先都**逃过惩罚**）。
+            score -= 40
+        # ★★"掉血换物资"必须**净负**（最后一道闸门）。
+        #   为什么需要它：上面各条正向规则是**独立相加**的，所以"给得多"可以盖过掉血：
+        #   实测（血比 0.73）「失去8点生命。获得1瓶随机药水。」= −12 +14 = **+2** ⇒
+        #   仍会**主动拿命换药水**。同理若同时给金币与卡牌，净分更高。
+        #   ⇒ 掉血/扣上限的选项，其正向收益一律**减半并再减 1**，保证**恒为负**；
+        #   血比 <0.6 时**全部抹掉**（低血时拿命换物资是本项目最该避免的决策）。
+        #   实测：只减半时血比 0.73 的「掉血8+药水14」= −12 +7 = **+1** 仍为正 ⇒
+        #   故 `//2 - 1` 把上界钉死在 **≤ −1**（"绝不主动拿命换"是硬约束，不是偏好）。
+        #   注意：惩罚项（诅咒 −40）保留原样，只压缩**收益**。
+        if loses_hp and score > 0:
+            score = 0 if hp_ratio < 0.6 else min(score // 2 - 1, -1)
         return score
 
+    @staticmethod
+    def _event_option_is_locked(option: dict[str, Any]) -> bool:
+        """事件选项是否被游戏**锁定**（`/state` 的 `event.options[].is_locked`）。
+
+        ★ 实机字段（2026-10-20，ENDLESS_CONVEYOR，逐字取自 `/state`）：
+            {"index": 0, "title": "破产了", "is_locked": true,  ...}   ← 金币不足支付
+            {"index": 1, "title": "离开",   "is_locked": false, ...}
+          字段名确为 `is_locked`（实测 `option` 键 =
+          `['index','text_key','title','description','is_locked','is_proceed',
+            'will_kill_player','has_relic_preview']`）。
+
+        ★ 判据做**窄**（保守），避免误伤：
+          · 只认真布尔 `True`，以及显式真值串（"true"/"1"/"yes"/"locked"）；
+          · 字段缺失 / `None` / `False` / `0` / `""` ⇒ **未锁**。
+          ⇒ 旧版 mod 或测试替身不带该字段时，行为与修复前**完全一致**。
+        """
+        if not isinstance(option, dict):
+            return False
+        raw = option.get("is_locked")
+        if raw is True:
+            return True
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"true", "1", "yes", "locked"}
+        return False
+
+    @staticmethod
+    def _option_gains_max_hp(text: str) -> bool:
+        """事件选项是否**永久提升生命上限**（`_option_loses_max_hp` 的反方向）。
+
+        与"回复生命"区分：回复是即时治疗（可被消耗掉），提升上限是永久容错空间。
+
+        实机依据：「获得[blue]11[/blue]点最大生命值。」/「获得[green]2[/green]点最大生命值。」
+        —— 两者在修复方向判定后都变成 **0 分**，即"给了永久上限提升"与"什么都没发生"同分。
+        """
+        t = STS2HeuristicPlanner._strip_rich_text(text).lower()
+        mentions = (
+            re.search(r"(生命|血量|最大)\s*(值)?\s*(上限|最大值)", t) is not None
+            or re.search(r"最大生命", t) is not None
+            or re.search(r"(max|maximum)\s*\.?\s*(hp|health)", t) is not None
+        )
+        if not mentions:
+            return False
+        gain = re.search(r"(获得|得到|增加|提升|提高|gain|increase|\+\s*\d)", t) is not None
+        loss = re.search(r"(失去|扣|减少|降低|lose|reduce|-\s*\d)", t) is not None
+        # 有得有失时以**损失**为准（与 `_option_loses_max_hp` 保持同一口径）。
+        return gain and not loss
+
     def _event_option_text(self, option: dict[str, Any]) -> str:
-        return " ".join(
-            [
-                str(option.get("label") or ""),
-                str(option.get("text") or ""),
-                str(option.get("description") or ""),
-            ]
+        """事件选项的归一化文本：拼接三个来源字段 + 转小写 + **剥富文本标签**。
+
+        ★这是事件文案匹配的**唯一入口**，因此富文本剥离放在这里 ——
+        所有下游判断（`_option_loses_max_hp` / `_option_loses_hp` / 金币/遗物/诅咒加分）
+        都会自动拿到干净文本，不必各自容忍标签。
+
+        实机原因见 `_strip_rich_text`：游戏文案是 ``失去[red]8[/red]点生命``，
+        标签夹在动词与数字之间会让 `失去\\s*\\d*` 这类正则整体失效。
+        """
+        return STS2HeuristicPlanner._strip_rich_text(
+            " ".join(
+                [
+                    str(option.get("label") or ""),
+                    str(option.get("text") or ""),
+                    str(option.get("description") or ""),
+                ]
+            )
         ).lower()
 
     def _score_map_node(self, node: dict[str, Any], route_policy: dict[str, Any], hp_ratio: float, gold: int) -> int:
@@ -3282,6 +5115,69 @@ class STS2HeuristicPlanner:
                 score -= 50
         return score
 
+    #: ★ 流派标签 → 该流派"成型"所需的卡牌特征（用于把 deck 自身判成某流派）。
+    #:
+    #: 背景（缺陷 E）：`_reward_deck_policy` 只认 `instruction_type == "deck_policy"` 的记录，
+    #: 而全仓库**没有任何地方产出**这种记录（唯一 `upsert` 点由用户自然语言指令驱动，
+    #: `_DOMAINS` 里连 `deck_policy` 域都没有）⇒ `prefer_tags/avoid_tags/archetype_bias/branches`
+    #: **恒为空** ⇒ `_score_reward_card` 里所有 ±35/±40/±50 的流派加权**永不触发**。
+    #: 这正是用户点名的「卡牌流派的抉择」——系统里**根本没有流派机制**。
+    #:
+    #: 修法：不再依赖"外部指令"，而是**从当前卡组自身推断流派**
+    #: （`_infer_archetype_tags` 已能识别中文卡组），
+    #: 再用它生成一份"内部 deck_policy"，让既有的加权分支真正跑起来。
+    _ARCHETYPE_TAG_KEYWORDS: dict[str, tuple[str, ...]] = {
+        "defense": ("block", "格挡", "护盾", "护甲", "defend", "bodyguard", "护卫", "守墓人"),
+        "attack": ("damage", "伤害", "attack", "strike", "打击"),
+        "draw": ("draw", "抽牌", "skim", "思虑", "过牌"),
+        "energy": ("energy", "能量", "储能", "turbo"),
+        "strength": ("strength", "力量", "易伤", "vulnerable", "虚弱", "weak"),
+        "orb_focus": ("orb", "focus", "电球", "充能", "聚焦", "宝珠"),
+    }
+
+    #: 流派"成型"阈值：该标签的卡达到这么多张，就认为卡组在走这个流派。
+    _ARCHETYPE_COMMIT_COUNT = 3
+
+    def _archetype_policy_from_deck(self, deck: dict[str, Any], archetype_tags: list[str]) -> dict[str, Any]:
+        """从**卡组自身**生成流派策略（替代恒空的外部 `deck_policy`）。
+
+        ★ 这是缺陷 E 的修复：让「卡牌流派的抉择」真正存在。
+        规则（保守、可解释）：
+          * 已经在走某流派（该流派卡 ≥ `_ARCHETYPE_COMMIT_COUNT` 张）
+            ⇒ `archetype_bias` 收录它 ⇒ 后续同流派卡 +20；
+          * 该流派**成型后**，明显**偏离**它的卡被轻微降权（`avoid_tags`），
+            避免"什么都要"把卡组摊薄（这是 Roguelike 卡组构建的核心取舍）；
+          * 卡组仍很小时（< 阈值）不做任何偏好 ⇒ 早期保持开放，不锁死流派。
+
+        返回空字典即表示"无流派偏好"（行为与改动前一致）。
+        """
+        if not archetype_tags:
+            return {}
+        cards = deck.get("cards") if isinstance(deck, dict) else None
+        cards = cards if isinstance(cards, list) else []
+        if len(cards) < self._ARCHETYPE_COMMIT_COUNT:
+            return {}
+        # 统计各流派在卡组里的实际张数（用同一套关键词表，口径与 _infer_archetype_tags 对齐）
+        counts: dict[str, int] = {}
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            text = " ".join(
+                str(card.get(field) or "")
+                for field in ("name", "card_id", "rules_text", "resolved_rules_text", "description", "effect", "card_type")
+            ).lower()
+            for tag, keywords in self._ARCHETYPE_TAG_KEYWORDS.items():
+                if any(keyword in text for keyword in keywords):
+                    counts[tag] = counts.get(tag, 0) + 1
+        committed = {tag for tag, n in counts.items() if n >= self._ARCHETYPE_COMMIT_COUNT}
+        if not committed:
+            return {}
+        return {
+            "archetype_bias": committed,
+            # 成型流派之外的"攻击/防御"倾向：若已专注防御流，则少拿纯攻击，反之亦然。
+            "committed_counts": counts,
+        }
+
     def _reward_deck_policy(self, records: list[dict[str, Any]]) -> dict[str, Any]:
         prefer_tags: set[str] = set()
         avoid_tags: set[str] = set()
@@ -3307,6 +5203,17 @@ class STS2HeuristicPlanner:
 
     def _base_reward_score(self, text: str, energy_gain: int) -> int:
         score = 0
+        # ★ 负面卡惩罚（原先【完全缺失】）：`_base_reward_score` 与 `_reward_value_score`
+        #   都只对正向关键词加分，于是「诅咒」与「防御」同为 0 分，
+        #   平分时还会被 index 次序选中 ⇒ 诅咒/状态牌被收进卡组。
+        #   这是「变化卡事件会选到诅咒」的第二个机制（第一个见 :838 跳牌判定被丢弃）。
+        #   ⇒ 明确扣分，使"一张都不该拿"的判定能真正成立（配合 reward_skip_low_value）。
+        if any(token in text for token in
+               ["curse", "诅咒", "无法打出", "unplayable", "不能被打出", "无法被移除"]):
+            score -= 60
+        if any(token in text for token in
+               ["wound", "伤口", "dazed", "晕眩", "slimed", "黏液", "burn", "灼伤", "void", "虚空"]):
+            score -= 40
         if any(token in text for token in ["block", "护盾", "格挡"]):
             score += 20
         if any(token in text for token in ["draw", "抽牌"]):
@@ -3368,17 +5275,65 @@ class STS2HeuristicPlanner:
         return None
 
     def _infer_archetype_tags(self, deck: dict[str, Any]) -> list[str]:
+        """从卡组推断流派标签。
+
+        ★ 修两个真实缺陷（2026-10-17，实机校准）：
+        1. **关键词表严重英文偏置**：实机卡名是中文（游戏跑中文），
+           原表 `orb/zap/coolheaded/...` 对「打击/护卫/出击/守墓人」**全部不命中**
+           ⇒ 实测真实 12 张卡组只推断出 `['defense','energy']`，
+             且 `defense` 还只是误撞到「防」字（命中"防御"）。
+           ⇒ 补齐中文关键词。
+        2. **只读 `name`/`card_id`，完全不看效果文本**：
+           `规则文本/rules_text/description` 里才有「造成N点伤害」这类可判据信息。
+           实战中卡名往往猜不出效果（如「守墓人」「负能量脉冲」）
+           ⇒ 改为 name + card_id + 全部效果文本一起做 haystack。
+        """
         cards = deck.get("cards") if isinstance(deck.get("cards"), list) else []
-        names = [str(card.get("name") or card.get("card_id") or "").lower() for card in cards if isinstance(card, dict)]
+        haystack: list[str] = []
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            parts = [
+                str(card.get("name") or ""),
+                str(card.get("card_id") or ""),
+                str(card.get("rules_text") or ""),
+                str(card.get("resolved_rules_text") or ""),
+                str(card.get("description") or ""),
+                str(card.get("effect") or ""),
+                str(card.get("card_type") or card.get("type") or ""),
+            ]
+            haystack.append(" ".join(parts).lower())
+        # ★ 中文关键词要选**不会被数量词插断**的短词：
+        #   实测真实文本是「抽2张牌」（数字插在"抽"和"牌"之间）⇒ 关键词"抽牌"不命中。
+        #   故一律用单词素（抽/牌/格挡…）或容忍插入的形式。
         tags: list[str] = []
-        if any(keyword in name for name in names for keyword in ("orb", "zap", "coolheaded", "ball lightning", "电")):
+        if any(keyword in text for text in haystack for keyword in
+               ("orb", "zap", "coolheaded", "ball lightning", "focus", "电球", "充能", "聚焦", "宝珠")):
             tags.append("orb_focus")
-        if any(keyword in name for name in names for keyword in ("block", "defend", "charge battery", "防")):
+        if any(keyword in text for text in haystack for keyword in
+               ("block", "defend", "charge battery", "格挡", "护盾", "防护", "防御", "护甲")):
             tags.append("defense")
-        if any(keyword in name for name in names for keyword in ("draw", "skim", "coolheaded", "抽")):
+        # ★ "抽N张牌"（数字插入）与"抽牌堆"（draw pile）必须区分：
+        #   用正则而非子串。`抽[0-9一二三四五六七八九十]+张牌` 才是真抽牌。
+        if any(
+            _ARCHETYPE_DRAW_RE.search(text)
+            or any(k in text for k in ("draw", "skim", "coolheaded"))
+            for text in haystack
+        ):
             tags.append("draw")
-        if any(keyword in name for name in names for keyword in ("energy", "turbo", "double energy", "能量")):
+        if any(keyword in text for text in haystack for keyword in
+               ("energy", "turbo", "double energy", "能量", "储能")):
             tags.append("energy")
+        if any(keyword in text for text in haystack for keyword in
+               ("strength", "力量", "易伤", "vulnerable", "虚弱", "weak")):
+            tags.append("strength")
+        # ★ 补 `attack` 标签（原实现**从不产出**它）：
+        #   后果实测 —— 纯攻击卡组 `_infer_archetype_tags` 返回 `[]`
+        #   ⇒ `_archetype_policy_from_deck` 拿不到流派 ⇒ 攻击卡组**永远没有流派偏好**，
+        #     而防御卡组有 ⇒ 系统性地把玩家往防御推。
+        if any(keyword in text for text in haystack for keyword in
+               ("damage", "strike", "造成", "点伤害", "攻击")):
+            tags.append("attack")
         return tags
 
     def _lethal_combat_operation(self, snapshot: dict[str, Any], actions: list[dict[str, Any]]) -> PlannedOperation | None:
@@ -3427,6 +5382,44 @@ class STS2HeuristicPlanner:
         return []
 
     def _card_damage(self, card: dict[str, Any]) -> int:
+        """这张牌的**伤害数值**（读不出就 0 —— 宁可算 0 也不要瞎猜）。
+
+        ★★ 2026-10-19 修掉一个**生产环境真在跑**的严重误判（`BUG-card-damage-unit-confusion`）：
+
+        原实现在 `damage` 字段缺失时，把整段效果文本**按空格切词、返回第一个能解析的整数**：
+
+            for token in effect_text.split():
+                parsed = self._safe_int(token)
+                if parsed is not None:
+                    return parsed            # ← 不看单位！
+
+        于是**任何带数字的非伤害牌都会被当成伤害牌**。实测：
+
+            防御    「获得 5 点格挡。」   -> 5   ❌ 格挡被当成伤害
+            准备    「抽 2 张牌。」       -> 2   ❌ 抽牌数被当成伤害
+            治疗    「回复 8 点生命。」   -> 8   ❌ 回血被当成伤害
+            充能    「获得 2 点能量。」   -> 2   ❌ 能量被当成伤害
+
+        **为什么这在生产里真的会触发**：`ShopCardPayload`（`GameStateService.cs:6180`）
+        **没有 `damage` 字段**，只有 `dynamic_values` + `resolved_rules_text`
+        ⇒ 商店屏**必然**走这条回落路径 ⇒ `_deck_gap_vector` 的输出/格挡两维全错。
+
+        实测后果（牌组 = 2×6伤 + 2×5格挡，第 10 层）：
+
+            正确：gap_output=0.50  gap_defense=0.38
+            实测：gap_output=0.08  gap_defense=0.58   ← **两维都错了，且方向相反**
+
+        ⇒ 输出被虚高（因为格挡牌也算输出），防御被虚低/虚高错乱
+        ⇒ **商店买错东西**，正是玩家说的「商店好像很喜欢买遗物？评估一下哪些是真正需要的」。
+
+        ★ 修法：**先认单位**，再取数。按"伤害"语义显式匹配，
+          匹配不到就返回 0（不再猜）。顺序刻意是：
+            1. `dynamic_values` 里的 `Damage`（最可靠，mod 已结构化）
+            2. `damage` 顶层字段
+            3. 文本里**明确表述伤害**的形态（"造成 N 点伤害" / "Deal N damage"）
+          第 3 步用正则**连带单位一起匹配**，而不是切词取数。
+        """
+        # 1. 结构化：dynamic_values 里的 Damage
         for item in card.get("dynamic_values") if isinstance(card.get("dynamic_values"), list) else []:
             if not isinstance(item, dict):
                 continue
@@ -3434,9 +5427,11 @@ class STS2HeuristicPlanner:
                 parsed = self._safe_int(item.get("current_value"))
                 if parsed is not None:
                     return parsed
+        # 2. 顶层 damage 字段
         damage = self._safe_int(card.get("damage"))
         if damage is not None:
             return damage
+        # 3. 文本：必须**连带单位**匹配，否则会把格挡/抽牌/回血的数字当成伤害
         effect_text = " ".join(
             [
                 str(card.get("resolved_rules_text") or ""),
@@ -3444,13 +5439,15 @@ class STS2HeuristicPlanner:
                 str(card.get("effect") or ""),
             ]
         )
-        for token in effect_text.replace("Deal", " ").replace("damage", " ").split():
-            parsed = self._safe_int(token)
-            if parsed is not None:
-                return parsed
+        # 中文形态：造成 N 点伤害（允许中间有修饰，如"对全体敌人造成 N 点伤害"）
         match = re.search(r"造成\s*(\d+)\s*点?伤害", effect_text)
         if match:
             return int(match.group(1))
+        # 英文形态：Deal N damage / deals N damage
+        match = re.search(r"deal[s]?\s*(\d+)\s*damage", effect_text, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        # 读不出伤害语义 ⇒ 0。**不再**切词猜数（那正是本缺陷的根源）。
         return 0
 
     def _card_energy_cost(self, card: dict[str, Any]) -> int:
@@ -3773,6 +5770,78 @@ class STS2HeuristicPlanner:
     #: 任一为 False 就认为该项不可选（宁可少给候选，也不能扰动出一个非法动作）。
     _UNSELECTABLE_FLAGS = ("playable", "enabled", "is_enabled", "affordable", "can_afford")
 
+    def _score_upgrade_card(self, card: dict[str, Any]) -> int:
+        """升级屏：一张牌"多值得被升级"。**分数越高越该升。**
+
+        ★★ 为什么必须单独写这一个函数（2026-10-18 实机缺陷）：
+          升级屏此前**复用了删牌评分** `_score_remove_card`（该函数给"打击"−60 =
+          "最该删的卡"），而 `_preferred_remove_option` 取的是 **min** ⇒
+          于是升级屏恰好选中**最该删的那张** ⇒ 实测「可以优先看：打击」7/13 次，
+          `打击+` 在日志里出现 35 次。**删牌与升级的最优方向正好相反**：
+            删牌：选**最没价值**的（分越低越该删）
+            升级：选**最有价值**的（分越高越该升）
+          ⇒ 两者**绝不能共用**同一个评分函数。旧行为是语义反转，不是调参问题。
+
+        判据（尽量只用 mod 已下发的字段，不猜）：
+          * 已升级过（`upgraded` 为真）→ 返回极低分（不能再升，排除）
+          * 诅咒牌 → 极低分（升它们没有意义）
+          * 基础打击/防御 → 低分（升一次收益极小，是"浪费升级"的典型）
+          * 高费牌 → 加分（升级降费收益大，费用越高收益越大）
+          * 抽牌/能量/充能/能力等引擎牌 → 加分（长期价值高）
+
+        ★★ 实机自查修掉的三个缺陷（2026-10-18，`_selfaudit_upgrade.py` 复现）：
+          1. **不能照抄删牌的关键词**。删牌用 `['status','状态']` 判"该删"是合理的
+             （状态牌确实该删），但**升级**若也这么判，就会把效果文本里含"状态"
+             一词的**好卡**（如「巨像：使敌人陷入易伤状态」「痛击：施加易伤状态」）
+             全打成 −500 而排到最后。实机样本已复现：巨像/痛击/头槌 均被误判。
+             ⇒ 这里**只认真正的诅咒牌**（`curse`/`诅咒`），**不看** status/状态。
+          2. **"打击/防御" 不能用裸子串**。`"双重打击"`、`"剑柄打击"`、`"灰烬打击"`
+             都含"打击"，但它们是好卡；一律 −60 会**把好卡当基础牌降权**。
+             ⇒ 改成**名称精确匹配**基础牌名（打击/防御/Defend/Strike + 可选 "+"）。
+          3. **"能量/充能" 也不该裸匹配效果文本**。`"消耗 1 点能量"` 这种
+             普通效果会被当成引擎牌加分。⇒ 只在**名称**里判引擎属性，不扫描述。
+        """
+        if bool(card.get("upgraded")):
+            # 已经升过，不能再升。给最低分让它排在最后（而不是直接删掉，
+            # 以便所有卡都升过时仍能选出一张、不发生死锁）。
+            return -1000
+        name = str(card.get("name") or "").strip()
+        name_l = name.lower()
+        # 只认真诅咒。★ 不看 status/状态 —— 效果文本里的"状态"是正常机制词。
+        text_for_curse = " ".join([
+            name,
+            str(card.get("card_type") or card.get("type") or ""),
+            str(card.get("rarity") or ""),
+        ]).lower()
+        if "curse" in text_for_curse or "诅咒" in text_for_curse:
+            return -500
+        # ★ 基础牌判定用**名称精确匹配**，避免 "双重打击"/"剑柄打击" 被误伤。
+        base_names = {"打击", "防御", "strike", "defend", "defend_ironclad",
+                      "strike_ironclad", "打击+", "防御+"}
+        is_base = name_l in base_names or name_l.rstrip("+").strip() in base_names
+        score = -60 if is_base and ("打击" in name or "strike" in name_l) else (
+            -45 if is_base else 20)
+        # 引擎类：★ 只看**名称**，不扫描述（避免"消耗1点能量"被当成引擎牌）。
+        if any(token in name_l for token in ["draw", "skim", "coolheaded", "抽牌", "过牌"]):
+            score += 40
+        if any(token in name_l for token in ["energy", "turbo", "能量"]):
+            score += 50
+        if any(token in name_l for token in ["focus", "orb", "电球", "充能"]):
+            score += 45
+        # ★降费收益：费用越高，升级减费赚得越多。读 mod 已给的 energy_cost。
+        cost = self._safe_int(card.get("energy_cost"))
+        if cost is None:
+            cost = self._safe_int(card.get("cost"))
+        if isinstance(cost, int) and cost >= 2:
+            score += 15 * min(cost, 3)
+        # 稀有度：越稀有通常越值得投资。
+        rarity = str(card.get("rarity") or "").lower()
+        if any(token in rarity for token in ["rare", "稀有"]):
+            score += 25
+        elif any(token in rarity for token in ["uncommon", "罕见"]):
+            score += 12
+        return score
+
     #: 用 _score_remove_card 排名的选牌屏（"移除/删牌"）。其它选牌屏（升级/变换/附魔）没有对应评分，
     #: 走通用枚举。
     _REMOVE_SELECTION_SCREENS = {"card_selection_remove", "card_selection_delet"}
@@ -3872,7 +5941,12 @@ class STS2HeuristicPlanner:
         return result
 
     def _ranked_option_indices(self, context: dict[str, Any], operation: Any) -> list[int]:
-        """按各屏**既有评分**给出的"从好到坏"顺序；没有评分可用的屏返回空列表。"""
+        """按各屏**既有评分**给出的"从好到坏"顺序；没有评分可用的屏返回空列表。
+
+        **跨局教训（strategy_directives["avoid"]）在这里生效**：排序完成后，命中教训关键词的
+        选项会被降权重排。这是复盘闭环唯一的消费点 —— 没有它，`avoid` 就只是个只写不读的死字段
+        （见 `.agent-teams/sts2-omnissiah-audit/reflection-audit-t2.md`）。
+        """
         action_type = str(self._operation_dict(operation).get("action_type") or "").strip().lower()
         summary_context, strategy_context, _snapshot = self._context_parts(context)
         preferences = strategy_context.get("preferences") if isinstance(strategy_context.get("preferences"), dict) else {}
@@ -3880,14 +5954,563 @@ class STS2HeuristicPlanner:
         state_name = str(classification.get("state_name") or "").strip().lower()
 
         if action_type == "choose_event_option":
-            return self._rank_event_options(summary_context)
+            ranked = self._rank_event_options(summary_context, strategy_context)
+        elif action_type == "choose_map_node":
+            ranked = self._rank_map_nodes(summary_context, preferences)
+        elif action_type == "choose_reward_card":
+            ranked = self._rank_reward_cards(summary_context, preferences)
+        elif action_type == "select_deck_card" and state_name in self._REMOVE_SELECTION_SCREENS:
+            ranked = self._rank_remove_options(summary_context)
+        elif action_type == "select_deck_card" and self._is_upgrade_selection(summary_context):
+            # ★ 升级屏的排序必须与删牌相反（分越高越该升），否则扰动池的"第 0 位"
+            #   会与 plan() 实际选出的那张不一致 —— 而扰动层的不变量正是
+            #   "排序第 0 个 == 规划器原本会选的那一个"。共用删牌排序会破坏该不变量。
+            ranked = self._rank_upgrade_options(summary_context)
+        else:
+            return []
+        return self._apply_run_lessons(strategy_context, summary_context, action_type, ranked)
+
+    def _run_memory_lessons(self, strategy_context: dict[str, Any]) -> list[str]:
+        """取出跨局教训文本（`strategy_directives["avoid"]`）。
+
+        这些文本由 `strategy_repository._inject_run_memory_directives` 从猫娘记忆注入，
+        每个 tick 重算，所以此处只读不写。
+        """
+        directives = strategy_context.get("strategy_directives") if isinstance(strategy_context.get("strategy_directives"), dict) else {}
+        raw = directives.get("avoid") if isinstance(directives.get("avoid"), list) else []
+        return [str(item).strip() for item in raw if str(item).strip()]
+
+    #: ★I2 战斗屏着力点：哪些教训 token 会改变**战斗出牌顺序**，以及怎么改。
+    #:
+    #: 背景（t10 基线实测）：`_indices_worth_penalizing` 对 `play_card` 返回空集，
+    #: 而 32/43 的死亡发生在 COMBAT。但**天真的补法（给 play_card 加降权分支）是错的**：
+    #:   * `_apply_run_lessons` 只被 `ordered_candidates`（**扰动候选池**）调用，
+    #:     `plan()` 的战斗路径在 solver 命中时于 :1049 直接 return，从不经过它
+    #:     ⇒ 只改 `_indices_worth_penalizing` 对真实战斗决策的位移为 **0**（t1 N1，已复现）。
+    #:   * `avoid` 语义是「哪张牌别出」，而战斗教训的真实语义是「**先垫格挡再输出**」——
+    #:     这是**顺序**，不是**排除**。用降权表达顺序会把语义压平（t2 F2 / t1 §3.5）。
+    #: 所以正确接线是：把教训转成**顺序偏好**，接进既有的战斗决策链
+    #: `_plan_combat_turn_sequence:3125` / `_preferred_combat_card_index:3046`。
+    #:
+    #: ⚠️ 防双重计分（t1 Q2 规则 R2/R3）：
+    #:   * 只在**没有任何既有指引**（solver 未命中、guidance 未给方向）时才补默认方向；
+    #:   * 绝不改写 solver 已给出的第一步；
+    #:   * 与 guidance 冲突时 **guidance 优先**（玩家显式指令 > 跨局教训）。
+    _LESSON_COMBAT_DIRECTION: tuple[tuple[str, str], ...] = (
+        # token -> 方向。顺序即优先级：先保命，再输出。
+        #
+        # ★t17 调查结论（**保留原语义**，不要"修"成极性分歧）：
+        # 真实 10 条注入教训里有 8 条含 `['skill','attack']`（另 2 条是兜底句/纯 skill），
+        # 因此这里**恒**返回 `prefer_defense`。我一度以为这是"极性锁定"缺陷，
+        # 实测后确认它**语义上是对的**：这批真实反思原文写的就是
+        # 「先垫够格挡再输出」「先把格挡叠够再还手」——**首步确实该防御**。
+        # 所以恒取 `prefer_defense` 不是 bug，是**正确地读懂了反思**。
+        #
+        # 真正的机制在别处：生产形态下 `gap>0`（挨打）时，:1145 的默认兜底
+        # **也会**给出 `prefer_defense` ⇒ 两者**同值** ⇒ 真实注入在该带内
+        # **不可见**（冗余，非被吞）。位移只能出现在默认兜底**不触发**的带
+        # （`gap<=0`，即玩家格挡已够）—— 实测那里位移 = 1。详见 `_lesson_combat_direction` 文档。
+        ("skill", "prefer_defense"),
+        ("attack", "prefer_attack"),
+    )
+
+    def _lesson_combat_direction(
+        self,
+        strategy_context: dict[str, Any],
+        *,
+        logger: Any | None = None,
+    ) -> dict[str, bool]:
+        """把跨局教训翻译成战斗屏的**顺序偏好**（`prefer_defense` / `prefer_attack`）。
+
+        返回值可直接并入既有的 `guidance_override` 通路
+        （`_guidance_override_from_payload` → `:1137-1143`）。
+
+        ★保守性（无教训时必须逐字保持现状）：
+        * 无教训 / 抽不出 token / token 与战斗无关 ⇒ 返回 `{}`（**空 dict**，不是 False）。
+        * 同时含 `skill` 与 `attack`（真实最高频组合）⇒ 取 **`prefer_defense`**：
+          这正对应反思原意「先垫格挡**再**输出」——先保命，再输出。
+          若取 `prefer_attack` 就会把「先垫格挡」读反。
+        * 纯函数：不掷随机、不读时间。
+
+        ★★t17 关键机制澄清（**必须连读，否则会做出错误推断**）：
+        在本函数恒返回 `prefer_defense` 的前提下，它与生产形态下
+        `:1145` 的默认兜底（`gap>0` ⇒ `prefer_defense`）**同值**。
+        ⇒ 真实注入在「挨打」带内**看不见位移**，但这**不是**被吞、也**不是**接线失效，
+          而是**冗余**——两者给出同一个方向。
+
+        位移可观测的唯一带是**默认兜底不触发**的地方（`gap<=0`，玩家格挡已够）：
+        ```
+        gap<=0 :  无教训 -> card_index=0 ;  真实注入 -> card_index=1   ★位移=1
+        gap>0  :  无教训 -> card_index=1 ;  真实注入 -> card_index=1     位移=0（冗余）
+        ```
+        ⇒ 因此「删掉任一闸即可覆盖」是**错的**；本函数与默认兜底是**两个独立来源**，
+          同时指向防御时自然无法区分贡献。要测量教训的**净贡献**，必须
+          在该函数**返回空 dict** 的带（或摘掉教训层）上做对照 —— 见 `_t17_e2e.py`。
+        """
+        lessons = self._run_memory_lessons(strategy_context)
+        if not lessons:
+            return {}
+        tokens = self._lesson_tokens(lessons)
+        if not tokens:
+            return {}
+        direction: dict[str, bool] = {}
+        for token, name in self._LESSON_COMBAT_DIRECTION:
+            if token in tokens:
+                direction[name] = True
+                break
+        if direction:
+            self._lesson_hit_debug("combat_direction", lessons, tokens, direction, logger=logger)
+        return direction
+
+    def lesson_trace(self, context: dict[str, Any], operation: Any = None) -> dict[str, Any]:
+        """★I5 度量埋点：把"这一 tick 教训层做了什么"完整暴露出来。
+
+        让 t_r3 的每个指标都能从**一个**调用算出，不必再猜内部状态：
+
+        * ``lessons``      —— 注入的教训原文（`strategy_directives["avoid"]`）
+        * ``tokens``       —— `_lesson_tokens()` 抽出的 token（闸3 判据）
+        * ``token_lesson_ratio`` —— 有多少条教训能抽出 token（信息密度）
+        * ``combat_direction``   —— 教训给出的战斗方向（I2 接线是否生效）
+        * ``fallback_lessons``   —— 其中有多少条是那个无信息量的兜底模板句
+        * ``penalize_indices``   —— 该屏被降权的下标（I3 区分度判据）
+
+        **只读**：不掷随机、不写状态（`_lesson_hit_debug` 的去重集合除外，且它不影响决策）。
+        `operation` 省略时只报教训侧，不报屏相关字段。
+        """
+        _summary_context, strategy_context, _snapshot = self._context_parts(context)
+        lessons = self._run_memory_lessons(strategy_context)
+        tokens = self._lesson_tokens(lessons)
+        trace: dict[str, Any] = {
+            "lessons": lessons,
+            "lesson_count": len(lessons),
+            "tokens": tokens,
+            "token_count": len(tokens),
+            "tokenizable_lessons": [text for text in lessons if self._lesson_tokens([text])],
+            "combat_direction": self._lesson_combat_direction(strategy_context),
+        }
+        trace["tokenizable_lesson_count"] = len(trace["tokenizable_lessons"])
+        trace["token_lesson_ratio"] = (
+            round(trace["tokenizable_lesson_count"] / len(lessons), 4) if lessons else 0.0
+        )
+        # 兜底模板句识别（供 M1 复读率的运行期口径）。
+        trace["fallback_lessons"] = [text for text in lessons if "输得不明不白" in text]
+        trace["fallback_lesson_count"] = len(trace["fallback_lessons"])
+        if operation is not None:
+            action_type = str(self._operation_dict(operation).get("action_type") or "").strip().lower()
+            digest = self._operation_dict(operation)
+            try:
+                ranked = self._ranked_option_indices(context, digest)
+            except Exception:
+                ranked = []
+            trace["action_type"] = action_type
+            trace["penalize_indices"] = sorted(self._indices_worth_penalizing(
+                (self._context_parts(context)[0].get("payload")
+                 if isinstance(self._context_parts(context)[0].get("payload"), dict) else {}),
+                action_type,
+                tokens,
+            ))
+            trace["ranked_indices"] = ranked
+            trace["candidate_count"] = len(ranked)
+            # I3 区分度：罚完之后还剩几个"未被罚"的候选。<=1 说明这条教训没有区分度。
+            trace["discriminating_indices"] = [
+                index for index in ranked if index not in set(trace["penalize_indices"])
+            ]
+            trace["discriminating_count"] = len(trace["discriminating_indices"])
+        return trace
+
+    def _lesson_hit_debug(
+        self,
+        stage: str,
+        lessons: list[str],
+        tokens: list[str],
+        effect: Any,
+        *,
+        logger: Any | None = None,
+    ) -> None:
+        """★I4 教训命中时的可 grep 日志（沿用既有 `[sts2_*]` 前缀风格）。
+
+        **去重键** = `stage + tokens + effect`：同一 tick 内同样的命中只打一次，
+        避免每个决策步骤都刷屏把日志淹掉。去重状态放在实例上（按 planner 生命周期）。
+
+        ★**日志失败绝不影响决策路径**：整段包在 `try/except` 里，
+        且 `logger` 缺省时回落到 `self._debug`（同样可能不可用）。
+        任何异常都被吞掉 —— 可观测性永远不许成为决策的失败点。
+        """
+        try:
+            dedup_key = f"{stage}|{','.join(tokens)}|{effect!r}"
+            seen = getattr(self, "_lesson_hit_seen", None)
+            if not isinstance(seen, set):
+                seen = set()
+                self._lesson_hit_seen = seen
+            if dedup_key in seen:
+                return
+            seen.add(dedup_key)
+            message = "[sts2_lesson_hit] stage=%s tokens=%s effect=%r lessons=%d"
+            args = (stage, ",".join(tokens), effect, len(lessons))
+            emit = logger if callable(logger) else getattr(self, "_debug", None)
+            if callable(emit):
+                emit(message, *args)
+        except Exception:
+            # 可观测性失败绝不允许冒泡到决策路径。
+            return
+
+    #: 每命中一条教训 token，被罚项的"降权档位"加多少。
+    #:
+    #: ★★ 方案 A（2026-10-19，玩家选定的修法）：把"降权"实现成**可比较的排序键**，
+    #: 而不是"移到末尾"。
+    #:
+    #: 病因（`.dsh-artifacts/BUG-lesson-demotion-identity.md`）：
+    #: 原实现是 `kept + demoted`（两个列表各自保持原相对顺序再拼接）。
+    #: 当被罚集合恰好是"候选尾部连续若干项"时，拼接结果**与原序逐字相同** ⇒
+    #: **恒等变换、教训完全失效**。而真实数据正落在这个失效区：
+    #:     基线 = [1, 3, 0, 2]，被罚 = {0, 2}（本来就在末尾）
+    #:     kept=[1,3] + demoted=[0,2] = [1,3,0,2]  ← 没变
+    #:
+    #: 为什么"移到末尾"这个语义本身就不对：
+    #:   它无法表达"已经在末尾了，不该再动"与"该降 3 位"的区别。
+    #:   一个恒等于尾部的映射，对被罚项的相对次序**没有任何信息**。
+    #:
+    #: 修法：给每个候选算一个**惩罚档位** `penalty`（0 = 未被罚），
+    #: 然后按 `(penalty, 原始名次)` 排序。这样：
+    #:   * 惩罚为 0 的项保持原相对顺序（等价于"无教训时逐字原序"）；
+    #:   * 被罚项按其**惩罚强度**分档，强的更靠后；
+    #:   * **已在末尾的被罚项仍是恒等** —— 但这次是**正确的恒等**：
+    #:     它已经在最低档了，没有更低的地方可去（这是语义正确，不是缺陷）。
+    #:
+    #: ⚠️ 与旧实现的**可观测差异**（本修法的价值所在）：
+    #:   旧实现在"被罚项分散"时才有效，在"被罚项集中尾部"时恒等；
+    #:   新实现在**两种情况下都有效** —— 分散时能把中间项压到尾部，
+    #:   集中时至少能把"更该罚的"排到"较该罚的"后面（旧实现做不到）。
+    _LESSON_PENALTY_PER_TOKEN = 1
+
+    def _lesson_penalty_strength(self, lessons: list[str]) -> dict[str, int]:
+        """每个教训 token 的**惩罚强度** = 有多少条教训提到过它。
+
+        ★★ 为什么需要"强度"而不是布尔命中（实测驱动，2026-10-19）：
+
+        真实 50 局记忆的窗口（10 条教训）实测频次：
+
+            attack  8 条     skill  7 条     elite  5 条     monster  1 条
+
+        若只按"命中/未命中"（布尔），`elite` 与 `monster` 同档 ⇒
+        排序键退化成 `(1, 原始名次)` ⇒ **保持原序 ⇒ 仍然恒等失效**。
+        这正是我第一版方案 A 实现的问题：换了个写法，病没治。
+
+        而频次是**真实的信号**：被 5 条教训反复提到的坑，
+        比只被提到 1 次的不该同等对待。用频次当强度，档位就能区分开。
+
+        语义上这也对：复盘是"多局统计"，某类死因越常出现，
+        说明它越没被纠正 ⇒ 越该规避。**这本来就是玩家要的"多维反思"的最小形式。**
+        """
+        strength: dict[str, int] = {}
+        for lesson in lessons:
+            for token in self._lesson_tokens([lesson]):
+                strength[token] = strength.get(token, 0) + 1
+        return strength
+
+    def _apply_run_lessons(
+        self,
+        strategy_context: dict[str, Any],
+        summary_context: dict[str, Any],
+        action_type: str,
+        ranked: list[int],
+    ) -> list[int]:
+        """把跨局教训应用到候选排序上（稳定重排：只降权，不删除）。
+
+        保守实现，三条硬约束：
+
+        * **无教训时逐字返回原序** —— 没有记忆时行为与改动前完全一致。
+        * **只降权不删除** —— 命中的选项仍留在候选里（只是靠后），所以扰动层拿到的仍是合法集合，
+          且最坏情况退化为"顺序不同"而不会"无候选可出"。
+        * **纯函数式** —— 不掷随机数、不读时间，同样的输入必得同样的输出，可确定性测试。
+
+        ★★ 2026-10-19 方案 A（玩家选定），修掉原 `kept + demoted` 的**恒等失效**：
+
+            旧：kept + demoted ⇒ 被罚项集中在尾部时**逐字原序**（教训完全失效）
+            新：按 (惩罚强度, 原始名次) 排序 ⇒ 强度可区分，任意分布都能表达
+
+        实测修复效果（真实 50 局注入，基线 `[1,3,0,2]`，命中 `{Monster(0), Elite(2)}`）：
+
+            elite=5 条、monster=1 条  ⇒  强度 5 > 1
+            ⇒ Monster(0) 被压到 Elite(2) 之后
+            ⇒ `[1,3,0,2]` → `[1,3,2,0]`  ★ **教训终于生效**
+
+        对照：若两者频次相同，则**保持原序是正确的** ——
+        同等该罚的两项之间没有理由改变相对次序（稳定性优于随机）。
+        """
+        lessons = self._run_memory_lessons(strategy_context)
+        if not lessons or len(ranked) < 2:
+            return ranked
+
+        payload = summary_context.get("payload") if isinstance(summary_context.get("payload"), dict) else {}
+        tokens = self._lesson_tokens(lessons)
+        if not tokens:
+            return ranked
+        penalize_indices = self._indices_worth_penalizing(payload, action_type, tokens)
+        if not penalize_indices:
+            # 这一屏没有该教训的着力点（或是未支持的屏）：原序返回，等于没有记忆时的行为。
+            return ranked
+
+        # ★ 强度 = "有多少条教训提到过这个 token"（见 `_lesson_penalty_strength`）。
+        #   必须**逐 token** 求命中集，才能把强度落到具体选项上。
+        strength = self._lesson_penalty_strength(lessons)
+        penalties: dict[int, int] = {}
+        for token, weight in strength.items():
+            for index in self._indices_worth_penalizing(payload, action_type, [token]):
+                penalties[index] = penalties.get(index, 0) + weight * self._LESSON_PENALTY_PER_TOKEN
+
+        # 未被罚的项 penalty = 0；排序键 (penalty, 原始名次) ⇒ 稳定、单调、可表达任意强度。
+        order = {index: position for position, index in enumerate(ranked)}
+        return sorted(ranked, key=lambda index: (penalties.get(index, 0), order.get(index, 0)))
+
+    def _lesson_tokens(self, lessons: list[str]) -> list[str]:
+        """把教训文本压成一小组可匹配的关键词。
+
+        教训是整句中文（例如「下次血量低于20的时候别头铁硬刚，先垫格挡喝回血药再输出」），
+        直接拿整句去匹配选项描述必然匹配不上，所以抽取其中的**行为关键词**。
+        未命中任何关键词的教训会被忽略 —— 宁可没影响，也不要用模糊匹配乱改决策。
+        """
+        tokens: list[str] = []
+        for lesson in lessons:
+            text = lesson.lower()
+            for token, keywords in self._LESSON_KEYWORD_MAP:
+                if token in tokens:
+                    continue
+                if any(keyword in text for keyword in keywords):
+                    tokens.append(token)
+        return tokens
+
+    def _indices_worth_penalizing(
+        self,
+        payload: dict[str, Any],
+        action_type: str,
+        tokens: list[str],
+    ) -> set[int]:
+        """哪些选项应当因为跨局教训被降权。
+
+        处理三种语义明确的屏：**路线**（规避某个节点类型）、**选牌奖励**（规避某类卡）、
+        **事件选项**（规避某类事件后果）。
+        其余屏返回空集 —— 匹配不准就别动，避免把复盘变成噪声。
+
+        ★事件屏是**缺陷 C** 的核心：此前它不在返回值内，于是复盘教训**永远作用不到事件屏**，
+        这正是用户说的「我建立复盘机制就是为了避免这个问题，但脚本已经这样很多次了，没有改善」。
+        """
+        targets: set[int] = set()
+        if not tokens:
+            return targets
         if action_type == "choose_map_node":
-            return self._rank_map_nodes(summary_context, preferences)
-        if action_type == "choose_reward_card":
-            return self._rank_reward_cards(summary_context, preferences)
-        if action_type == "select_deck_card" and state_name in self._REMOVE_SELECTION_SCREENS:
-            return self._rank_remove_options(summary_context)
-        return []
+            nodes = payload.get("travelable_nodes")
+            if not isinstance(nodes, list) or not nodes:
+                nodes = payload.get("available_nodes")
+            for position, node in enumerate(nodes if isinstance(nodes, list) else []):
+                if not isinstance(node, dict):
+                    continue
+                raw = node.get("index")
+                index = int(raw) if isinstance(raw, int) and not isinstance(raw, bool) else position
+                # **必须复用**既有别名表：mod 真实下发的是 `RestSite`/`Treasure` 这类枚举名，
+                # 而教训 token 是规范短键（`rest`/`treasure`）。只 lower() 不做归一会永远匹配不上——
+                # 这正是"短键能重排、真实对局却毫无反应"的根因（见 `_map_node_weight_key`）。
+                node_type = self._map_node_weight_key(node)
+                if node_type and node_type in tokens:
+                    targets.add(index)
+        elif action_type == "choose_reward_card":
+            cards = payload.get("reward_cards") if isinstance(payload.get("reward_cards"), list) else []
+            if not cards:
+                cards = payload.get("cards") if isinstance(payload.get("cards"), list) else []
+            # ★I3 有区分度的奖励选牌着力点 —— 修掉「全罚等于没罚 / 偏罚」两种退化。
+            #
+            # 病因：真实最高频的教训（9/10 条）抽出 `["skill","attack"]`，而奖励屏常给出
+            # attack/skill/power 三选一 ⇒ 前两张**全被罚**，只剩 power 没被罚。
+            # 实测（t10 `g4_degeneracy`）：区分度 3/3 → **1/3**，且**恒定**把玩家推向 power，
+            # 与反思本意（「先垫格挡再输出」是**顺序**）毫无关系。
+            # `_apply_run_lessons:4467` 的 `kept + demoted if kept else ranked` 对此无能为力：
+            # 只要还剩 1 个未罚项，它就会把其余全部推到后面 —— 这是**偏罚**，比 no-op 更危险。
+            #
+            # 修法：**只有当惩罚集不至于把候选压成单一选择时才应用**。
+            # 判据是"留下 ≥2 个未被罚的候选"：低于此数就说明这次匹配**没有区分度**
+            # （罚掉了几乎所有选项 ⇒ 剩下的那一个是运气，不是判断），于是本屏放弃降权、返回原序。
+            # 保守性优先：宁可不动，也不要用一条压平语义的教训去改选牌。
+            candidates: list[int] = []
+            matched: set[int] = set()
+            for position, card in enumerate(cards):
+                if not isinstance(card, dict):
+                    continue
+                raw = card.get("index")
+                index = int(raw) if isinstance(raw, int) and not isinstance(raw, bool) else position
+                candidates.append(index)
+                card_type = str(card.get("card_type") or "").strip().lower()
+                rarity = str(card.get("rarity") or "").strip().lower()
+                if "curse" in tokens and rarity == "curse":
+                    matched.add(index)
+                # ★ 六维缺口的「牌组质量」着力点（2026-10-19）：
+                #   「这局基础牌和诅咒太多，下局我想早点升级关键牌、删掉废牌」
+                #   ⇒ `quality` token ⇒ 把**会拉低牌组质量**的奖励降权
+                #     （诅咒牌 + 已持有的基础牌再拿一张）。
+                #
+                # ★ 为什么这是**正确方向**：`quality` 缺口的定义就是
+                #   "基础牌没升级 + 诅咒太多"（`_deck_gap_vector` 的 gap_quality），
+                #   所以"别再拿基础牌/诅咒"正是它该产生的行为。
+                elif "quality" in tokens and (rarity == "curse" or _is_basic_card_like(card)):
+                    matched.add(index)
+                elif card_type and card_type in tokens:
+                    matched.add(index)
+            if len(candidates) - len(matched) >= 2:
+                targets |= matched
+        elif action_type == "choose_event_option":
+            # ★缺陷 C：让复盘教训能作用于**事件屏**。
+            # 此前事件屏不在本函数覆盖范围内 ⇒ `avoid` 对事件决策**零影响**
+            # （inquisitor t12 实测：有无 avoid 的 plan() 逐字相同）。
+            # 玩家口径：「我建立复盘机制就是为了避免这个问题，但脚本已经这样很多次了，没有改善」。
+            #
+            # 判据与路线/选牌同源：教训 token 命中选项文本所表达的**后果类型**。
+            # 复用既有的 `_LESSON_KEYWORD_MAP` 语义（curse/shop/rest/...），
+            # 但事件选项的文案是自然语言（"失去 5 点生命上限，获得 100 金币"），
+            # 因此这里按**关键词共现**匹配，而不是等值比较。
+            options = payload.get("event_options") if isinstance(payload.get("event_options"), list) else []
+            for position, option in enumerate(options):
+                if not isinstance(option, dict):
+                    continue
+                raw = option.get("index")
+                index = int(raw) if isinstance(raw, int) and not isinstance(raw, bool) else position
+                text = self._event_option_text(option).lower()
+                if not text:
+                    continue
+                # 教训 token -> 事件选项文本的后果关键词
+                for token in tokens:
+                    keywords = self._EVENT_CONSEQUENCE_KEYWORDS.get(token)
+                    if not keywords:
+                        continue
+                    if any(keyword in text for keyword in keywords):
+                        targets.add(index)
+                        break
+        elif action_type == "choose_shop_item":
+            # ★★ 让复盘教训能作用于**商店屏**（此前完全无着力点）。
+            #
+            # 病因：本函数没有 `choose_shop_item` 分支 ⇒ `avoid` 对商店决策**零影响**，
+            # 教训学不到"这局缺格挡"就永远改不了"该不该买格挡牌"。
+            # 已由 `test_shop_screen_has_no_lesson_fulcrum` 钉住该缺口。
+            #
+            # ★ 与其它屏的**本质差别**：路线/选牌屏是"**规避**某类选项"（降权），
+            #   而商店的教训是"**别买**某类东西" —— 语义仍是降权，故复用同一机制。
+            #
+            # 判据：教训 token 映射到**牌组维度**，再看这件商品补的是不是那一维。
+            #   例：「这局栽在精英手里」→ `elite` token → 不对应具体维度 ⇒ **不动商店**
+            #       （商店里没有"精英"这类商品，硬匹配只是噪声）
+            #   「早点补格挡浓度」→ `skill` token → 格挡维 ⇒ 把"纯输出"类商品降权
+            #
+            # ⚠️ 刻意**保守**：只在 token 明确指向某一维时才动（`_LESSON_TOKEN_TO_SHOP_DIM`），
+            #   其余 token 一律不动 —— 商店是花金币的地方，误降权等于白花/不花，
+            #   代价比路线屏更高（与全局"匹配不准就别动"一致）。
+            dims = self._lesson_shop_dims(tokens)
+            if dims:
+                for position, item in enumerate(self._shop_payload_items(payload)):
+                    if not isinstance(item, dict):
+                        continue
+                    raw = item.get("index")
+                    index = int(raw) if isinstance(raw, int) and not isinstance(raw, bool) else position
+                    # 这件商品补的维度（卡走 `_card_effect_dims`，遗物/药水走类别）
+                    item_dims = self._shop_item_dims(item)
+                    # ★ 降权的是"**没在补**该维度"的商品 —— 教训说缺格挡，
+                    #   那买攻击牌就该被压后（把额度留给格挡牌）。
+                    if item_dims and not (item_dims & dims):
+                        targets.add(index)
+        return targets
+
+    #: 教训 token -> 商店商品的**牌组维度**。
+    #:
+    #: 只收"能明确对应到某一维"的 token。`elite`/`boss`/`monster`/`rest`/`treasure`
+    #: 等**路线/敌人**类 token 刻意不收 —— 商店里没有对应的商品，
+    #: 硬匹配只会变成噪声（与 `_EVENT_CONSEQUENCE_KEYWORDS` 的保守口径一致）。
+    _LESSON_TOKEN_TO_SHOP_DIM: dict[str, tuple[str, ...]] = {
+        # 「先垫格挡」「血量低优先保命叠甲」-> 缺格挡/生存
+        "skill": ("defense",),
+        # 「输出不够」「斩杀不了」-> 缺输出
+        "attack": ("output",),
+        # ★ 六维缺口新增（2026-10-19）：
+        #   「几乎没有群伤牌，下局想早点拿群伤」-> 缺群伤
+        #   ⇒ 商店里**没在补 aoe** 的商品被压后。
+        "aoe": ("aoe",),
+        # ⚠️ `quality` **刻意不映射到商店维度**。
+        #
+        # 我一度写了 `"quality": ("quality",)`，但实测它会造成**全罚**：
+        #   * `_shop_item_dims` 只给商品标 output/defense/draw/energy/aoe，
+        #     **永远不会**标 `quality`（质量不是"某张牌补的维度"，而是"牌组整体状态"）
+        #   * 于是 `item_dims and not (item_dims & {"quality"})` 对**每一件**商品恒为真
+        #   * 实测：`_indices_worth_penalizing({shop_cards:[打击,防御]}, "choose_shop_item", ["quality"])`
+        #     -> `[0, 1]`（两件全罚）
+        #
+        # 全罚在加权排序里是**无操作**（所有项同时 +1 权重，相对序不变），
+        # 但它会让"降权集"这个中间量失真，且一旦将来排序改成非线性就会变成真 bug。
+        # ⇒ 撤掉。`quality` 的着力点在**奖励屏**（`_is_basic_card_like`，
+        #   语义明确："别再拿基础牌/诅咒"），不在商店。
+        #
+        # 这正是全局口径「匹配不准就别动，避免把复盘变成噪声」的应用。
+    }
+
+    def _lesson_shop_dims(self, tokens: list[str]) -> set[str]:
+        """教训 token 指向的**商店维度**集合（空集 = 本屏不该动）。"""
+        dims: set[str] = set()
+        for token in tokens:
+            for dim in self._LESSON_TOKEN_TO_SHOP_DIM.get(token, ()):
+                dims.add(dim)
+        return dims
+
+    def _shop_payload_items(self, payload: dict[str, Any]) -> list[Any]:
+        """商店屏的可买项（卡/遗物/药水），按 mod 下发的顺序拼成一个候选序列。
+
+        ★ 顺序必须与 `_shop_affordable_items` 一致（卡 → 遗物 → 药水），
+          否则 `index` 会与真实的商品下标错位。
+        """
+        out: list[Any] = []
+        for key in ("shop_cards", "shop_relics", "shop_potions"):
+            items = payload.get(key)
+            if isinstance(items, list):
+                out.extend(items)
+        return out
+
+    #: 药水/遗物**类别** -> 牌组维度。
+    #:
+    #: 卡牌有 `_card_effect_dims` 可直接映射，药水/遗物没有 ⇒ 需要这张表。
+    #: 键取自 `_potion_category` 的返回值（aoe/defense/heal/cleanse/burst/draw/other）。
+    #: `burst` 映射到 `output`（单体爆发就是输出）；`heal`/`cleanse` 不对应六维中的任何一维
+    #: （六维里没有"续航"）⇒ 刻意留空，表示"这类商品在维度判据下**不动它**"。
+    _POTION_CATEGORY_TO_SHOP_DIM: dict[str, tuple[str, ...]] = {
+        "defense": ("defense",),
+        "burst": ("output",),
+        "aoe": ("aoe",),
+        "draw": ("draw",),
+        # heal / cleanse / other：六维里没有对应项 ⇒ 不参与降权
+    }
+
+    def _shop_item_dims(self, item: dict[str, Any]) -> set[str]:
+        """这件商店商品补的是哪些**牌组维度**（读不出就返回空集 ⇒ 不动它）。"""
+        # 卡牌：直接复用既有映射（攻击→输出、格挡→格挡、抽牌→抽牌…）
+        if str(item.get("card_id") or "") or str(item.get("card_type") or ""):
+            return set(self._card_effect_dims(item))
+        # 遗物/药水：走类别映射
+        category = self._potion_category(item)
+        return set(self._POTION_CATEGORY_TO_SHOP_DIM.get(category, ()))
+
+    #: 教训 token -> **事件选项文案**里表示该后果的关键词（缺陷 C 用）。
+    #:
+    #: 与 `_LESSON_KEYWORD_MAP`（面向路线/选牌屏的简短词）不同：事件选项是自然语言长句，
+    #: 且中英混排，所以要单列一张表。刻意保守 —— 只收"语义明确、误判代价高"的几类，
+    #: 匹配不准就不动（与 `_indices_worth_penalizing` 的整体口径一致）。
+    _EVENT_CONSEQUENCE_KEYWORDS: dict[str, tuple[str, ...]] = {
+        # 诅咒：永恒话题，且游戏侧已证变换期望近零（见 `_TRANSFORM_CURSE_SCORE` 注释）
+        "curse": ("诅咒", "curse"),
+        # ★生命**上限**损失：用户报告的核心痛点，优先级高于普通掉血
+        "max_hp": ("生命上限", "最大生命", "上限", "max hp", "maximum health", "max. hp"),
+        # 生命：掉血（一次性、可恢复）—— 用户报告的核心痛点
+        "hp": ("失去生命", "掉血", "失去", "lose hp", "lose ", "生命值", "血量"),
+        "skill": ("格挡", "防御", "护盾", "block"),
+        "attack": ("伤害", "攻击", "damage", "attack"),
+        # 金币：复盘里"攒钱"类教训应当能影响"花钱/得钱"的选项
+        "shop": ("金币", "gold", "购买", "buy", "花费", "spend"),
+        "rest": ("回复", "回血", "heal", "休息", "生命"),
+        "treasure": ("遗物", "relic", "宝箱", "chest"),
+        "elite": ("精英", "elite"),
+    }
 
     def _rank_map_nodes(self, summary_context: dict[str, Any], preferences: dict[str, Any]) -> list[int]:
         """与 _preferred_map_index 同口径：分数高的在前，同分时下标小的在前。"""
@@ -3942,7 +6565,22 @@ class STS2HeuristicPlanner:
         return [index for _score, index in scored]
 
     def _rank_remove_options(self, summary_context: dict[str, Any]) -> list[int]:
-        """与 _preferred_remove_option 同口径：分数高的在前，同分时下标**大**的在前。"""
+        """与 `_preferred_remove_option` **同口径**：最该删的在前。
+
+        ★ 修一个真实缺陷（2026-10-17）：本函数原为
+        `scored.sort(key=lambda item: (-item[0], -item[1]))`，即**分数高者在前**，
+        与 `_preferred_remove_option` 的 `min((score, -index))`
+        （**分数低者优先删**）**方向相反**，但 docstring 却写"同口径"。
+
+        后果：`_score_remove_card` 对诅咒 = −100（最低 ⇒ 最该删），
+        而排序把它放**最后** ⇒ `ordered_candidates` 的扰动候选里，
+        `items[1]`（mischievous 档位会选它）指向的是**最不该删的卡**（如能量卡 +70）。
+        实测：`[诅咒, 打击, 储能]` ⇒ preferred=0(诅咒) 正确，但 rank=[2,1,0]
+        ⇒ 扰动时优先删掉储能卡。
+
+        现在改为与 preferred 同口径（`(score, -index)` 升序），
+        ⇒ 扰动候选顺序变为"次该删 → 再次该删"，与决策对齐。
+        """
         payload = summary_context.get("payload") if isinstance(summary_context.get("payload"), dict) else {}
         selection_cards = payload.get("selection_cards") if isinstance(payload.get("selection_cards"), list) else []
         scored: list[tuple[int, int]] = []
@@ -3952,7 +6590,30 @@ class STS2HeuristicPlanner:
             raw = card.get("index")
             index = int(raw) if isinstance(raw, int) and not isinstance(raw, bool) else position
             scored.append((self._score_remove_card(card), index))
-        scored.sort(key=lambda item: (-item[0], -item[1]))
+        # 与 `_preferred_remove_option` 完全同序：分数低者在前（最该删），
+        # 同分时下标**大**者在前（与 preferred 的 `-card_index` 取 min 等价）。
+        scored.sort(key=lambda item: (item[0], -item[1]))
+        return [index for _score, index in scored]
+
+    def _rank_upgrade_options(self, summary_context: dict[str, Any]) -> list[int]:
+        """与 `_preferred_upgrade_option` **同口径**：最该升的在前。
+
+        ★ 刻意与 `_rank_remove_options` 方向相反 —— 升级要"最有价值"，
+        删牌要"最没价值"。第 0 个必须等于规划器真正会选的那张，
+        否则扰动层的"不扰动 == 取第 0 个"不变量会被破坏。
+        """
+        payload = summary_context.get("payload") if isinstance(summary_context.get("payload"), dict) else {}
+        selection_cards = payload.get("selection_cards") if isinstance(payload.get("selection_cards"), list) else []
+        scored: list[tuple[int, int]] = []
+        for position, card in enumerate(selection_cards):
+            if not isinstance(card, dict) or self._item_blocked(card):
+                continue
+            raw = card.get("index")
+            index = int(raw) if isinstance(raw, int) and not isinstance(raw, bool) else position
+            scored.append((self._score_upgrade_card(card), index))
+        # 与 `_preferred_upgrade_option` 的 `max((score, -index))` 等价：
+        # 分数**高**者在前，同分时下标**小**者在前。
+        scored.sort(key=lambda item: (-item[0], item[1]))
         return [index for _score, index in scored]
 
     def ordered_candidates(self, context: dict[str, Any], operation: Any) -> list[int]:

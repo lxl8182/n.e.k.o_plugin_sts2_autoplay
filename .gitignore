@@ -13,3 +13,11 @@ store.db
 .env
 .DS_Store
 .codegraph/
+
+# agent/team local state and analysis artifacts (166MB+)
+.dsh-artifacts/
+.agent-teams/
+plugin.toml.lock
+
+# runtime data written by history_view.py (never tracked)
+static/autoplay_history.json

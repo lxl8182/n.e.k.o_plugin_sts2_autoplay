@@ -77,200 +77,131 @@ def test_planner_uses_default_option_index_for_map_when_no_preference() -> None:
 
 
 
-def test_planner_defense_sequence_builds_block_before_attack() -> None:
-    planner = STS2HeuristicPlanner()
+def _combat_context(*, solver_plan=None, hand=None, energy=2, block=0, enemies=None) -> dict:
+    """构造战斗 context。默认手牌是一张攻击 + 一张防御。
 
-    operation = planner.plan(
-        {
-            "classification": {"state_name": "combat"},
-            "summary_context": {
-                "payload": {},
-                "decision_payload": {
-                    "guidance": {
-                        "pending": [{"content": "先防一下，别贪"}],
-                        "generation": 1,
-                    }
-                },
+    ★ `solver_plan` 放在 **context 顶层** —— 与生产一致：
+      `loop_runner.py:225` 的 planning_context 就是
+      `{..."solver_plan": solver_plan, "solver_step_index": ...}`。
+      planner 读的是 `context.get("solver_plan")`（heuristic_planner.py:1272），
+      **不是** `summary_context["payload"]` 里的那份
+      （payload 那份是给猫娘弹幕用的，两条消费路径，别混）。
+    """
+    ctx: dict = {
+        "classification": {"state_name": "combat"},
+        "summary_context": {"payload": {}},
+        "strategy_context": {"preferences": {}},
+        "snapshot": {
+            "screen": "COMBAT",
+            "available_actions": [
+                {"type": "play_card", "raw": {"name": "play_card"}},
+                {"type": "end_turn", "raw": {"name": "end_turn"}},
+            ],
+            "raw_state": {
+                "combat": {
+                    "player": {"energy": energy, "block": block},
+                    "hand": hand
+                    if hand is not None
+                    else [
+                        {"index": 0, "card_id": "STRIKE", "name": "Strike", "damage": 6, "energy_cost": 1, "playable": True},
+                        {"index": 1, "card_id": "DEFEND", "name": "Defend", "block": 5, "energy_cost": 1, "playable": True},
+                    ],
+                    "enemies": enemies if enemies is not None else [{"current_hp": 20, "intent_damage": 6}],
+                }
             },
-            "strategy_context": {"preferences": {}},
-            "snapshot": {
-                "screen": "COMBAT",
-                "available_actions": [
-                    {"type": "play_card", "raw": {"name": "play_card"}},
-                    {"type": "end_turn", "raw": {"name": "end_turn"}},
-                ],
-                "raw_state": {
-                    "combat": {
-                        "player": {"energy": 3, "block": 0},
-                        "hand": [
-                            {"index": 0, "name": "Strike", "description": "Deal 6 damage", "damage": 6, "energy_cost": 1, "playable": True, "valid_target_indices": [0]},
-                            {"index": 1, "name": "Defend", "description": "Gain 5 block", "block": 5, "energy_cost": 1, "playable": True},
-                            {"index": 2, "name": "Defend", "description": "Gain 5 block", "block": 5, "energy_cost": 1, "playable": True},
-                        ],
-                        "enemies": [{"current_hp": 20, "intent_damage": 6}],
-                    }
-                },
-            },
-        }
+        },
+    }
+    if solver_plan is not None:
+        ctx["solver_plan"] = solver_plan
+    return ctx
+
+
+def _plan(*steps) -> dict:
+    return {"in_combat": True, "line": [{"turn": 1, "steps": list(steps)}]}
+
+
+def test_combat_obeys_solver_play_card() -> None:
+    """★ 有求解器计划 ⇒ 照它打，且 `source` 标明来源是求解器。"""
+    planner = STS2HeuristicPlanner()
+    ctx = _combat_context(
+        solver_plan=_plan(
+            {"kind": "play_card", "card_index": 1, "card_id": "DEFEND", "card_name": "Defend", "target_index": None}
+        )
     )
 
-    assert operation is not None
-    assert operation.reason == "combat_defense_sequence"
-    assert operation.kwargs["card_index"] in {1, 2}
+    operation = planner.plan(ctx)
 
-
-def test_planner_attack_priority_sequence_defends_when_gap_is_large() -> None:
-    planner = STS2HeuristicPlanner()
-
-    operation = planner.plan(
-        {
-            "classification": {"state_name": "combat"},
-            "summary_context": {
-                "payload": {},
-                "decision_payload": {
-                    "guidance": {
-                        "pending": [{"content": "优先输出"}],
-                        "generation": 1,
-                    }
-                },
-            },
-            "strategy_context": {"preferences": {}},
-            "snapshot": {
-                "screen": "COMBAT",
-                "available_actions": [
-                    {"type": "play_card", "raw": {"name": "play_card"}},
-                    {"type": "end_turn", "raw": {"name": "end_turn"}},
-                ],
-                "raw_state": {
-                    "combat": {
-                        "player": {"energy": 2, "block": 0},
-                        "hand": [
-                            {"index": 0, "name": "Strike", "description": "Deal 6 damage", "damage": 6, "energy_cost": 1, "playable": True},
-                            {"index": 1, "name": "Defend", "description": "Gain 5 block", "block": 5, "energy_cost": 1, "playable": True},
-                        ],
-                        "enemies": [{"current_hp": 20, "intent_damage": 6}],
-                    }
-                },
-            },
-        }
-    )
-
-    assert operation is not None
-    assert operation.reason == "combat_attack_priority_sequence"
+    assert operation is not None, "有求解器计划却不出手"
+    # 打的是求解器指定的那张（index 1 = Defend），而不是"启发式认为该打的"
     assert operation.kwargs["card_index"] == 1
+    # ★ source 是留痕字段（reason 是 mod_combat_search，记的是动作来源分类）
+    assert operation.source == "mod_solver", f"source 未标明求解器：{operation.source!r}"
 
 
-def test_planner_attack_priority_sequence_attacks_when_gap_is_small() -> None:
+def test_combat_obeys_solver_target() -> None:
+    """★ 求解器指定的目标必须原样透传（不许自己挑目标）。"""
     planner = STS2HeuristicPlanner()
-
-    operation = planner.plan(
-        {
-            "classification": {"state_name": "combat"},
-            "summary_context": {
-                "payload": {},
-                "decision_payload": {
-                    "guidance": {
-                        "pending": [{"content": "优先输出"}],
-                        "generation": 1,
-                    }
-                },
-            },
-            "strategy_context": {"preferences": {}},
-            "snapshot": {
-                "screen": "COMBAT",
-                "available_actions": [
-                    {"type": "play_card", "raw": {"name": "play_card"}},
-                    {"type": "end_turn", "raw": {"name": "end_turn"}},
-                ],
-                "raw_state": {
-                    "combat": {
-                        "player": {"energy": 2, "block": 5},
-                        "hand": [
-                            {"index": 0, "name": "Strike", "description": "Deal 6 damage", "damage": 6, "energy_cost": 1, "playable": True},
-                            {"index": 1, "name": "Defend", "description": "Gain 5 block", "block": 5, "energy_cost": 1, "playable": True},
-                        ],
-                        "enemies": [{"current_hp": 20, "intent_damage": 6}],
-                    }
-                },
-            },
-        }
+    ctx = _combat_context(
+        solver_plan=_plan(
+            {"kind": "play_card", "card_index": 0, "card_id": "STRIKE", "card_name": "Strike", "target_index": 1}
+        ),
+        enemies=[{"current_hp": 10, "intent_damage": 12}, {"current_hp": 6, "intent_damage": 4}],
+        hand=[
+            {
+                "index": 0,
+                "card_id": "STRIKE",
+                "name": "Strike",
+                "damage": 6,
+                "energy_cost": 1,
+                "playable": True,
+                "requires_target": True,
+                "valid_target_indices": [0, 1],
+            }
+        ],
     )
 
+    operation = planner.plan(ctx)
+
     assert operation is not None
-    assert operation.reason == "combat_attack_priority_sequence"
-    assert operation.kwargs["card_index"] == 0
+    # ★ 求解器说打 1 号（血量更低的那个）。启发式过去会因"高意图优先"选 0 号。
+    assert operation.kwargs["target_index"] == 1, "没有原样照做求解器的目标"
 
 
+def test_combat_obeys_solver_end_turn() -> None:
+    """★ 求解器说收手 ⇒ 就收手（不许自作主张再打一张）。"""
+    planner = STS2HeuristicPlanner()
+    ctx = _combat_context(solver_plan=_plan({"kind": "end_turn", "card_id": ""}))
+
+    operation = planner.plan(ctx)
+
+    assert operation is not None
+    assert operation.action_type == "end_turn"
 
 
+def test_combat_without_solver_plan_emits_no_action() -> None:
+    """★ **没有**求解器计划时不出手 —— 这是"纯求解器"的核心断言。
 
-
-def test_planner_target_priority_prefers_lethal_target() -> None:
+    为什么不能降级到启发式：玩家明确说"启发了会导致更多变量导致失败"。
+    宁可本 tick 不出手（让上层重取计划），也不要打出启发式认为对的牌。
+    """
     planner = STS2HeuristicPlanner()
 
-    operation = planner.plan(
-        {
-            "classification": {"state_name": "combat"},
-            "summary_context": {"payload": {}},
-            "strategy_context": {"preferences": {}},
-            "snapshot": {
-                "screen": "COMBAT",
-                "available_actions": [
-                    {"type": "play_card", "raw": {"name": "play_card"}},
-                ],
-                "raw_state": {
-                    "combat": {
-                        "player": {"energy": 1, "block": 10},
-                        "hand": [
-                            {"index": 0, "name": "Strike", "description": "Deal 6 damage", "damage": 6, "energy_cost": 1, "playable": True, "valid_target_indices": [0, 1]},
-                        ],
-                        "enemies": [
-                            {"current_hp": 10, "intent_damage": 12},
-                            {"current_hp": 6, "intent_damage": 4},
-                        ],
-                    }
-                },
-            },
-        }
+    # 手上有可打的牌、能量足够 —— 诱使启发式出手的条件全都满足
+    operation = planner.plan(_combat_context(solver_plan=None))
+
+    assert operation is None, (
+        f"无求解器计划却出手了（说明启发式仍在兜底）：{operation!r}"
     )
 
-    assert operation is not None
-    assert operation.kwargs["target_index"] == 1
 
-
-def test_planner_target_priority_prefers_higher_intent_when_no_lethal() -> None:
+def test_combat_solver_says_not_in_combat_emits_no_action() -> None:
+    """★ 求解器明说 `in_combat=False` ⇒ 同样不出手（等重算）。"""
     planner = STS2HeuristicPlanner()
+    ctx = _combat_context(solver_plan={"in_combat": False, "line": [{"turn": 1, "steps": []}]})
 
-    operation = planner.plan(
-        {
-            "classification": {"state_name": "combat"},
-            "summary_context": {"payload": {}},
-            "strategy_context": {"preferences": {}},
-            "snapshot": {
-                "screen": "COMBAT",
-                "available_actions": [
-                    {"type": "play_card", "raw": {"name": "play_card"}},
-                ],
-                "raw_state": {
-                    "combat": {
-                        "player": {"energy": 1, "block": 10},
-                        "hand": [
-                            {"index": 0, "name": "Strike", "description": "Deal 6 damage", "damage": 6, "energy_cost": 1, "playable": True, "valid_target_indices": [0, 1]},
-                        ],
-                        "enemies": [
-                            {"current_hp": 20, "intent_damage": 12},
-                            {"current_hp": 10, "intent_damage": 4},
-                        ],
-                    }
-                },
-            },
-        }
-    )
+    operation = planner.plan(ctx)
 
-    assert operation is not None
-    assert operation.kwargs["target_index"] == 0
-
-
+    assert operation is None, f"求解器说不在战斗却出手了：{operation!r}"
 
 
 def test_planner_remove_skips_eternal_cards() -> None:

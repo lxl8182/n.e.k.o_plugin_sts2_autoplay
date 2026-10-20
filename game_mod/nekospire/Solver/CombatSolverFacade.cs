@@ -3,11 +3,13 @@
 // runs. Capture on the game thread, offload the search to a worker thread, map SolverResult -> payload.
 // Recommendation only — never deploys.
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Entities.Players;
+using NekoComm.Game.Sim;
 using CombatSolver;
 
 namespace NekoComm.Game;
@@ -29,6 +31,10 @@ internal static class CombatSolverFacade
         SolverDisplayNames names;
         BattleDamageSnapshot damage;
         bool includeTurnSetup;
+        // Card-side coverage denominator: the LIVE hand at root-capture time (same moment and same set as
+        // the captured root snapshot — the hand this plan's current turn plays from). Null => the hand
+        // could not be read, and coverage is then reported as explicitly unknown (-1), never as a fake 0.
+        SimCoverageCard[]? handCoverage = null;
         try
         {
             // Always capture the LIVE Play-phase combat state (the current turn's real hand), so the line's
@@ -41,6 +47,15 @@ internal static class CombatSolverFacade
                 return Failed("solver_failed", "捕获的玩家与本地玩家不一致。");
             names = SolverDisplayNames.Capture(state);
             damage = BattleDamageTracker.Observe(state);
+            try
+            {
+                handCoverage = CaptureHandCoverage(me);
+            }
+            catch (Exception ex)
+            {
+                // Non-fatal: coverage degrades to "unknown" instead of killing the plan.
+                Entry.Logger?.Debug($"[NekoSpire] 手牌覆盖捕获失败: {ex.Message}");
+            }
         }
         catch (Exception ex)
         {
@@ -60,7 +75,7 @@ internal static class CombatSolverFacade
         {
             var first = await RunSolveAsync(root, names, damage, smartPolicy, cancellationToken);
             if (tolerance.IsWithinTolerance(first.Snapshot.CumulativePlayerHpLost))
-                return MapResult(first, me, options, root);   // acceptable damage -> no potions
+                return MapResult(first, me, options, root, handCoverage);   // acceptable damage -> no potions
 
             int potionSlots = me.Potions.Count();
             SolverResult best = first;
@@ -74,7 +89,7 @@ internal static class CombatSolverFacade
                         potionFreePolicyBaseline: null, maximumPotionUses: n).Solve());
 
                 if (tolerance.IsWithinTolerance(bounded.Snapshot.CumulativePlayerHpLost))
-                    return MapResult(bounded, me, options, root);   // fewest potions that hit tolerance
+                    return MapResult(bounded, me, options, root, handCoverage);   // fewest potions that hit tolerance
                 if (bounded.BestNode.Score > best.BestNode.Score)
                     best = bounded;                            // keep the best we found so far
             }
@@ -86,7 +101,7 @@ internal static class CombatSolverFacade
             return Failed("solver_failed", $"CombatSolver 搜索失败: {ex.Message}{inner}\n{ex.StackTrace}");
         }
 
-        return MapResult(result, me, options, root);
+        return MapResult(result, me, options, root, handCoverage);
     }
 
     private static async Task<SolverResult> RunSolveAsync(
@@ -146,7 +161,9 @@ internal static class CombatSolverFacade
             MemoryPressureSignal: memory);
     }
 
-    private static SolverPlanPayload MapResult(SolverResult result, Player me, SolverFacadeOptions options, CombatRootSnapshot root)
+    private static SolverPlanPayload MapResult(
+        SolverResult result, Player me, SolverFacadeOptions options, CombatRootSnapshot root,
+        IReadOnlyList<SimCoverageCard>? handCoverage)
     {
         var first = result.BestNode.Actions.FirstOrDefault();
         // Group the forecasted line into per-turn buckets; each turn's steps end with an "end_turn"
@@ -162,8 +179,8 @@ internal static class CombatSolverFacade
             })
             .ToArray();
 
-        (int exact, int inferred, int unsupported, int ignored) = ClassifyCoverage(result);
-        var warnings = BuildWarnings(result);
+        SimCoverageSummary coverageSummary = SummarizeCoverage(result, handCoverage);
+        var warnings = BuildWarnings(result, coverageSummary, handCoverage);
 
         return new SolverPlanPayload
         {
@@ -179,10 +196,10 @@ internal static class CombatSolverFacade
             warnings = warnings,
             coverage = new CoverageSummaryPayload
             {
-                exact = exact,
-                inferred = inferred,
-                unsupported = unsupported,
-                ignored = ignored,
+                exact = coverageSummary.Exact,
+                inferred = coverageSummary.Inferred,
+                unsupported = coverageSummary.Unsupported,
+                ignored = coverageSummary.Ignored,
                 potions = result.PotionCount,
                 risk = result.Snapshot.HasRisk || !result.Forecast.IsExactForModeledDamage,
             },
@@ -271,29 +288,123 @@ internal static class CombatSolverFacade
         return null;
     }
 
-    private static (int exact, int inferred, int unsupported, int ignored) ClassifyCoverage(SolverResult result)
+    /// <summary>
+    /// Card-side coverage of the hand this plan's current turn plays from. The four buckets are a genuine
+    /// partition produced by the shared classifier in <see cref="SimCoverage"/> (same semantics as
+    /// Game/Sim/SimSolverPlan.cs), so:
+    /// <list type="bullet">
+    /// <item>DENOMINATOR = the LIVE hand captured on the game thread together with the root snapshot
+    /// (== the root snapshot's hand, i.e. the hand <see cref="MapStepCardIndex"/> indexes into).
+    /// It is <b>not</b> <c>result.Snapshot.HandCount</c>: that is the hand count of the FINAL simulated
+    /// node at the end of the searched horizon (CombatBeamSolver.Phases.cs:493-513), a different quantity
+    /// in a different unit — subtracting one from the other was the old bug.</item>
+    /// <item>NUMERATOR = one bucket per card of that hand ⇒ exact+inferred+unsupported+ignored == hand size
+    /// (never a gap-entry count, never a <c>Math.Max(0, …)</c> plug).</item>
+    /// <item>EVIDENCE = <c>result.Snapshot.PredictionGaps</c>, but a gap counts only for the card it is
+    /// about (<c>SourceId == card id</c> of this hand). PredictionGaps is the deduped risk list of the
+    /// whole search and also contains powers / relics / monsters; those are not card-side coverage.</item>
+    /// <item>ENEMY ITEMS = <c>Forecast.ApproximationDetails</c> / <c>Forecast.UnsupportedDetails</c> are
+    /// enemy-intent forecasts, not cards. They are carried on their own summary fields (surfaced only as
+    /// <c>enemy_approximation:</c> / <c>enemy_unsupported:</c> warnings) and never enter these buckets.</item>
+    /// </list>
+    /// When the hand could not be captured the whole report is honestly unknown: exact = -1 (see
+    /// <see cref="SimCoverageSummary.UnknownValue"/>), with a <c>coverage_unknown:</c> warning.
+    /// </summary>
+    private static SimCoverageSummary SummarizeCoverage(
+        SolverResult result, IReadOnlyList<SimCoverageCard>? handCoverage)
     {
-        int handCount = result.Snapshot.HandCount;
-        int inferred = result.Snapshot.PredictionGaps.Count(g => g.Compensated)
-            + result.Forecast.ApproximationDetails.Count;
-        int unsupported = result.Snapshot.PredictionGaps.Count(g => !g.Compensated)
-            + result.Forecast.UnsupportedDetails.Count;
-        int ignored = 0;
-        int exact = Math.Max(0, handCount - inferred - unsupported - ignored);
-        return (exact, inferred, unsupported, ignored);
+        IReadOnlyList<PredictionGap> predictionGaps = result.Snapshot.PredictionGaps;
+        var gaps = new SimCoverageGap[predictionGaps.Count];
+        for (var i = 0; i < gaps.Length; i++)
+        {
+            PredictionGap gap = predictionGaps[i];
+            gaps[i] = new SimCoverageGap(gap.SourceId, gap.Compensated);
+        }
+
+        return SimCoverage.Summarize(
+            handCoverage,
+            gaps,
+            enemyApproximated: result.Forecast.ApproximationDetails.Count,
+            enemyUnsupported: result.Forecast.UnsupportedDetails.Count);
     }
 
-    private static string[] BuildWarnings(SolverResult result)
+    /// <summary>
+    /// Snapshot the live hand (game thread) into the pure classifier input: card id + the two X-cost
+    /// predicates. Uses exactly the same predicates as Game/Sim/SimBuild.cs:91-92
+    /// (<c>card.EnergyCost.CostsX</c> / <c>card.HasStarCostX</c>), so the CombatSolver path and the Sim path
+    /// agree on what "ignored" means. Returns null when the hand is not readable (=> coverage unknown).
+    /// </summary>
+    private static SimCoverageCard[]? CaptureHandCoverage(Player me)
+    {
+        var playerCombat = me.PlayerCombatState;
+        if (playerCombat == null)
+            return null;
+        var cards = playerCombat.Hand.Cards;
+        if (cards == null)
+            return null;
+
+        var hand = new SimCoverageCard[cards.Count];
+        for (var i = 0; i < hand.Length; i++)
+        {
+            var card = cards[i];
+            hand[i] = new SimCoverageCard(
+                card.Id.Entry,
+                CostsX: card.EnergyCost.CostsX,
+                CostsStarX: card.HasStarCostX,
+                // The CombatSolver path has no per-card model flags: only the search's gaps carry
+                // evidence about a card, so these stay false (they are the Sim pipeline's own flags).
+                Unmodeled: false,
+                Approximated: false);
+        }
+        return hand;
+    }
+
+    private static string[] BuildWarnings(
+        SolverResult result, SimCoverageSummary coverage, IReadOnlyList<SimCoverageCard>? handCoverage)
     {
         var warnings = new System.Collections.Generic.List<string>();
         if (result.BoundaryReason != SearchBoundaryReason.None)
             warnings.Add($"search_boundary:{result.BoundaryReason.ToString().ToLowerInvariant()}");
+
+        // Same population AND same precedence as the coverage buckets: a gap may only be printed as a
+        // card-side line when its source is a card of the reported hand, and its prefix is the bucket that
+        // card actually landed in — an X/star-X card is `ignored:` even if the search recorded a risk entry
+        // about it (that is why `inferred:`/`unsupported:` can never exceed the hand size). Everything else
+        // PredictionGaps carries — deck/discard cards simulated later in the line, powers, relics, monsters —
+        // is search-scope evidence and gets its own `search_gap_*` prefix. Before T40 all of it was printed
+        // as `inferred:` and then counted against the hand, producing "7 inferred warnings for a 1-card hand".
+        var handById = new Dictionary<string, SimCoverageCard>(StringComparer.Ordinal);
+        if (handCoverage != null)
+            foreach (SimCoverageCard card in handCoverage)
+                handById[card.Id] = card;
         foreach (var gap in result.Snapshot.PredictionGaps)
-            warnings.Add(gap.Compensated ? $"inferred:{gap.SourceId}.{gap.Method}" : $"unsupported:{gap.SourceId}.{gap.Method}");
+        {
+            string prefix;
+            if (handById.TryGetValue(gap.SourceId, out SimCoverageCard handCard))
+            {
+                prefix = handCard.CostsX || handCard.CostsStarX ? "ignored"
+                    : gap.Compensated ? "inferred"
+                    : "unsupported";
+            }
+            else
+            {
+                prefix = gap.Compensated ? "search_gap_inferred" : "search_gap_unsupported";
+            }
+            warnings.Add($"{prefix}:{gap.SourceId}.{gap.Method}");
+        }
+
         foreach (var detail in result.Forecast.UnsupportedDetails)
             warnings.Add($"enemy_unsupported:{detail}");
         foreach (var detail in result.Forecast.ApproximationDetails)
             warnings.Add($"enemy_approximation:{detail}");
+        // Self-describing coverage scope, so a consumer never has to guess the denominator again: the
+        // four buckets were classified against this hand, and they partition it.
+        if (!coverage.IsKnown)
+            warnings.Add("coverage_unknown:手牌捕获不可用,coverage 四分类记为 -1(未知)");
+        else
+            warnings.Add($"coverage_scope:hand={coverage.HandCount}:classified={coverage.Classified}");
+        if (coverage.IsKnown && !coverage.IsConsistent)
+            warnings.Add($"coverage_inconsistent:hand={coverage.HandCount}:classified={coverage.Classified}");
         return warnings.ToArray();
     }
 

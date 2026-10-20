@@ -151,7 +151,20 @@ def test_companion_evaluator_primary_message_includes_card_cost() -> None:
     )
 
     assert "邪眼（1费）" in result["primary_message"]
-    assert "建议优先防御或找减伤线" in result["primary_message"]
+    # ★ 测试意图是「**承伤超过格挡时要给防御口径**」，与具体文案无关。
+    #   原来写死"建议优先防御或找减伤线"，2026-10-19 i18n 第一人称改造后必然失效
+    #   —— 那是**测试耦合了文案**，不是行为回归。
+    #   ⇒ 断言"意图 + 人称"两件事：
+    #     ① 必须给出防御/减伤口径（而不是"抓机会输出"）
+    #     ② 必须是猫娘自述（不得出现旁白词）
+    assert "防御" in result["primary_message"] or "减伤" in result["primary_message"], (
+        f"承伤超过格挡时应给防御口径，实际：{result['primary_message']!r}"
+    )
+    assert "抓机会" not in result["primary_message"], "承伤超过格挡时不该说抓机会输出"
+    for forbidden in ("建议", "玩家"):
+        assert forbidden not in result["primary_message"], (
+            f"必须是猫娘自述，不得出现旁白词「{forbidden}」：{result['primary_message']!r}"
+        )
 
 
 @pytest.mark.unit
@@ -184,7 +197,14 @@ def test_companion_evaluator_uses_strategy_context_for_commentary() -> None:
     assert result["strategy_name"] == "defect"
     assert result["risk_level"] == "high"
     assert "当前局势偏危险" not in result["commentary"]
-    assert "建议优先防御或找减伤线" in result["commentary"]
+    # ★ 同上的口径修正：断言"防御口径 + 第一人称"，不写死文案。
+    assert "防御" in result["commentary"] or "减伤" in result["commentary"], (
+        f"承伤超过格挡时应给防御口径，实际：{result['commentary']!r}"
+    )
+    for forbidden in ("建议", "玩家"):
+        assert forbidden not in result["commentary"], (
+            f"必须是猫娘自述，不得出现旁白词「{forbidden}」：{result['commentary']!r}"
+        )
 
 
 @pytest.mark.unit
@@ -217,7 +237,78 @@ def test_companion_evaluator_combat_intent_drives_advice() -> None:
 
 
 @pytest.mark.unit
-def test_companion_evaluator_combat_uses_heuristic_named_card_suggestion() -> None:
+def test_companion_evaluator_combat_speaks_solver_card_in_first_person() -> None:
+    """★ 战斗台词 = 求解器要打的那一步，且必须是**第一人称**。
+
+    契约（玩家 2026-10-18 指示）：
+      1. 战斗决策**完全交给求解器**，插件不再自己启发式选牌；
+      2. 猫娘是唯一主语，插件是她的**反射弧**，不是"转述求解器的第三方"；
+      3. ⇒ 输出形如「这回合我打『X』」，**不得**出现「建议…理由：…」这种转达口气。
+
+    ★ 判据来自 `solver_plan.line[0].steps[0]`；与
+      `test_companion_evaluator_combat_falls_back_when_solver_absent` 互为对照：
+      有求解器就念它，没有就不编。
+    """
+    evaluator = STS2CompanionEvaluator(None)
+
+    result = evaluator.evaluate(
+        summary_context={
+            "summary_kind": "combat",
+            "payload": {
+                "player": {"current_hp": 18, "max_hp": 80, "block": 0},
+                "enemies": [{"name": "Louse", "intent_damage": 12}],
+                # 求解器这一步要打「Defend」（防御牌，不需要目标）
+                "solver_plan": {
+                    "in_combat": True,
+                    "line": [
+                        {
+                            "turn": 1,
+                            "steps": [
+                                {
+                                    "kind": "play_card",
+                                    "card_index": 1,
+                                    "card_id": "DEFEND",
+                                    "card_name": "Defend",
+                                    "target_index": None,
+                                }
+                            ],
+                        }
+                    ],
+                },
+            },
+        },
+        situation_summary={
+            "kind": "combat",
+            "text": "当前战斗状态。",
+            "static_text": "当前战斗状态。",
+            "source": "snapshot",
+            "delta": {},
+            "before": {},
+            "after": {},
+        },
+        strategy_context={
+            "strategy_name": "defect",
+            "strategy_directives": {},
+        },
+    )
+
+    suggestion = result["suggestion"]
+    # 念的是求解器指定的那张牌
+    assert "Defend" in suggestion
+    # ★ 第一人称：猫娘自己在打，不是"建议你打"
+    assert "我" in suggestion
+    # ★ 不得出现转达口气（插件不是求解器的发言人）
+    for forbidden in ("建议", "理由：", "求解器", "插件"):
+        assert forbidden not in suggestion, f"出现转达词『{forbidden}』：{suggestion!r}"
+
+
+@pytest.mark.unit
+def test_companion_evaluator_combat_falls_back_when_solver_absent() -> None:
+    """★ 没有求解器计划时**不编造牌名**，退到局势短句。
+
+    为什么这条重要：弹幕是陪玩玩家**唯一**能看到的信息渠道（玩家自己打牌、
+    看不到求解器）。编一个牌名比什么都不说更糟 —— 玩家会照着打错。
+    """
     evaluator = STS2CompanionEvaluator(None)
 
     result = evaluator.evaluate(
@@ -227,9 +318,9 @@ def test_companion_evaluator_combat_uses_heuristic_named_card_suggestion() -> No
                 "player": {"current_hp": 18, "max_hp": 80, "block": 0},
                 "enemies": [{"name": "Louse", "intent_damage": 12}],
                 "playable_card_summaries": [
-                    {"name": "Strike", "energy_cost": 1, "star_cost": 0, "costs_x": False, "star_costs_x": False, "requires_target": True, "playable": True, "effect": "造成伤害"},
-                    {"name": "Defend", "energy_cost": 1, "star_cost": 0, "costs_x": False, "star_costs_x": False, "requires_target": False, "playable": True, "effect": "获得格挡"},
+                    {"name": "Defend", "energy_cost": 1, "playable": True},
                 ],
+                # ★ 故意不给 solver_plan
             },
         },
         situation_summary={
@@ -247,42 +338,69 @@ def test_companion_evaluator_combat_uses_heuristic_named_card_suggestion() -> No
         },
     )
 
-    assert "Defend" in result["suggestion"]
+    suggestion = result["suggestion"]
+    # 仍然要说话（不能空着让玩家干等），但**不许**点名任何具体牌
+    assert suggestion, "无求解器时也应给出局势短句，不能完全沉默"
+    assert "Defend" not in suggestion, f"无求解器却点名了牌：{suggestion!r}"
 
 
 @pytest.mark.unit
-def test_companion_evaluator_combat_includes_target_and_reason_text() -> None:
-    evaluator = STS2CompanionEvaluator(None)
+def test_companion_evaluator_combat_names_target_only_when_solver_targets() -> None:
+    """★ 求解器指定了目标才念目标；没指定就**不许念**（防编造）。
 
-    result = evaluator.evaluate(
-        summary_context={
-            "summary_kind": "combat",
-            "payload": {
-                "player": {"current_hp": 40, "max_hp": 80, "block": 0},
-                "enemies": [{"name": "Louse", "intent_damage": 6, "current_hp": 6}],
-                "playable_card_summaries": [
-                    {"name": "Strike", "energy_cost": 1, "star_cost": 0, "costs_x": False, "star_costs_x": False, "requires_target": True, "playable": True, "effect": "造成6点伤害"},
-                ],
+    这条来自一个**实测复现**的缺陷：
+      `_safe_int(None) == 0`，于是"防御牌 + target_index=None"会被念成
+      「这回合我打『防御』，招呼 Louse」——凭空给不需要目标的牌安了个目标。
+      陪玩玩家看不到求解器，只能照弹幕打 ⇒ 会打错敌人。
+
+    ⇒ 判据必须是"键在不在 / 值是不是 null"，不能是数值本身。
+    """
+    base_payload = {
+        "player": {"current_hp": 40, "max_hp": 80, "block": 0},
+        "enemies": [{"name": "Louse", "intent_damage": 6, "current_hp": 6}],
+    }
+    situation = {
+        "kind": "combat",
+        "text": "当前战斗状态。",
+        "static_text": "当前战斗状态。",
+        "source": "snapshot",
+        "delta": {},
+        "before": {},
+        "after": {},
+    }
+    strategy = {"strategy_name": "defect", "strategy_directives": {}}
+
+    def _say(step: dict) -> str:
+        return STS2CompanionEvaluator(None).evaluate(
+            summary_context={
+                "summary_kind": "combat",
+                "payload": {
+                    **base_payload,
+                    "solver_plan": {"in_combat": True, "line": [{"turn": 1, "steps": [step]}]},
+                },
             },
-        },
-        situation_summary={
-            "kind": "combat",
-            "text": "当前战斗状态。",
-            "static_text": "当前战斗状态。",
-            "source": "snapshot",
-            "delta": {},
-            "before": {},
-            "after": {},
-        },
-        strategy_context={
-            "strategy_name": "defect",
-            "strategy_directives": {},
-        },
-    )
+            situation_summary=situation,
+            strategy_context=strategy,
+        )["suggestion"]
 
-    assert "Strike" in result["suggestion"]
-    assert "Louse" in result["suggestion"]
-    assert "理由：" in result["suggestion"]
+    # ① 求解器指定 0 号敌人 ⇒ 必须念出名字
+    with_target = _say(
+        {"kind": "play_card", "card_id": "STRIKE", "card_name": "Strike", "target_index": 0}
+    )
+    assert "Strike" in with_target
+    assert "Louse" in with_target, f"指定了目标却没念：{with_target!r}"
+
+    # ② target_index=None ⇒ 不许念目标（曾是缺陷）
+    none_target = _say(
+        {"kind": "play_card", "card_id": "DEFEND", "card_name": "Defend", "target_index": None}
+    )
+    assert "Defend" in none_target
+    assert "Louse" not in none_target, f"★ target_index=None 却编造了目标：{none_target!r}"
+
+    # ③ 根本没有 target_index 键 ⇒ 同样不许念目标
+    no_key = _say({"kind": "play_card", "card_id": "DEFEND", "card_name": "Defend"})
+    assert "Defend" in no_key
+    assert "Louse" not in no_key, f"★ 缺 target_index 键却编造了目标：{no_key!r}"
 
 
 @pytest.mark.unit
@@ -360,7 +478,23 @@ def test_companion_evaluator_shop_relic_does_not_default_to_first_item_without_p
         },
     )
 
-    assert result["suggestion"] == "建议优先考虑高价值购买或删牌，而不是随手消费。"
+    # ★ 测试意图是「**没有偏好时不得默认指向第一件**」，与文案人称无关。
+    #   原来写死整句第三人称文案（"建议优先考虑高价值购买或删牌…"），
+    #   2026-10-19 i18n 第一人称改造后必然失效 —— 那是**测试耦合了文案**，
+    #   不是行为回归。⇒ 改为断言"意图"本身：
+    #     ① 不得提及任何一件具体商品
+    #     ② 必须给出通用口径（非空）
+    suggestion = result["suggestion"]
+    assert suggestion.strip(), "通用口径不能为空"
+    for name in ("Burning Blood", "Frozen Core"):
+        assert name not in suggestion, (
+            f"没有偏好时不得默认指向具体商品，实际提到了 {name}：{suggestion!r}"
+        )
+    # ★ 顺带钉住第一人称口径：不得出现旁白式"建议…"转达口气
+    for forbidden in ("建议", "玩家"):
+        assert forbidden not in suggestion, (
+            f"商店口径必须是猫娘自述，不得出现旁白词「{forbidden}」：{suggestion!r}"
+        )
 
 
 

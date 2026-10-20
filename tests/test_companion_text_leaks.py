@@ -171,7 +171,7 @@ def test_display_name_keeps_chinese_and_splits_camel_case() -> None:
 
 @pytest.mark.unit
 def test_enemy_intent_prefers_structured_data_with_damage() -> None:
-    """有 `intents[]` 就说「攻击 9」—— 这是观众真看得懂的信息。"""
+    """有 `intents[]` 就说「攻击 9」—— 这是真看得懂的信息。"""
     payload_enemy = {"name": "树叶史莱姆（中）", "intent": "CLUMP_SHOT"}
     raw_enemy = {"intents": [{"intent_type": "Attack", "damage": 9, "hits": 1, "total_damage": 9}]}
     assert _enemy_intent_label(payload_enemy, raw_enemy) == "攻击 9"
@@ -288,5 +288,5 @@ def test_instant_line_speaks_intent_in_chinese() -> None:
     assert "攻击 12" in text, text
     assert "FRAIL_SPORE" not in text, text
     assert "UNSET_MOVE" not in text, text
-    # 「还没决定」的敌人只留名字，不给观众念一个哨兵值。
+    # 「还没决定」的敌人只留名字，不念一个哨兵值出来。
     assert "蛮兽" in text and "蛮兽/" not in text, text

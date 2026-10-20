@@ -35,6 +35,7 @@ using MegaCrit.Sts2.Core.Nodes.Screens.Shops;
 using MegaCrit.Sts2.Core.Nodes.Screens.Timeline;
 using MegaCrit.Sts2.Core.Nodes.Screens.Timeline.UnlockScreens;
 using MegaCrit.Sts2.Core.Nodes.Screens.TreasureRoomRelic;
+using MegaCrit.Sts2.Core.Nodes.Events.Custom.CrystalSphere;
 using MegaCrit.Sts2.Core.Nodes.TopBar;
 using MegaCrit.Sts2.Core.Nodes.Rooms;
 using MegaCrit.Sts2.Core.Runs;
@@ -121,6 +122,7 @@ internal static class GameActionService
             "open_chest" => ExecuteOpenChestAsync(),
             "choose_treasure_relic" => ExecuteChooseTreasureRelicAsync(request),
             "choose_event_option" => ExecuteChooseEventOptionAsync(request),
+            "divine_crystal_sphere" => ExecuteDivineCrystalSphereAsync(request),
             "choose_capstone_option" => ExecuteChooseCapstoneOptionAsync(request),
             "choose_bundle" => ExecuteChooseBundleAsync(request),
             "confirm_bundle" => ExecuteConfirmBundleAsync(),
@@ -2271,6 +2273,245 @@ internal static class GameActionService
     }
 
     /// <summary>
+    /// 水晶球"占卜"子屏（`NCrystalSphereScreen`）的**揭格子**动作。
+    ///
+    /// 为什么需要它：这一屏既不是 `NEventRoom`（所以 `choose_event_option` 不管用），
+    /// 进小游戏后 `EventSynchronizer.GetLocalEvent()` 也不再有可选项 —— 屏上真正的可操作对象
+    /// 是 `CrystalSphereMinigame.cells[,]`（11x11）。屏名被 `ResolveScreenFromStaticRoom()`
+    /// 兜底成 "EVENT"，于是「名字说有事件、动作却一个都没有」，整局永久卡死。
+    ///
+    /// ★ 实现刻意**对齐游戏自己的 `CrystalSphereScreenHandler`**（已反编译其 IL，
+    ///   见 .dsh-artifacts/_t33_PROBE-SUMMARY.md）：它也是拿 `%Cells` 下的
+    ///   `NCrystalSphereCell` 节点、发 `SignalName.Released`，而不是像素/坐标点击。
+    ///   这里复用同一条具名节点路径，所以不会随版本漂移。
+    ///
+    /// 参数：复用 `option_index` 作为**格子序号** `y * grid_width + x`（不新增请求字段，
+    /// 避免动到插件与 mod 之间的请求协议）。不传则让游戏自己挑一格（同官方 handler 的随机行为）。
+    /// </summary>
+    private static async Task<ActionResponsePayload> ExecuteDivineCrystalSphereAsync(ActionRequest request)
+    {
+        var currentScreen = ActiveScreenContext.Instance.GetCurrentScreen();
+        var screen = GameStateService.ResolveScreen(currentScreen);
+
+        if (currentScreen is not Node root || !currentScreen.GetType().Name.Contains("CrystalSphere"))
+        {
+            throw new ApiException(409, "invalid_action", "Action is not available in the current state.", new
+            {
+                action = "divine_crystal_sphere",
+                screen
+            });
+        }
+
+        // 官方 handler 用的是 `%Cells` 具名节点容器。
+        var cellsContainer = root.GetNodeOrNull<Control>("%Cells");
+        if (cellsContainer == null)
+        {
+            throw new ApiException(503, "state_unavailable", "Crystal sphere cells container (%Cells) not found.", new
+            {
+                action = "divine_crystal_sphere",
+                screen
+            }, retryable: true);
+        }
+
+        var clickable = new List<NCrystalSphereCell>();
+        CollectClickableCells(cellsContainer, clickable);
+        if (clickable.Count == 0)
+        {
+            throw new ApiException(409, "invalid_target", "No clickable crystal sphere cells remain.", new
+            {
+                action = "divine_crystal_sphere",
+                screen
+            });
+        }
+
+        NCrystalSphereCell target;
+        if (request.option_index is int idx)
+        {
+            if (idx < 0 || idx >= clickable.Count)
+            {
+                throw new ApiException(409, "invalid_target", "cell index is out of range.", new
+                {
+                    action = "divine_crystal_sphere",
+                    cell_index = idx,
+                    cell_count = clickable.Count
+                });
+            }
+
+            target = clickable[idx];
+        }
+        else
+        {
+            target = clickable[0];
+        }
+
+        // ★★ 序号 ↔ 坐标的**权威映射**就在此处。
+        //   `CollectClickableCells` 是按**场景树节点顺序**递归的，
+        //   而 `BuildCrystalSpherePayload.candidates` 是按 `cells[,]` 的**行优先**顺序 ——
+        //   两者**顺序未必一致**（前者取决于 .tscn 里节点的排列）。
+        //   ⇒ 插件若拿 candidates[i] 当 option_index=i 的坐标去推理"揭了哪块"，可能错位。
+        //   ⇒ 这里把**真正被点的那一格**的坐标回给调用方，让日志/复盘有权威依据，
+        //     而不是让插件靠顺序去猜（CANON §23：「枚举要给出有哪些可能」，
+        //     但"序号代表哪一格"必须由**持有序号解释权的一方**说明）。
+
+        // ★★★ 必须调 `ForceClick()`，**不是**单独发 `Released` 信号。
+        //
+        //   【为什么】实测（2026-10-20 07:03，run C6CM8CZRR9KQ / act1 / floor23）：
+        //   只发 `EmitSignal(NClickableControl.SignalName.Released)` 时，
+        //   序号 0..96 / 102 全部返回 HTTP 200 且 **cells_hidden 恒为 97、divinations_left 恒为 3**，
+        //   连发 5 次 + 等 10 秒仍无变化 ⇒ 信号发出去了但**没人接**。
+        //
+        //   【真因】`NClickableControl.ForceClick()` 的反编译 IL 是：
+        //       callvirt NClickableControl.OnRelease
+        //       ldsfld   SignalName.Released
+        //       call     GodotObject.EmitSignal
+        //   ⇒ 官方点击其实是【两步】：先 `OnRelease()`（把按钮内部状态从"按下"翻到"弹起"），
+        //     **再**发 `Released` 信号。我只做了第二步 ⇒ 按钮状态机没走完 ⇒ 信号无效。
+        //
+        //   【权威依据】游戏自己的 `AutoSlay.Helpers.UiHelper.Click(NClickableControl, Int32)`
+        //   的 `<Click>d__0.MoveNext` IL 只有两句实质内容：
+        //       callvirt NClickableControl.ForceClick
+        //       call     Task.Delay
+        //   ⇒ **官方自动化就是 ForceClick + 等**。本方法现在与它同款。
+        //     （我前一轮写"与官方同款：发 Released 信号"，那是**读错了 IL** ——
+        //       官方 handler 里那行 `EmitSignal(Node.SignalName.Released)` 存在，
+        //       但真正生效的路径是 UiHelper.Click → ForceClick。此处已更正。）
+        target.ForceClick();
+
+        // ★★ 序号 ↔ 坐标的**权威映射**必须在日志里能读到。
+        //   `CollectClickableCells` 按**场景树节点顺序**递归，
+        //   而 `BuildCrystalSpherePayload.candidates` 按 `cells[,]` 的**行优先**顺序 ——
+        //   两者顺序**未必一致** ⇒ 插件不能想当然认为 candidates[i] 就是 option_index=i 的坐标。
+        //   这里把**真正被点的那一格**打印出来，让日志/复盘有权威依据（而不是靠顺序去猜）。
+        var clickedX = GetNodeCellX(target);
+        var clickedY = GetNodeCellY(target);
+        try
+        {
+            Godot.GD.Print($"[nekospire] divine_crystal_sphere idx={request.option_index} " +
+                           $"count={clickable.Count} clicked=({clickedX},{clickedY})");
+        }
+        catch
+        {
+            // 日志失败绝不影响动作本身
+        }
+
+        var stable = await WaitForCrystalSphereProgressAsync(target, TimeSpan.FromSeconds(8));
+
+        return new ActionResponsePayload
+        {
+            action = "divine_crystal_sphere",
+            status = stable ? "completed" : "pending",
+            stable = stable,
+            message = stable
+                ? $"Revealed cell ({clickedX},{clickedY})."
+                : $"Click sent to cell ({clickedX},{clickedY}) but no visible progress yet.",
+            state = GameStateService.BuildStatePayload()
+        };
+    }
+
+    /// <summary>读 `NCrystalSphereCell.Entity.X`（场景节点 → 游戏实体）。失败返回 -1。</summary>
+    private static int GetNodeCellX(NCrystalSphereCell cell)
+        => GetReflectedIntOf(GetReflectedPropertyOf(cell, "Entity"), "X", -1);
+
+    /// <summary>读 `NCrystalSphereCell.Entity.Y`。失败返回 -1。</summary>
+    private static int GetNodeCellY(NCrystalSphereCell cell)
+        => GetReflectedIntOf(GetReflectedPropertyOf(cell, "Entity"), "Y", -1);
+
+    /// <summary>
+    /// 等到"这一揭真的生效了"或超时。
+    ///
+    /// ★ 原来只看 `previousCell.GetParent().GetChildCount()` —— **它永远不变**：
+    ///   格子在游戏过程中不会增删（官方 handler 是靠"可点格数变化"判断进度，
+    ///   因为官方**逐个剔除**已揭的格子；我们不动节点，所以那条路对我不适用）。
+    ///   实测后果：即使真的揭开了也会被判 `pending`（假阴性）。
+    ///
+    /// ⇒ 改为观察**真正的进度量**：
+    ///   · 该屏的 `_entity.DivinationCount`（每揭一次 -1，`:CellClicked` 里递减）；
+    ///   · 该格的 `IsHidden` 由 true 变 false；
+    ///   · 该格离开了树（被清掉）或屏被关掉。
+    ///   任一发生即视为"生效"。
+    /// </summary>
+    private static async Task<bool> WaitForCrystalSphereProgressAsync(Node clickedCell, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        var cellEntityBefore = GetReflectedPropertyOf(clickedCell, "Entity");
+        var divBefore = GetReflectedIntOf(cellEntityBefore, "DivinationCount", -1);
+        var hiddenBefore = SafeReadBoolOf(cellEntityBefore, "IsHidden");
+
+        while (DateTime.UtcNow < deadline)
+        {
+            await WaitForNextFrameAsync();
+
+            // ① 屏/格子没了 ⇒ 一定发生了变化
+            if (!GodotObject.IsInstanceValid(clickedCell))
+            {
+                return true;
+            }
+
+            // ② 该格已被揭开
+            if (hiddenBefore && !SafeReadBoolOf(cellEntityBefore, "IsHidden"))
+            {
+                return true;
+            }
+
+            // ③ 占卜次数变了（`CellClicked` 里 `DivinationCount--`）
+            var divNow = GetReflectedIntOf(cellEntityBefore, "DivinationCount", divBefore);
+            if (divBefore >= 0 && divNow != divBefore)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>反射取属性/字段（**复用 `GameStateService` 的实现**，不另起一套）。失败返回 null，不抛。</summary>
+    private static object? GetReflectedPropertyOf(object? target, string name)
+    {
+        if (target == null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return GameStateService.GetReflectedProperty(target, name)
+                   ?? GameStateService.GetReflectedField(target, name);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>反射取 int（失败返回 fallback）。用于跨程序集读 Godot 节点上的游戏对象。</summary>
+    private static int GetReflectedIntOf(object? target, string name, int fallback)
+    {
+        var v = GetReflectedPropertyOf(target, name);
+        return v is int i ? i : fallback;
+    }
+
+    /// <summary>反射取 bool（失败返回 false）。</summary>
+    private static bool SafeReadBoolOf(object? target, string name)
+        => GetReflectedPropertyOf(target, name) is bool b && b;
+
+    /// <summary>递归收集 `%Cells` 下可点的格子（沿用官方 handler 的 UiHelper.FindAll 语义）。</summary>
+    private static void CollectClickableCells(Node node, List<NCrystalSphereCell> found)
+    {
+        if (node is NCrystalSphereCell cell && cell.IsEnabled)
+        {
+            found.Add(cell);
+        }
+
+        foreach (var child in node.GetChildren())
+        {
+            if (child is Node n)
+            {
+                CollectClickableCells(n, found);
+            }
+        }
+    }
+
+    /// <summary>
     /// Waits for screen to leave NEventRoom (used after proceed).
     /// </summary>
     private static async Task<bool> WaitForEventScreenTransitionAsync(TimeSpan timeout)
@@ -4182,6 +4423,24 @@ internal static class GameActionService
         return finalScreen is NCardGridSelectionScreen || finalScreen is not NMerchantInventory;
     }
 
+    /// <summary>
+    /// 解析药水的目标；返回 null 表示"这瓶药不需要生物目标"。
+    ///
+    /// ★ 修复 D9（2026-10-19）：原实现把 <c>TargetType.AllEnemies</c> 等**非单目标**类型
+    /// 落入 <c>_ =&gt; potion.Owner.Creature</c> 兜底，于是把「玩家自己」当成了目标。
+    /// 游戏侧 <c>UsePotionAction.ExecuteAction</c> 对非单目标会走
+    /// <c>GetCreatureAsync(TargetId, ...)</c>，随后用 <c>PotionModel.IsValidTarget(creature)</c>
+    /// 校验 —— 对 <c>AllEnemies</c> 而言「玩家」是非法目标 ⇒ <c>Cancel()</c>，
+    /// 药水永不消耗；mod 的 <c>WaitForPotionUseTransitionAsync</c> 等满 10 秒后只回
+    /// <c>status="pending"</c>，插件误判为已执行 ⇒ 求解器反复给出同一条 <c>use_potion</c>
+    /// 建议 ⇒ 无限循环（实测单局 7347 次、5 小时 2 分）。
+    ///
+    /// ★ 判据与游戏保持一致（见 <c>PotionModel.IsValidTarget</c>）：
+    ///   <c>target == null</c> 时，只有 <c>TargetedNoCreature</c> 与非单目标类型合法。
+    ///   故**非单目标一律传 null**，而不是把自己塞进去。
+    /// ★ 游戏自身的 <c>PotionModel.EnqueueManualUse</c> 亦如此：先看
+    ///   <c>IsValidTarget(Owner.Creature)</c> 过不过，过才回填自己。
+    /// </summary>
     private static Creature? ResolvePotionTarget(ActionRequest request, CombatState? combatState, PotionModel potion)
     {
         return potion.TargetType switch
@@ -4189,8 +4448,40 @@ internal static class GameActionService
             TargetType.AnyEnemy => ResolvePotionEnemyTarget(request, combatState, potion),
             TargetType.AnyPlayer when GameStateService.PotionRequiresTarget(combatState, potion) => ResolvePotionPlayerTarget(request, combatState, potion),
             TargetType.TargetedNoCreature => null,
-            _ => potion.Owner.Creature
+            // ★ D9 修复：非单目标（AllEnemies / RandomEnemy / AllAllies / None / …）不需要生物目标。
+            //   `Self` 也归此类 —— 游戏 IsValidTarget(null) 对非单目标返回 true，
+            //   而 OnUse 内部自带 Owner.Creature，不看这个参数。
+            _ when !potion.TargetType.IsSingleTarget() => null,
+            // 单目标但未在上面覆盖（AnyPlayer 走显式选择、AnyAlly 等）⇒ 交给自愈逻辑。
+            _ => ResolvePotionFallbackTarget(combatState, potion),
         };
+    }
+
+    /// <summary>
+    /// 剩下这类「单目标但本服务没有显式解析分支」的药水（<c>AnyPlayer</c> 不需要显式选择、
+    /// <c>AnyAlly</c>、<c>Osty</c> …）。**只在自己确实是合法目标时才回填自己**，
+    /// 否则明确报错 —— 不允许再静默塞一个非法 target 让游戏侧 Cancel。
+    /// </summary>
+    private static Creature? ResolvePotionFallbackTarget(CombatState? combatState, PotionModel potion)
+    {
+        Creature owner = potion.Owner.Creature;
+        if (potion.IsValidTarget(owner))
+        {
+            return owner;
+        }
+
+        if (potion.IsValidTarget(null))
+        {
+            return null;
+        }
+
+        throw new ApiException(409, "invalid_target", "No valid target is available for the selected potion.", new
+        {
+            action = "use_potion",
+            potion_id = potion.Id.Entry,
+            target_type = potion.TargetType.ToString(),
+            in_combat = combatState != null
+        });
     }
 
     private static Creature ResolvePotionEnemyTarget(ActionRequest request, CombatState? combatState, PotionModel potion)

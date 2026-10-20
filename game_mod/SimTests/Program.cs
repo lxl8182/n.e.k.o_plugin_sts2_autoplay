@@ -1030,6 +1030,234 @@ internal static class SimTests
         Check(SimDiff.Diff(a, b).Count == 0, "canonicalized diff is order-insensitive");
     }
 
+    // ---- T40: card-side coverage classification (Game/Sim/SimCoverage.cs) -------------------
+    //
+    // Regression gate for the `coverage` payload the mod publishes. The defect being pinned down:
+    // Solver/CombatSolverFacade.cs used to compute
+    //     inferred    = PredictionGaps(compensated) + Forecast.ApproximationDetails   (enemy items!)
+    //     unsupported = PredictionGaps(!compensated) + Forecast.UnsupportedDetails   (enemy items!)
+    //     ignored     = 0
+    //     exact       = Math.Max(0, Snapshot.HandCount - inferred - unsupported)
+    // so with a live hand of ONE card the payload reported inferred = 7 (7 gaps about *other* models) and
+    // exact = 0 on every frame. The tests below fail if any of that comes back.
+
+    private static SimCoverageCard CovCard(string id, bool costsX = false, bool costsStarX = false,
+        bool unmodeled = false, bool approximated = false)
+        => new(id, costsX, costsStarX, unmodeled, approximated);
+
+    private static void TestCoverageOneCardHandIsNotSeven()
+    {
+        Console.WriteLine("[Coverage: 1-card hand with 7 non-card gaps => buckets sum to 1]");
+        // Measured 2026-10-20 13:03:09: live hand ['STOKE'], `warnings` held 7 `inferred:` entries.
+        var hand = new[] { CovCard("STOKE") };
+        var gaps = new[]
+        {
+            new SimCoverageGap("BASH", true),
+            new SimCoverageGap("ARMAMENTS", true),
+            new SimCoverageGap("RAGE", true),
+            new SimCoverageGap("SETUP_STRIKE", true),
+            new SimCoverageGap("SHRINK_POWER", true),
+            new SimCoverageGap("TUNGSTEN_ROD", true),
+            new SimCoverageGap("PHANTASMAL_GARDENER", true),
+        };
+
+        var s = SimCoverage.Summarize(hand, gaps, enemyApproximated: 5, enemyUnsupported: 2);
+        Check(s.IsKnown, "coverage report is known (hand was capturable)");
+        Check(s.HandCount == 1, $"denominator is the captured hand (1), got {s.HandCount}");
+        Check(s.Inferred == 0, $"gaps about other models do not raise card-side inferred (0), got {s.Inferred}");
+        Check(s.Unsupported == 0, $"gaps about other models do not raise card-side unsupported (0), got {s.Unsupported}");
+        Check(s.Exact == 1, $"the one hand card is exact (1), got {s.Exact}");
+        Check(s.Classified == 1, $"exact+inferred+unsupported+ignored == 1, got {s.Classified} (was 7 before T40)");
+        Check(s.IsConsistent, "four buckets partition the denominator");
+        Check(s.EnemyApproximated == 5 && s.EnemyUnsupported == 2,
+            "enemy forecast items are carried on their own fields (5/2)");
+    }
+
+    private static void TestCoverageEnemyItemsDoNotMoveCardSide()
+    {
+        Console.WriteLine("[Coverage: enemy forecast items never change card-side inferred]");
+        var hand = new[] { CovCard("STRIKE"), CovCard("DEFEND") };
+        var gaps = new[] { new SimCoverageGap("STRIKE", true) };   // STRIKE's own OnPlay was compensated
+
+        var withoutEnemy = SimCoverage.Summarize(hand, gaps);
+        var withEnemy = SimCoverage.Summarize(hand, gaps, enemyApproximated: 9, enemyUnsupported: 4);
+
+        Check(withoutEnemy.Inferred == 1 && withoutEnemy.Exact == 1,
+            $"baseline: inferred 1 / exact 1 (got {withoutEnemy.Inferred}/{withoutEnemy.Exact})");
+        Check(withEnemy.Inferred == withoutEnemy.Inferred,
+            $"enemy approximations do not change inferred ({withoutEnemy.Inferred} vs {withEnemy.Inferred})");
+        Check(withEnemy.Unsupported == withoutEnemy.Unsupported,
+            $"enemy unsupported intents do not change unsupported ({withoutEnemy.Unsupported} vs {withEnemy.Unsupported})");
+        Check(withEnemy.Exact == withoutEnemy.Exact && withEnemy.Classified == 2,
+            $"card-side buckets unchanged and still sum to the hand (2), got {withEnemy.Classified}");
+    }
+
+    private static void TestCoverageXCostCardIsIgnored()
+    {
+        Console.WriteLine("[Coverage: CostsX / CostsStarX cards are ignored, not exact]");
+        var hand = new[]
+        {
+            CovCard("STRIKE"),
+            CovCard("WHIRLWIND", costsX: true),
+            CovCard("STARBURST", costsStarX: true),
+        };
+        // An X-cost card is excluded from the search; a gap about it must not leak into unsupported
+        // either (precedence: ignored first, exactly like SimSolverPlan.cs:112).
+        var gaps = new[] { new SimCoverageGap("WHIRLWIND", false) };
+
+        var s = SimCoverage.Summarize(hand, gaps);
+        Check(s.Ignored == 2, $"both X-cost cards land in ignored (2), got {s.Ignored}");
+        Check(s.Exact == 1, $"only the plain card is exact (1), got {s.Exact}");
+        Check(s.Unsupported == 0, $"X-cost card's gap does not leak into unsupported (0), got {s.Unsupported}");
+        Check(s.Classified == 3, $"buckets sum to the hand (3), got {s.Classified}");
+        Check(SimCoverage.Classify(CovCard("WHIRLWIND", costsX: true), gaps) == SimCoverageClass.Ignored,
+            "Classify(X-cost card) == Ignored");
+    }
+
+    private static void TestCoverageUncompensatedWinsAndCountsOnce()
+    {
+        Console.WriteLine("[Coverage: uncompensated gap => unsupported, one card counted once]");
+        var hand = new[] { CovCard("SETUP_STRIKE") };
+        var gaps = new[]
+        {
+            new SimCoverageGap("SETUP_STRIKE", true),
+            new SimCoverageGap("SETUP_STRIKE", false),
+        };
+        var s = SimCoverage.Summarize(hand, gaps);
+        Check(s.Unsupported == 1, $"uncompensated card gap => unsupported (1), got {s.Unsupported}");
+        Check(s.Inferred == 0, $"not double-counted as inferred (0), got {s.Inferred}");
+        Check(s.Classified == 1, $"sum still equals the hand (1), got {s.Classified}");
+    }
+
+    private static void TestCoverageSimPipelinePath()
+    {
+        Console.WriteLine("[Coverage: Sim-pipeline flags go through the same classifier]");
+        var state = new SimState { MaxEnergy = 3, ActiveEnergy = 3 };
+        state.Players.Add(new SimCombatant(60, 80));
+        state.Enemies.Add(new SimCombatant(40, 40));
+        state.Hand.Add(new SimCard { Id = "STRIKE", Cost = 1 });
+        state.Hand.Add(new SimCard { Id = "STORM_OF_STEEL", Cost = 1, CostsX = true });
+        state.Hand.Add(new SimCard { Id = "SUMMONER", Cost = 1, SummonCardId = "MINION" });
+        state.Hand.Add(new SimCard { Id = "MYSTERY", Cost = 1, BehaviorUnmodeled = true });
+
+        var hand = new SimCoverageCard[state.Hand.Count];
+        for (var i = 0; i < hand.Length; i++) hand[i] = SimCoverage.FromSimCard(state.Hand[i]);
+
+        var s = SimCoverage.Summarize(hand, gaps: null);
+        Check(s.Exact == 1 && s.Inferred == 1 && s.Unsupported == 1 && s.Ignored == 1,
+            $"exact/inferred/unsupported/ignored = 1/1/1/1 (got {s.Exact}/{s.Inferred}/{s.Unsupported}/{s.Ignored})");
+        Check(s.Classified == state.Hand.Count,
+            $"Sim path buckets sum to the hand ({state.Hand.Count}), got {s.Classified}");
+    }
+
+    private static void TestCoverageUnknownHandIsMinusOne()
+    {
+        Console.WriteLine("[Coverage: an uncapturable hand is reported as unknown (-1), not as a fake 0]");
+        var s = SimCoverage.Summarize(hand: null, gaps: null, enemyApproximated: 3);
+        Check(!s.IsKnown, "report marked unknown");
+        Check(s.Exact == SimCoverageSummary.UnknownValue,
+            $"exact = {SimCoverageSummary.UnknownValue} (unknown), got {s.Exact}");
+        Check(!s.IsConsistent, "an unknown report never claims the partition invariant");
+        Check(s.EnemyApproximated == 3, "enemy count still carried separately");
+    }
+
+    // ---- T41: contracts the coverage-gap work depends on -------------------------------------
+    //
+    // These pin the *pure-model* contracts that the game-coupled transcriptions must satisfy. The
+    // transcriptions themselves (Solver/Prediction/CardOnPlaySupport*, Solver/Engine/.../OnPlay/*) reference
+    // MegaCrit types and are therefore not compilable here by design; they are verified by build + live
+    // sampling (see .dsh-artifacts/T41-COVERAGE-GAPS.md §4).
+
+    // (1) Summon contract. LEGION_OF_BONE ("所有玩家召唤6。", vars Summon=6) is transcribed as one
+    //     `SummonOsty(DynamicVars.Summon)` call — the same shape as Afterlife/Bodyguard/Reanimate in
+    //     CardOnPlaySupport.Batch043. The pure model's summon spelling is SimCard.SummonCardId, which
+    //     materialises exactly ONE card per play (SimResolver.cs:101-102) — it is NOT amount-scaled.
+    //     Pinning it means anyone turning it into an amount loop must do so deliberately.
+    private static void TestT41SummonPlacesExactlyOneCard()
+    {
+        Console.WriteLine("[T41 summon contract: one card per play, cost paid]");
+        var s = new SimState { MaxEnergy = 3, ActiveEnergy = 3 };
+        s.Players.Add(new SimCombatant(60, 80));
+        s.Enemies.Add(new SimCombatant(40, 40));
+        s.Hand.Add(new SimCard
+        {
+            Id = "LEGION_OF_BONE", Name = "Legion of Bone", Cost = 2, CardType = "Skill",
+            Target = SimTargetKind.Self, SummonCardId = "SUMMONED_MINION",
+        });
+
+        SimResolver.PlayCard(s, 0, null);
+        Check(s.ActiveEnergy == 1, $"cost 2 was paid (energy 3 -> 1), got {s.ActiveEnergy}");
+        Check(s.Hand.Count == 1 && s.Hand[0].Id == "SUMMONED_MINION",
+            $"one summoned card materialised in hand, got {s.Hand.Count} [{string.Join(",", s.Hand.ConvertAll(c => c.Id))}]");
+        Check(s.DiscardPile.Count == 1 && s.DiscardPile[0].Id == "LEGION_OF_BONE",
+            "the played card went to the discard pile");
+    }
+
+    // (2) X-cost vs fixed star cost. Only CostsX / CostsStarX are "ignored" (excluded from the search).
+    //     A FIXED star price (CLOAK_OF_STARS 1, DEVASTATE 4, SEVEN_STARS 7) is a normal, playable cost —
+    //     it must stay in the search. That is the reading the "5 X/star cards are all ignored" premise got
+    //     wrong, so the distinction gets a gate.
+    private static void TestT41FixedStarCostIsNotIgnored()
+    {
+        Console.WriteLine("[T41 coverage: only X / star-X is ignored; a fixed star price is playable]");
+        var hand = new[]
+        {
+            SimCoverage.FromSimCard(new SimCard { Id = "DEVASTATE", Cost = 1, StarCost = 4, CardType = "Attack", Damage = 35 }),
+            SimCoverage.FromSimCard(new SimCard { Id = "CLOAK_OF_STARS", Cost = 0, StarCost = 1, CardType = "Skill", Block = 7 }),
+            SimCoverage.FromSimCard(new SimCard { Id = "ERADICATE", CostsX = true, CardType = "Attack", Damage = 11 }),
+            SimCoverage.FromSimCard(new SimCard { Id = "STARDUST", CostsStarX = true, CardType = "Attack" }),
+            SimCoverage.FromSimCard(new SimCard { Id = "STRIKE_IRONCLAD", Cost = 1, CardType = "Attack", Damage = 6 }),
+        };
+
+        var summary = SimCoverage.Summarize(hand, gaps: null);
+        Check(summary.Ignored == 2, $"only ERADICATE + STARDUST are ignored (2), got {summary.Ignored}");
+        Check(summary.Exact == 3, $"fixed-star + plain cards stay in the search (3 exact), got {summary.Exact}");
+        Check(summary.Classified == hand.Length, $"buckets partition the hand ({hand.Length}), got {summary.Classified}");
+
+        // A fixed star price is really paid at play time => such a card is a real decision, not a no-op.
+        var s = new SimState { MaxEnergy = 3, ActiveEnergy = 3, ActiveStars = 7 };
+        s.Players.Add(new SimCombatant(60, 80));
+        s.Enemies.Add(new SimCombatant(40, 40));
+        s.Hand.Add(new SimCard
+        {
+            Id = "DEVASTATE", Name = "Devastate", Cost = 1, StarCost = 4, CardType = "Attack",
+            Target = SimTargetKind.AnyEnemy, Damage = 35,
+        });
+        SimResolver.PlayCard(s, 0, 0);
+
+        Check(s.ActiveStars == 3, $"star price 4 was paid (7 -> 3), got {s.ActiveStars}");
+        Check(s.Enemies[0].Hp == 5, $"Devastate dealt 35 (40 -> 5), got {s.Enemies[0].Hp}");
+    }
+
+    // (3) Monster move table necessity. An enemy with an EMPTY move table is silently harmless:
+    //     SimEnemy.RollMove returns the synthetic "idle" move and nothing happens. That is exactly why a
+    //     missing movement transcription under-models a fight without any error — hence the t41 audit of the
+    //     20 candidate monsters. The second half is the positive control (same path, one move => damage).
+    private static void TestT41EmptyMoveTableIsSilent()
+    {
+        Console.WriteLine("[T41 monsters: an empty move table silently does nothing (need a table)]");
+        var idle = MakeState();
+        SimResolver.NewTurn(idle);
+        idle.Enemies[0].Moves.Clear();
+        var hpBefore = idle.Players[0].Hp;
+        SimResolver.EndPlayerTurn(idle);
+        SimEnemy.RunEnemyTurn(idle);
+        Check(idle.Players[0].Hp == hpBefore,
+            $"enemy without a move table deals no damage (hp {hpBefore} -> {idle.Players[0].Hp})");
+
+        var armed = MakeState();
+        SimResolver.NewTurn(armed);
+        armed.Enemies[0].Moves.Clear();
+        var bite = new SimMonsterMove { MoveId = "BITE_MOVE" };
+        bite.Intents.Add(new SimIntent { Kind = SimIntentKind.Attack, Damage = 7 });
+        armed.Enemies[0].Moves.Add(bite);
+        var hp2 = armed.Players[0].Hp;
+        SimResolver.EndPlayerTurn(armed);
+        SimEnemy.RunEnemyTurn(armed);
+        Check(hp2 - armed.Players[0].Hp == 7,
+            $"positive control: the same path applies 7 damage once a move exists (lost {hp2 - armed.Players[0].Hp})");
+    }
+
     private static int Main()
     {
         TestNewTurn();
@@ -1068,6 +1296,15 @@ internal static class SimTests
         TestGameRng();
         TestTransientPowers();
         TestPayloadRoundTrip();
+        TestCoverageOneCardHandIsNotSeven();
+        TestCoverageEnemyItemsDoNotMoveCardSide();
+        TestCoverageXCostCardIsIgnored();
+        TestCoverageUncompensatedWinsAndCountsOnce();
+        TestCoverageSimPipelinePath();
+        TestCoverageUnknownHandIsMinusOne();
+        TestT41SummonPlacesExactlyOneCard();
+        TestT41FixedStarCostIsNotIgnored();
+        TestT41EmptyMoveTableIsSilent();
 
         Console.WriteLine();
         Console.WriteLine(_failures == 0 ? "ALL PASS" : $"{_failures} FAILURE(S)");

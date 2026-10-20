@@ -9,8 +9,11 @@
     <AssemblyName>SimTests</AssemblyName>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
   </PropertyGroup>
-  <!-- Link the pure Sim sources (they are game-type-free). Game-coupled files (SimBuild/SimCapture)
-       are excluded so this runs without sts2.dll. -->
+  <!-- Link the pure Sim sources (they are game-type-free) from the mod project itself. Game-coupled
+       files (SimBuild / SimCapture / SimSolverPlan) are excluded so this runs without sts2.dll.
+       T40: the old path was "..\neko_comm\Game\Sim\" — that directory does not exist (the sim sources
+       live in "..\nekospire\Game\Sim\"), so the whole gate failed with 15x CS2001 and the mod had no
+       runnable automated verification at all. -->
   <ItemGroup>
     <Reference Include="System.IO.Hashing">
       <HintPath>D:/Steam/steamapps/common/Slay the Spire 2/data_sts2_windows_x86_64/System.IO.Hashing.dll</HintPath>
@@ -18,20 +21,23 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="..\neko_comm\Game\Sim\SimGameRandom.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimPayload.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimState.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimCommand.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimResolver.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimDiff.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimReplay.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimRng.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimPower.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimIntents.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimBudget.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimSearch.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimOrb.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimRelic.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimOnPlay.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimGameRandom.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimPayload.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimState.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimCommand.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimResolver.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimDiff.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimReplay.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimRng.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimPower.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimIntents.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimBudget.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimSearch.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimOrb.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimRelic.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimOnPlay.cs" />
+    <!-- T40: the shared card-side coverage classifier (pure; the mod compiles the same file through
+         its default **/*.cs glob, so the gate tests the shipping logic, not a copy). -->
+    <Compile Include="..\nekospire\Game\Sim\SimCoverage.cs" />
   </ItemGroup>
 </Project>

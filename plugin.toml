@@ -80,7 +80,26 @@ enabled = true
 id = "main"
 title = "尖塔2陪玩"
 entry = "static/index.html"
-context = "sts2_autoplay"
+# ⚠️ 这里**不要**写 `context = "sts2_autoplay"`。
+#
+# 原值把它自己插件的 id 当成了"UI context 提供者"的名字，但本插件
+# **从未注册**任何 context provider，于是宿主的每次查询都失败：
+#
+#     GET /plugin/sts2_autoplay/hosted-ui/context?kind=panel&id=main
+#     -> warnings: [{"code":"ui_context_failed",
+#                    "message":"UI context 'sts2_autoplay' not found"}]
+#     -> actions = []   entries = []
+#
+# 连锁后果：`call_surface_action` 在 `_resolve_authorized_action_entry_id`
+# 拿不到任何 action ⇒ 从外部调用 entry（例如 sts2_start_autoplay）一律失败。
+#
+# 留空则走 `ui_query_service.py:1563-1564` 的回退：
+#     context_id = surface.get("context") or surface.get("id")  ->  "main"
+# 这与 `app_launcher`（同样是 static panel，context 为空）实际能列出
+# 12 个 entry 的行为一致。
+#
+# ★ 教训：**声明一个不存在的 context 比不声明更糟** —— 不声明会回退，
+#   声明错了会让整次查询失败，且只在 warnings 里留一行，很难注意到。
 permissions = [
     "state:read",
     "action:call",
@@ -104,7 +123,7 @@ permissions = ["state:read"]
 id = "history"
 title = "自动游玩历史"
 entry = "static/history.html"
-context = "sts2_autoplay"
+# 同上：不要声明未注册的 context（reasoning 见上一条 panel）。
 permissions = [
     "state:read",
 ]

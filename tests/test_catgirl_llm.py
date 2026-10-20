@@ -235,11 +235,24 @@ class FakeClient:
 
 
 @pytest.mark.unit
-def test_maybe_emit_catgirl_llm_disabled_falls_back() -> None:
+def test_maybe_emit_catgirl_llm_disabled_falls_back(monkeypatch) -> None:
+    """LLM 关掉时仍要推启发式文本。
+
+    这里**把头像 HTTP 打桩成瞬时返回**，而不是靠 ``sleep`` 等它 —— 真实取头像要 331~685ms，
+    原先的 200ms 预算压不住，于是这条用例长期假红（实测：真实路径 685/336/331ms，
+    打桩后 0.07ms 即过）。用 sleep 兜住真实网络是脆弱的，涨超时也只是把偶发变偶发；
+    头像本身已由 ``test_danmaku_disabled_blocks_llm_avatar_and_post_entirely`` 等用例单独覆盖。
+    """
     client = FakeClient()
     service = STS2AutoplayService(DummyLogger(), lambda p: None, lambda **k: None)
     service._client = client
     service._catgirl_llm_enabled = False
+
+    async def fake_avatar_fast() -> str | None:
+        return None
+
+    monkeypatch.setattr(service, "_catgirl_avatar_base64", fake_avatar_fast)
+    monkeypatch.setattr(service, "_cached_avatar_base64", lambda: None)
 
     async def go() -> None:
         service._maybe_emit_catgirl_llm(
@@ -247,7 +260,11 @@ def test_maybe_emit_catgirl_llm_disabled_falls_back() -> None:
             {"should_comment": True, "primary_message": "建议先防御。"},
             {"message": "建议先防御。"},
         )
-        await asyncio.sleep(0.2)  # let the fire-and-forget push task run (it awaits a localhost avatar fetch)
+        # 只等"这个 fire-and-forget 任务被调度完"，不再依赖真实网络耗时。
+        for _ in range(50):
+            if client.pushed:
+                break
+            await asyncio.sleep(0.01)
 
     asyncio.run(go())
     assert client.pushed == [("建议先防御。", "catgirl")]

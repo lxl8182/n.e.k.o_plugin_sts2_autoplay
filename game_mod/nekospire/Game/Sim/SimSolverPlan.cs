@@ -99,22 +99,26 @@ namespace NekoComm.Game
             return turns.ToArray();
         }
 
-        // Coarse coverage: exact = field-driven simple card; inferred = behaviour card (summon/DSL)
-        // not fully modelled; ignored = X/star-X cost skipped from search.
         // CombatSolver-style four-way coverage: exact (fully simulated) / inferred (an effect is
         // approximated or a behaviour is not fully represented) / unsupported (a behaviour card with no
-        // table entry — the engine cannot simulate it) / ignored (X/star-X cost). Honest per-hand report.
+        // table entry — the engine cannot simulate it) / ignored (X/star-X cost, excluded from search).
+        //
+        // T40 — the semantics are now owned by ONE place, Game/Sim/SimCoverage.cs, shared with
+        // Solver/CombatSolverFacade.cs, so the two `coverage` producers cannot drift apart again:
+        //   · DENOMINATOR = the current hand (`sim.Hand`), never a count of gap/warning entries.
+        //   · NUMERATOR   = one bucket per hand card => exact+inferred+unsupported+ignored == hand size.
+        //   · PRECEDENCE  = ignored (X/star-X) > unsupported (BehaviorUnmodeled) > inferred
+        //                   (SummonCardId / OnPlayScript / ApproximateEffect) > exact.
+        // The CombatSolver path feeds the same classifier its LIVE hand plus card-side prediction gaps;
+        // enemy forecast items are never part of either count.
         private static (int exact, int inferred, int unsupported, int ignored) ClassifyCoverage(SimState sim)
         {
-            var exact = 0; var inferred = 0; var unsupported = 0; var ignored = 0;
-            foreach (var c in sim.Hand)
-            {
-                if (c.CostsX || c.CostsStarX) ignored++;
-                else if (c.BehaviorUnmodeled) unsupported++;   // behaviour card, no transcription
-                else if (c.SummonCardId != null || c.OnPlayScript != null || c.ApproximateEffect) inferred++;
-                else exact++;
-            }
-            return (exact, inferred, unsupported, ignored);
+            var hand = new SimCoverageCard[sim.Hand.Count];
+            for (var i = 0; i < hand.Length; i++)
+                hand[i] = SimCoverage.FromSimCard(sim.Hand[i]);
+
+            SimCoverageSummary summary = SimCoverage.Summarize(hand, gaps: null);
+            return (summary.Exact, summary.Inferred, summary.Unsupported, summary.Ignored);
         }
 
         private static string[] BuildWarnings(SimState sim)
