@@ -9,7 +9,7 @@
   的 nekospire_ui/ 资产目录（catgirl.png 等由 NekoUi.LoadUserTexture 读取）。
 
 .EXAMPLE
-  # 缺省即部署到 3794941932（D:/Steam 的 STS2 订阅）
+  # 缺省即部署到 3794941932（F:/steam 的 STS2 订阅）
   .\scripts\deploy-workshop.ps1
 
 .PARAMETER Configuration
@@ -22,7 +22,7 @@
   Godot console exe（用于打包 PCK）。默认仓库内置 Godot_v4.5.1-stable_win64_console.exe。
 
 .PARAMETER SteamRoot
-  Steam 安装根目录。默认 D:/Steam。
+  Steam 安装根目录。默认 F:/steam。
 
 .PARAMETER WorkshopAppId
   默认 2868840（杀戮尖塔 2）。
@@ -37,7 +37,7 @@ param(
     [string]$Configuration = "Release",
     [string]$ProjectRoot = "",
     [string]$GodotExe = "",
-    [string]$SteamRoot = "D:/Steam",
+    [string]$SteamRoot = "F:/steam",
     [int]$WorkshopAppId = 2868840,
     [string]$WorkshopItemId = "3794941932",
     [string]$UploadContentDir = ""
@@ -56,7 +56,7 @@ if (-not (Test-Path $GodotExe)) {
 }
 # STS2_DATA_DIR 指向真实游戏数据目录，否则 CS0246。
 if ([string]::IsNullOrWhiteSpace($env:STS2_DATA_DIR)) {
-    $env:STS2_DATA_DIR = "D:/Steam/steamapps/common/Slay the Spire 2/data_sts2_windows_x86_64"
+    $env:STS2_DATA_DIR = "F:/steam/steamapps/common/Slay the Spire 2/data_sts2_windows_x86_64"
 }
 
 $mod = "nekospire"
