@@ -8,7 +8,7 @@ REM  ¿ÇÆô¶¯ºó»á×Ô¼ºÉ¨µ½ÒÑÔÚÅÜµÄÔ´Âëºó¶Ë²¢ attach£¨¸´ÓÃ£©£¬²»ÁíÆğËŞÖ÷½ø³Ì¡£
 REM
 REM  ÓÃ·¨Ò»£¨ÍÆ¼ö£¬Steam Æô¶¯ÏîÒ»¼ü£©£º
 REM    Steam ¡ú ¿â ¡ú N.E.K.O ¡ú ÓÒ¼ü¡¸ÊôĞÔ¡¹¡ú¡¸Í¨ÓÃ¡¹¡ú Æô¶¯Ñ¡Ïî£¬Ìî£º
-REM      cmd /c "E:\job\code\projectcodex\temp\nekospire\scripts\start-neko-source-shell.cmd" %command%
+REM      cmd /c "F:\game\projectNEKO\plugin\nekospire\scripts\start-neko-source-shell.cmd" %command%
 REM    Ö®ºóµã Steam ÀïµÄ¡¸¿ªÊ¼ÓÎÏ·¡¹¼´µÈÓÚ£ºÏÈÆğÔ´Âëºó¶Ë ¡ú ÔÙ¿ª×À³è¿Ç¡£
 REM
 REM  ÓÃ·¨¶ş£ºÖ±½ÓË«»÷±¾½Å±¾£¨µÈ¼ÛÓÚÓÃ·¨Ò»£¬¿ÇÂ·¾¶ÓÃÏÂÃæ NEKO_SHELL Ä¬ÈÏÖµ£©¡£
@@ -34,7 +34,7 @@ REM       Æô¶¯Ë²¼ä openapi Ê×´ÎÉú³É¿ÉÄÜ³¬¹ıÌ½Õë³¬Ê±£¬ÄÃµ½¿ÕÏìÓ¦»áÎó±¨È±Â·ÓÉµ¼ÖÂ²
 REM    4. Æô¶¯/Ê§°Ü½á¹û×·¼Óµ½ logs\start-shell.log£¬Steam Æô¶¯Ê±¿ØÖÆÌ¨Ò»ÉÁ¶ø¹ıÒ²ÄÜ²é¡£
 REM ============================================================================
 
-if not defined NEKO_SRC             set "NEKO_SRC=F:\game\NEKO-src"
+if not defined NEKO_SRC             set "NEKO_SRC=F:\game\projectNEKO\N.E.K.O"
 if not defined NEKO_SHELL           set "NEKO_SHELL=F:\steam\steamapps\common\N.E.K.O\N.E.K.O.exe"
 if not defined NEKO_HEALTH          set "NEKO_HEALTH=http://127.0.0.1:48911/health"
 if not defined NEKO_WAIT_SECONDS    set "NEKO_WAIT_SECONDS=180"
