@@ -49,15 +49,25 @@ if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
     $ProjectRoot = (Resolve-Path (Join-Path $scriptRoot "..")).Path
 }
 if ([string]::IsNullOrWhiteSpace($GodotExe)) {
-    $GodotExe = Join-Path $ProjectRoot "Godot_v4.5.1-stable_win64.exe/Godot_v4.5.1-stable_win64_console.exe"
+    $bundled = Join-Path $ProjectRoot "Godot_v4.5.1-stable_win64.exe/Godot_v4.5.1-stable_win64_console.exe"
+    if (Test-Path $bundled) {
+        $GodotExe = $bundled
+    }
+    else {
+        # 仓库里没有内置 Godot 时，退回 PATH 里的 godot（例如 E:\job\Godot\godot.cmd）。
+        $godotCmd = Get-Command godot -ErrorAction SilentlyContinue
+        if ($godotCmd) { $GodotExe = $godotCmd.Source }
+    }
 }
-if (-not (Test-Path $GodotExe)) {
-    throw "Godot exe not found: $GodotExe"
+if (-not $GodotExe -or -not (Test-Path $GodotExe)) {
+    throw "Godot exe not found: $GodotExe（可放回 game_mod/Godot_v4.5.1-stable_win64.exe/，或把 godot 加进 PATH）"
 }
 # STS2_DATA_DIR 指向真实游戏数据目录，否则 CS0246。
 if ([string]::IsNullOrWhiteSpace($env:STS2_DATA_DIR)) {
     $env:STS2_DATA_DIR = "F:/steam/steamapps/common/Slay the Spire 2/data_sts2_windows_x86_64"
 }
+# csproj 用 $(SteamRoot) 定位 RitsuLib 的引用 props；PowerShell 参数不会自动变成 MSBuild 属性。
+$env:SteamRoot = $SteamRoot
 
 $mod = "nekospire"
 $csproj = Join-Path $ProjectRoot "nekospire/nekospire.csproj"
