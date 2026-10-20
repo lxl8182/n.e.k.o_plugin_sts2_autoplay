@@ -8,30 +8,34 @@
     <RootNamespace>SimTests</RootNamespace>
     <AssemblyName>SimTests</AssemblyName>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <Sts2DataDirFromEnv>$([System.Environment]::GetEnvironmentVariable('STS2_DATA_DIR'))</Sts2DataDirFromEnv>
+    <Sts2DataDir Condition="'$(Sts2DataDir)' == '' and '$(Sts2DataDirFromEnv)' != ''">$(Sts2DataDirFromEnv)</Sts2DataDir>
+    <Sts2DataDir Condition="'$(Sts2DataDir)' == ''">C:/Program Files (x86)/Steam/steamapps/common/Slay the Spire 2/data_sts2_windows_x86_64</Sts2DataDir>
   </PropertyGroup>
-  <!-- Link the pure Sim sources (they are game-type-free). Game-coupled files (SimBuild/SimCapture)
-       are excluded so this runs without sts2.dll. -->
+  <!-- Link the pure Sim sources from the current mod tree (they are game-type-free). Game-coupled
+       files (SimBuild/SimCapture) are excluded so this runs without sts2.dll. -->
+  <!-- Run: see the command in Program.cs header. -->
   <ItemGroup>
     <Reference Include="System.IO.Hashing">
-      <HintPath>D:/Steam/steamapps/common/Slay the Spire 2/data_sts2_windows_x86_64/System.IO.Hashing.dll</HintPath>
+      <HintPath>$(Sts2DataDir)/System.IO.Hashing.dll</HintPath>
       <Private>true</Private>
     </Reference>
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="..\neko_comm\Game\Sim\SimGameRandom.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimPayload.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimState.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimCommand.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimResolver.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimDiff.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimReplay.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimRng.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimPower.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimIntents.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimBudget.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimSearch.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimOrb.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimRelic.cs" />
-    <Compile Include="..\neko_comm\Game\Sim\SimOnPlay.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimGameRandom.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimPayload.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimState.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimCommand.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimResolver.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimDiff.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimReplay.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimRng.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimPower.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimIntents.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimBudget.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimSearch.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimOrb.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimRelic.cs" />
+    <Compile Include="..\nekospire\Game\Sim\SimOnPlay.cs" />
   </ItemGroup>
 </Project>

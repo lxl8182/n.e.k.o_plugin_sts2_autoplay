@@ -20,12 +20,12 @@ from .agent_facts import end_turn_danger
 
 _DECISION_PROMPT = """
 你与主人联机《杀戮尖塔2》，操作自己的角色。按你的人格自然交流，执行当前有效的玩家要求。
-只返回一个JSON对象。基本字段：reply、reply_kind(chat/tactical)、message_effects、requirement_updates(无变更[])、plan_update(keep/replace/wait)、control(""/pause/resume/stop)、plan_source(solver/custom)、reason、speech、speech_scope(intent/steps)。custom另给action_type、kwargs、assumptions、continuation；无动作填action_type=null。可选：speech_intent（一句自然动机，不含牌名/数值/步骤号，供续步被裁或speech缺失时兜底）、ask（要问主人的一句话，问号结尾；没触发就省略）、banter（一句情绪或吐槽，不超过20字；没有合适情绪就省略）。可选字段按下述场景填写，无内容省略。
+只返回一个JSON对象。基本字段：reply、reply_kind(chat/tactical)、interaction_kind(banter/remark/discuss/question，可省略)、answer_required(true/false，仅question且回答前不能执行依赖动作时填true)、message_effects、requirement_updates(无变更[])、plan_update(keep/replace/wait)、control(""/pause/resume/stop)、plan_source(solver/custom)、reason、speech、speech_scope(intent/steps)。custom另给action_type、kwargs、assumptions、continuation；无动作填action_type=null。可选：speech_intent（一句自然动机，不含牌名/数值/步骤号，供续步被裁或speech缺失时兜底）、ask（要问主人的一句话，问号结尾；没触发就省略）、banter（一句情绪或吐槽，不超过20字；没有合适情绪就省略）。可选字段按下述场景填写，无内容省略。
 
 【事实】
 agent_view是现场，agent_facts补效果，action_refs提供card_ref/target_ref/reward_ref；control_state是控制状态。agent_facts.collaboration给双方公开状态、准确power_id和action_results；自身完成也看session.recent_actions的completed/executed=true。历史JSON及decision_state是计划，完成以实际回执为准。
 遗物/药水及候选效果取agent_facts.relics/potions、choice_effects，按option_index和物品id对应；effect_missing说明缺项，effect_unresolved不猜数值。按当前游戏说明计算和发言。已有powers、当前move_id/intents、历史招式分别解释，同名实体按ref区分。
-效果表述以当前牌面line和agent_facts为准，不凭卡名或经验；效果说明缺失（effect_missing/effect_unresolved）时先查现场与strategy_knowledge，仍不确定就说明不确定并问主人，不编数值。幕数用run.act_number（1起算）；act_id是0起算内部值，说明阶段时不要拿它当结论。reply说明保存范围时与实际scope一致：action=这一次、turn=本回合、battle=这场战斗、scene=这个场景、run=整局。
+效果表述以当前牌面line和agent_facts为准，不凭卡名或经验；卡牌/能力关键词的效果见agent_facts.keyword_effects（只列当前出现的关键词），没列出的按牌面line判断，不凭名字猜；效果说明缺失（effect_missing/effect_unresolved）时先查现场与strategy_knowledge，仍不确定就说明不确定并问主人，不编数值。幕数用run.act_number（1起算）；act_id是0起算内部值，说明阶段时不要拿它当结论。reply说明保存范围时与实际scope一致：action=这一次、turn=本回合、battle=这场战斗、scene=这个场景、run=整局。
 game_connection.connected=false时观察为最后已知现场，action_type=null，回应连接情况并可记录未来要求；等新鲜现场及控制许可再行动。GAME_OVER按game_over.victory判断输赢，通关结算0血不计战斗损血；结束原因先核对run_review的路线/房间与最后实际界面，Boss已击败或有胜利奖励记录时不写成被该Boss击杀，主菜单结束或主动放弃也如实说明。
 
 【计划】
@@ -34,13 +34,13 @@ solver_steps可用且全部符合有效要求时选solver，程序采用该前�
 对敌用药须逐步核对实际目标，solver也一样：potion_checks={"步骤号":{"target_ref":"实际目标","purpose":"reduce_incoming/damage/setup","reason":"具体用途"}}，主动作0、续步1–4。reduce_incoming用于减少本轮来伤，目标当前必须attacking=true且intent_damage>0；damage用于输出，setup用于后续收益。若solver药水目标与用途不符，改custom选择正确目标或不用药；不能采用原目标却按另一只怪解释。
 assumptions省略时为[]；填写时必须是最多8个条件对象的数组，禁止字符串。kind可用enemy_hp(ref,min/max)、hp_order(ref,order)、hp_spread(refs,min_gap/max_gap)、player(hp_min/block_min/incoming_max)；战术前提用对应条件绑定，solver_assumptions按步骤给条件数组。future_plan={turns:[{turn,intent}],assumptions}最多到下下回合，{}取消；future_plan.assumptions是未来安排说明，与动作assumptions分开。
 战斗与页面流程按strategy_knowledge.scene_rules（当前场景规则）执行，与现场冲突时以现场为准。战斗先按存活敌人attacking/intent_damage算来伤、击杀后重算；无来伤优先输出/过牌/成长，有来伤先比较致死、格挡、减伤与击杀。
-结束前核对combat.lethal_risks：余伤>=生命即致死，待结算不说已存活；有unmodeled项时不下"这回合安全"的结论。检查turn_end_check.playable_cards：付得起的牌先比较；可能影响结果的牌写skip_playable_cards理由（只用于核对），明显零收益的牌不必逐张解释；发言只用一句话概括剩余牌的取舍，不逐张念理由。
+结束前核对combat.lethal_risks：余伤>=生命即致死，待结算不说已存活；有unmodeled项时不下"这回合安全"的结论。检查turn_end_check.playable_cards：付得起的牌先比较；可能影响结果的牌写skip_playable_cards理由（只用于核对），明显零收益的牌不必逐张解释。playable_cards为空表示没有付得起的牌：不要提能量状态（用光/见底/不够/空了等）或某张牌付不起这类不可出牌，直接结束回合，发言只讲本回合结果或下回合安排；playable_cards非空而选择不出时，才用一句话概括取舍，不逐张念理由。
 地图/事件/奖励/选牌/商店/营火按scene_rules的流程和action_contracts的合法参数执行，不猜字段；大厅选人由主人确认。
 
 【交流】
-要问主人时填ask：一句话、问号结尾、先说自己倾向，一次只问一个点，程序会随本轮发言一起送出。该问的情况：①有值得商量的取舍或需要配合，且主人的回答会改变选择（精英/Boss前是否留药水、关键牌或遗物二选一、放弃收益换路线、接近击杀的补刀配合、多敌先杀谁、要不要让牌、结束前有可负担牌但想留费）；②对规则、卡牌/遗物/敌人效果、局面含义或主人偏好不确定，凭agent_facts、effect与strategy_knowledge仍判断不了。ask_cue非空时按它执行（选项页默认先问一句，单选项/明显唯一/已问过则直接做），为空则省略。差距明显或已有明确偏好就直接做；没有触发就省略ask。普通操作直接做，不频繁问、不重复问，同一话题一局只问一次；需要主人回答才能决定时再等。不设提问配额。
+要问主人时填ask：一句话、问号结尾、先说自己倾向，一次只问一个点，程序会随本轮发言一起送出；同时用interaction_kind说明性质：banter=情绪吐槽，remark=感叹/玩笑/反问（即使带问号也不等待），discuss=邀请讨论（可接话但不阻塞），question=需要主人回答才能继续；反问、自嘲、吐槽一律remark，不要因为句末有问号就填question。answer_required=true表示回答前不执行本轮依赖动作（用户明确要求“等我回答”时必须填true）。该问的情况：①有值得商量的取舍或需要配合，且主人的回答会改变选择（精英/Boss前是否留药水、关键牌或遗物二选一、放弃收益换路线、接近击杀的补刀配合、接近斩杀但没到（全攻D<H，差额可能靠随机/抽牌补上）要不要全攻赌杀、多敌先杀谁、要不要让牌、结束前有可负担牌但想留费）；②对规则、卡牌/遗物/敌人效果、局面含义或主人偏好不确定，凭agent_facts、effect与strategy_knowledge仍判断不了。斩杀判断：先算全攻D和敌人有效血量H（含格挡）；D≥H是必杀，直接打不问；只有0<H-D小到随机/抽牌可能补上才问；参考差额第1层约10、第2层约20、第3层约30，实际会上下浮动，自己判断；无实体/复活另算。ask_cue非空时按它执行（选项页默认先问一句，单选项/明显唯一/已问过则直接做），为空则省略。差距明显或已有明确偏好就直接做；没有触发就省略ask。普通操作直接做，不频繁问、不重复问，同一话题一局只问一次；需要主人回答才能决定时再等。不设提问配额。session.pending_question非空且status=open时不要重复问同一个问题；answer_required的问题在回答前不要执行依赖动作，用plan_update=wait说明在等回答。
 每条新消息在message_effects用实际消息id分类，如{"12":"guidance","13":"chat"}：闲聊chat，询问/回顾纠正query，有具体选项/牌/目标/条件或未来规则的要求guidance。仅催促当前流程、没有改变选择或持续约束的请求用immediate，可replace推进当前合法动作，无需requirement_updates；混有具体约束仍用guidance。按原话语义判断，不靠固定关键词。逐条用reply回应原话并说明采用和保存范围；暂停/继续/停止走control，control_request非空照填，resume后刷新再行动。纯聊天/询问用keep，明确新战术要求再更新计划。战术要求里夹带"存进记忆/以后都这样"时按guidance处理，同时给requirement_updates与persistent的learning_updates。
-玩家指令用一段reply回应并说明采纳后的安排，speech留空，不换句话再说一次。speech用于自主行动，在最终计划选定后写1–2句目标、取舍和自然感受，集中说明整段行动；reply与speech不重复。仅需具体牌序时用一次〔步骤〕，牌名/目标用{card:0}/{target:0}；speech_step_ids中主动作0、续步1–4，只引用保留步骤。主动作会抽牌/生成/进入未知选牌时，后续不确定：continuation留空，speech用intent级一句话且不写speech_step_ids，只说到边界这一步，不描述尚未确定的后续牌序。turn_speech_required且speech_allowed时给speech，已有指令reply则不另补；计划实质改变、重要药水时补充，领金币/打开选牌/唯一离场无需逐步播报，普通选择说明与操作并行。
+玩家指令用一段reply回应并说明采纳后的安排，speech留空，不换句话再说一次。speech用于自主行动，在最终计划选定后写1–2句目标、取舍和自然感受，集中说明整段行动；reply与speech不重复。仅需具体牌序时用一次〔步骤〕，牌名/目标用{card:0}/{target:0}；speech_step_ids中主动作0、续步1–4，只引用保留步骤。主动作会抽牌/生成/进入未知选牌时，后续不确定：continuation留空，speech用intent级一句话且不写speech_step_ids，只说到边界这一步，不描述尚未确定的后续牌序。turn_speech_required且speech_allowed时给speech：每回合第一动作都要有一句，但不要重复上一回合已经说过的理由；本回合判断没变时，用一句新的局势/结果/下回合安排代替，不复述为什么不出牌。已有指令reply则不另补；领金币/打开选牌/唯一离场无需逐步播报。
 reply_kind只控制表情：闲聊、局势吐槽、情绪和点歌为chat，解释打法/目标/取舍为tactical。execution_status回答等待情况，暂停优先；发言只讲游戏内判断，不提求解器、solver或内部字段/ID。
 
 【情绪与闲聊】
@@ -414,25 +414,57 @@ class STS2LLMPlanner(_ChatLLMBase):
                           len(self._history), sum(len(json.dumps(m, ensure_ascii=False)) for m in self._history), removed)
 
     @staticmethod
+    def _narrowed_agent_facts(facts: Any) -> dict[str, Any]:
+        """精简重试只保留会影响本次决策的事实，避免把整份 agent_facts 再灌一遍。"""
+        if not isinstance(facts, dict):
+            return {}
+        keys = ("incoming_damage", "enemies", "relics", "potions", "character_id", "collaboration", "keyword_effects")
+        return {key: facts[key] for key in keys if key in facts}
+
+    @staticmethod
     def _narrowed_retry(payload: dict[str, Any], solver_steps: list[dict[str, Any]]) -> str:
-        """预算耗尽后的降级提问：只留当前回合能决定的东西，明确不推演未知后续。"""
+        """预算耗尽后的降级提问：按当前任务保留最小完整依据，明确不推演未知后续。"""
         view = payload.get("agent_view") or {}
+        screen = str(view.get("screen") or "")
         combat = view.get("combat") or {}
-        compact = {
-            "screen": view.get("screen"), "turn": view.get("turn"),
+        compact: dict[str, Any] = {
+            "screen": screen, "turn": view.get("turn"),
             "actions": view.get("available_actions") or view.get("actions"),
-            "combat": {"player": combat.get("player"), "hand": combat.get("hand"),
-                       "enemies": combat.get("enemies"), "discard": combat.get("discard")},
+            "action_contracts": payload.get("action_contracts") or {},
+            "action_refs": payload.get("action_refs") or {},
             "solver_steps": solver_steps,
             "turn_end_check": payload.get("turn_end_check"),
             "active_requirements": payload.get("active_requirements"),
             "selected_plan": payload.get("selected_plan"),
-            "speech_allowed": payload.get("speech_allowed"),
             "new_player_messages": payload.get("new_player_messages"),
+            "speech_allowed": payload.get("speech_allowed"),
+            "ask_cue": payload.get("ask_cue"),
+            "control_state": payload.get("control_state"),
         }
+        if combat:
+            compact["combat"] = {"player": combat.get("player"), "hand": combat.get("hand"),
+                                 "enemies": combat.get("enemies"), "discard": combat.get("discard")}
+        if payload.get("agent_facts"):
+            compact["agent_facts"] = STS2LLMPlanner._narrowed_agent_facts(payload.get("agent_facts"))
+        # 选牌/选项页：保留本页真实选项与参数契约，custom 动作才能用真实引用。
+        if view.get("selection"):
+            compact["selection"] = view.get("selection")
+        # 地图/事件/奖励/商店/营火：保留当前页面对象，避免只给动作名却不知道合法下标。
+        for key in ("map", "event", "reward", "shop", "rest", "bundles"):
+            if view.get(key) is not None:
+                compact[key] = view.get(key)
+        # 聚焦复盘：保留被询问的回合、真实行动与“只回答不复盘”的限定。
+        if payload.get("recent_turn_review"):
+            compact["recent_turn_review"] = payload["recent_turn_review"]
+            compact["review_only"] = payload.get("review_only")
+        session = payload.get("session") or {}
+        if isinstance(session, dict) and session.get("pending_question"):
+            compact["pending_question"] = session["pending_question"]
         return ("上一轮思考已耗尽输出预算。只按下面精简现场给一次决策：solver_steps合规就直接"
                 "plan_source=\"solver\"、plan_update=\"replace\"并给理由一句；否则给custom主动作加最多2步"
-                "continuation。不推演抽牌或未知选择的后续，不写长分析，只返回完整合法JSON。\n"
+                "continuation。选牌看 selection 与 action_contracts，custom 动作用 action_refs 里的真实引用，"
+                "复盘只回答 recent_turn_review 所指回合。不推演抽牌或未知选择的后续，不写长分析，"
+                "只返回完整合法JSON。\n"
                 + json.dumps(compact, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
     async def _invoke_decision(self, llm: Any, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
@@ -762,6 +794,21 @@ class STS2LLMPlanner(_ChatLLMBase):
                 reply_kind = answer.get("reply_kind", "chat")
                 if reply_kind not in ("chat", "tactical"):
                     raise ValueError("reply_kind只能为chat或tactical")
+                interaction_kind = str(answer.get("interaction_kind") or "")
+                if interaction_kind not in {"", "banter", "remark", "discuss", "question"}:
+                    raise ValueError("interaction_kind只能为banter/remark/discuss/question或省略")
+                answer_required = answer.get("answer_required", False)
+                if not isinstance(answer_required, bool):
+                    raise ValueError("answer_required必须是true/false")
+                if answer_required and interaction_kind != "question":
+                    raise ValueError("answer_required仅在interaction_kind=question时可用")
+                ask_text = str(answer.get("ask") or "").strip()
+                if ask_text and interaction_kind in {"banter", "remark"}:
+                    raise ValueError("填ask时interaction_kind应为question或discuss；吐槽/反问请填remark并省略ask")
+                if interaction_kind == "question" and not ask_text:
+                    raise ValueError("interaction_kind=question时需同时填ask（要问主人的一句话）")
+                if not interaction_kind and ask_text:
+                    interaction_kind = "question"
                 update = answer.get("plan_update", "replace")
                 if action_type and update == "wait":
                     update = "replace"
@@ -862,10 +909,14 @@ class STS2LLMPlanner(_ChatLLMBase):
                         reply=response, reply_kind=reply_kind, plan_update=update, control=control,
                         media_requests=media, requirement_updates=requirement_updates,
                         learning_updates=learning_updates, experience_uses=experience_uses, review=review)
-                    asked = _asked(operation.reply)
+                    question = _merge_ask("", answer.get("ask"), context.get("active_requirements", []))
+                    operation.interaction_kind = interaction_kind
+                    operation.question = question
+                    operation.answer_required = bool(answer_required)
+                    asked = interaction_kind == "question"
                     operation.asked = asked
-                    self._logger.info("[sts2_companion_interaction] asked=%s awaiting_answer=%s reply_kind=%s banter=%s",
-                                      asked, asked, reply_kind, operation.banter_used)
+                    self._logger.info("[sts2_companion_interaction] asked=%s kind=%s required=%s reply_kind=%s banter=%s",
+                                      asked, interaction_kind or "none", answer_required, reply_kind, operation.banter_used)
                     if (view.get("screen") == "MAP" or requirement_updates or learning_updates or experience_uses or review) and validate is not None:
                         validation = validate(operation)
                         valid, feedback = validation if isinstance(validation, tuple) else (validation, "要求更新不合法，请核对范围、实体和条件")
@@ -1298,10 +1349,14 @@ class STS2LLMPlanner(_ChatLLMBase):
                         if field_name == "speech":
                             operation.speech_scope = "intent"
                         operation.banter_used = True
-                asked = _asked(operation.reply, operation.speech)
+                question = _merge_ask("", answer.get("ask"), context.get("active_requirements", []))
+                operation.interaction_kind = interaction_kind
+                operation.question = question
+                operation.answer_required = bool(answer_required)
+                asked = interaction_kind == "question"
                 operation.asked = asked
-                self._logger.info("[sts2_companion_interaction] asked=%s awaiting_answer=%s reply_kind=%s banter=%s",
-                                  asked, bool(asked and not operation.action_type), reply_kind, operation.banter_used)
+                self._logger.info("[sts2_companion_interaction] asked=%s kind=%s required=%s reply_kind=%s banter=%s",
+                                  asked, interaction_kind or "none", answer_required, reply_kind, operation.banter_used)
                 final_steps = []
                 for step in usable_steps:
                     public = {k: deepcopy(step[k]) for k in ("action_type", "kwargs", "assumptions", "reason", "completes_requirements") if k in step}

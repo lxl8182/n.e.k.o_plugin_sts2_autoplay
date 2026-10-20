@@ -59,6 +59,7 @@ def test_each_turn_waits_for_current_verified_message_and_passes_it_to_planner(m
 
 def test_same_decision_danmaku_and_completed_speech_precede_action_and_pause_blocks_it(monkeypatch):
     service = STS2AutoplayService(Mock(), lambda _: None)
+    service._danmaku_enabled = True  # 该用例验证弹幕先于发言与动作；默认关闭是生产配置。
     view = {"screen": "EVENT", "run_id": "one", "event": {"options": [{"i": 0}, {"i": 1}]}}
     service._state.snapshot = {"agent_view": view}
     service._companion_session.observe(view)
@@ -267,3 +268,56 @@ def test_pending_completion_and_plan_only_changes_reach_chat_context(monkeypatch
     validated, feedback = service._validate_companion_action(snapshot, uncertain)
     assert validated is None and "请选择其他操作" in feedback
     assert service._companion_session.actions[-1]["executed"] is False
+
+
+def test_pending_action_registered_before_refresh_failure(monkeypatch):
+    """G01：Mod 已接收动作后刷新失败，也要保留待确认记录（否则同一动作会重复派发）。"""
+    service = STS2AutoplayService(Mock(), lambda _: None)
+    view = {"screen": "COMBAT", "run_id": "r", "turn": 1,
+            "combat": {"player": {"energy": 2}, "hand": [{"i": 0, "line": "打击", "playable": True}]}}
+    snapshot = {"agent_view": view, "raw_state": {"in_combat": True, "turn": 1, "combat": {}},
+                "action_registry": [{"type": "play_card"}]}
+    service._state.snapshot = snapshot
+    service._companion_session.observe(view)
+    operation = {"action_type": "play_card", "kwargs": {"card_index": 0}, "source": "llm"}
+    monkeypatch.setattr(service, "_companion_client", lambda: None)
+    monkeypatch.setattr(service, "_action_engine", SimpleNamespace(execute=AsyncMock(return_value={
+        "status": "pending", "executed": False, "action_id": "a1", "message": "等待现场确认完成。"})))
+    monkeypatch.setattr(service, "refresh_state", AsyncMock(side_effect=RuntimeError("连接断开")))
+    monkeypatch.setattr(service, "_deliver_host_context", Mock())
+    result = asyncio.run(service._execute_operation(operation))
+    assert result["status"] == "pending"
+    assert service._pending_action is not None
+    assert service._pending_action["action_id"] == "a1"
+    assert service._companion_session.actions[-1]["status"] == "pending"
+
+
+def test_action_engine_maps_mod_result_states_and_echoes_action_id():
+    """G02：Mod 的 canceled/unknown 不能被当成成功；action_id 原样带给 Mod 并回传。"""
+    engine = STS2AutoplayService(Mock(), lambda _: None)._action_engine
+    engine.validate = lambda snapshot, operation: {"action_type": "play_card", "kwargs": {}, "source": "llm"}
+    operation = {"action_type": "play_card", "kwargs": {}, "source": "llm", "_action_id": "abc"}
+    for mod_status, expected, executed in (("canceled", "canceled", False), ("unknown", "unknown", False),
+                                           ("pending", "pending", False), ("completed", "ok", True)):
+        client = SimpleNamespace(execute_action=AsyncMock(return_value={"status": mod_status}))
+        result = asyncio.run(engine.execute(client, {}, operation))
+        assert result["status"] == expected and result["executed"] is executed
+        assert client.execute_action.await_args.kwargs["action_id"] == "abc"
+
+
+def test_pending_question_lifecycle_links_answer_and_expiry():
+    """C03：问题可被回答/过期，回答按消息 id 关联原问题。"""
+    session = CompanionSession()
+    session.observe({"screen": "COMBAT", "run_id": "r", "turn": 1})
+    question = session.ask_question("要不要把药水留到Boss？", required=True, window=10,
+                                    operation={"action_type": "end_turn"})
+    assert question["status"] == "open"
+    assert session.context()["pending_question"]["text"] == "要不要把药水留到Boss？"
+    session.answer_pending_question([{"id": "7"}])
+    assert session.pending_question["status"] == "answered"
+    assert session.pending_question["answered_by"] == ["7"]
+    assert session.pending_question_context() == {}
+    second = session.ask_question("先打哪只？", required=False, window=5)
+    session.expire_pending_question()
+    assert second["id"] == session.pending_question["id"]
+    assert session.pending_question["status"] == "expired"

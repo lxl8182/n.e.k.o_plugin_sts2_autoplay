@@ -485,7 +485,7 @@ locales_dir = "i18n"
 
 - **战斗求解器**（`Solver/`）：内嵌 **vendored CombatSolver 0.50.1 引擎**（基线 `v0.28.0`），卡效推断用 **RitsuLib**，私有成员用 **GameRef 反射**（已去掉 Krafs.Publicizer）。`Game/Sim/` 是一套独立重实现的确定性结算器，仅作回退。
   - vendor 边界、适配规则、再同步流程与流水线脚本见 [`game_mod/nekospire/Solver/VENDORING.md`](game_mod/nekospire/Solver/VENDORING.md) 与 `game_mod/scripts/apply-vendor-sync.py`；只读同步报告：`game_mod\scripts\sync-vendor.ps1`。
-  - **行为验证状态**：本次同步只验证到"Release 编译零错误 + SimTests 全通过"。求解器在真实对局中的行为**尚未验证**，见 `VENDORING.md` 的"验证边界"一节。
+  - **行为验证状态**：本次同步验证到"Release 编译零错误 + SimTests 全通过"（`game_mod/SimTests` 的失效引用已于 2026-10-18 修复，运行：`dotnet run --project game_mod/SimTests/SimTests.csproj`，需 `STS2_DATA_DIR` 指向游戏数据目录）。求解器在真实对局中的行为**尚未验证**，见 `VENDORING.md` 的"验证边界"一节。
 
 ## 问题反馈
 

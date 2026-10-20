@@ -46,6 +46,8 @@ class CompanionSession:
         self.on_action = None
         self.input_results: list[dict[str, Any]] = []
         self.delivery_revision = 0
+        # C03：当前待回答的问题（回答/取消/过期/被新话题替代）。
+        self.pending_question: dict[str, Any] = {}
 
     def observe(self, view: dict[str, Any], *, in_combat: bool | None = None, effects: dict | None = None) -> None:
         observed_at = time()
@@ -72,6 +74,7 @@ class CompanionSession:
             self.observations.clear()
             self._anchors.clear()
             self.future_plan.clear()
+            self.pending_question = {}
             self.active_plan = {"remaining_steps": []}
             self.announced_plan.clear()
             self._last_speech.clear()
@@ -370,6 +373,43 @@ class CompanionSession:
         if changed:
             self.generation += 1
 
+    # ---- 问题与回答（C03） ----
+
+    def ask_question(self, text: str, *, required: bool, window: float,
+                     operation: dict[str, Any] | None = None) -> dict[str, Any]:
+        """记录一个待回答的问题；新问题替代旧问题（旧问题标记 superseded）。"""
+        text = str(text or "").strip()
+        if not text:
+            return {}
+        if self.pending_question.get("status") == "open":
+            self.pending_question.update(status="superseded", superseded_at=time())
+        self.pending_question = {
+            "id": uuid4().hex[:8], "text": text[:500], "required": bool(required),
+            "window": float(window or 0), "status": "open", "asked_at": time(),
+            "answered_at": None, "answered_by": [], "anchor": self.anchor(),
+            "action_type": str((operation or {}).get("action_type") or ""),
+        }
+        return deepcopy(self.pending_question)
+
+    def answer_pending_question(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        question = self.pending_question
+        if question.get("status") != "open" or not messages:
+            return {}
+        question.update(status="answered", answered_at=time(),
+                        answered_by=[m.get("id") or m.get("request_id") for m in messages])
+        return deepcopy(question)
+
+    def expire_pending_question(self) -> None:
+        if self.pending_question.get("status") == "open":
+            self.pending_question.update(status="expired", expired_at=time())
+
+    def pending_question_context(self) -> dict[str, Any]:
+        question = self.pending_question
+        if question.get("status") != "open":
+            return {}
+        return {key: deepcopy(question[key]) for key in
+                ("id", "text", "required", "asked_at", "window", "action_type")}
+
     def record_action(self, operation: dict[str, Any], *, anchor: dict[str, Any],
                       before: dict[str, Any], after: dict[str, Any], result: dict[str, Any]) -> None:
         kwargs = operation.get("kwargs") or {}
@@ -438,6 +478,7 @@ class CompanionSession:
                 "local_pending_messages": [dict(item) for item in self.user_requests
                                            if item["kind"] == "pending" and not item.get("request_id")],
                 "pending_inputs": [dict(item) for item in self.user_requests if item["kind"] == "pending"],
+                "pending_question": self.pending_question_context(),
                 "character_choice_made": self.character_choice_made,
                 "requirements": deepcopy(self.requirements.records), "requirements_revision": self.requirements_revision,
                 "requirement_sequence": self.requirements.sequence,

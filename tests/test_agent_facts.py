@@ -93,6 +93,24 @@ def test_orb_evoke_target_preserves_identity_effect_and_values():
     assert "伤害" in orbs[-1]["effect"]
 
 
+def test_orb_capacity_and_empty_slots_are_exposed():
+    """球位上限要按现场 orb_capacity，而不是 Defect 默认 3 球位（2026-10-20 01:09 现场）。"""
+    raw = _raw_state()
+    raw["combat"]["player"].update({
+        "orb_capacity": 2, "base_orb_slots": 3, "empty_orb_slots": 0,
+        "orbs": [
+            {"slot_index": 0, "orb_id": "FROST_ORB", "name": "冰霜", "is_front": True,
+             "passive_value": 2, "evoke_value": 5},
+            {"slot_index": 1, "orb_id": "LIGHTNING_ORB", "name": "闪电", "is_front": False,
+             "passive_value": 3, "evoke_value": 8},
+        ],
+    })
+    facts = build_agent_facts(raw)
+    assert facts["orb_capacity"] == 2
+    assert facts["base_orb_slots"] == 3
+    assert facts["empty_orb_slots"] == 0
+
+
 def test_relic_and_potion_effects_added():
     facts = build_agent_facts(_raw_state(
         relics=[{"relic_id": "BURNING_BLOOD", "name": "燃烧之血",

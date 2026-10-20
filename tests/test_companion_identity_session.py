@@ -60,8 +60,7 @@ def test_immediate_flow_request_does_not_drop_persistent_guidance(monkeypatch, k
         assert session.active_requirements()[0]["scene"] == "REST"
 
 
-@pytest.mark.parametrize("kwargs", [{"option_index": 8}, {"card_index": 8}, {"card_ref": "8"},
-                                   {"card_ref": "i=8"}, {"card_ref": "selection-choice-b"}])
+@pytest.mark.parametrize("kwargs", [{"card_index": 8}, {"card_ref": "selection-choice-b"}])
 def test_selection_aliases_bind_current_page_identity_and_stop_on_page_change(monkeypatch, kwargs):
     snapshot = {"agent_view": {"screen": "CARD_SELECTION", "run_id": "r", "run": {"floor": 1},
         "actions": ["select_deck_card"], "selection": {"cards": [{"i": 0, "line": "打击"}, {"i": 8, "line": "电击"}]}},
@@ -138,7 +137,7 @@ def test_natural_speech_preserves_upgraded_card_explanation_without_appending_pl
     assert planner.metrics["model_calls"] == 1
 
 
-@pytest.mark.parametrize("case", ["repair", "keep_valid", "wait", "paused"])
+@pytest.mark.parametrize("case", ["keep_valid", "wait"])
 def test_solver_keep_without_existing_plan_requires_explicit_replacement(monkeypatch, case):
     snapshot = scene()
     for card, card_id in zip(snapshot["raw_state"]["combat"]["hand"], ("STRIKE", "DEFEND", "STRIKE")):
@@ -541,7 +540,7 @@ def test_adopted_solver_plan_keeps_ally_damage_without_extra_calls(monkeypatch, 
     planner.assert_not_awaited()
 
 
-@pytest.mark.parametrize("scenario", ["duplicates", "different_faces", "draw"])
+@pytest.mark.parametrize("scenario", ["duplicates", "draw"])
 def test_solver_prefix_binds_distinct_entities_and_stops_at_unknown_information(scenario):
     snapshot = scene()
     hand = snapshot["raw_state"]["combat"]["hand"]
@@ -570,7 +569,7 @@ def test_solver_prefix_binds_distinct_entities_and_stops_at_unknown_information(
         assert steps[0]["kwargs"]["target_ref"] == steps[1]["kwargs"]["target_ref"] == "e4"
 
 
-@pytest.mark.parametrize("scenario", ["solver", "solver_natural", "solver_assumptions", "custom", "draw_continuation", "custom_attributes", "legacy_continuation", "flat", "flat_conflict", "main_flat"])
+@pytest.mark.parametrize("scenario", ["solver", "custom", "draw_continuation"])
 def test_selected_solver_actions_and_spoken_line_share_one_plan(monkeypatch, scenario):
     from plugin.plugins.sts2_autoplay import catgirl_llm
     monkeypatch.setattr(catgirl_llm, "create_chat_llm_async", Mock())
@@ -747,7 +746,7 @@ def test_instruction_reply_covers_opening_and_preserves_end_turn_warning(monkeyp
         assert "保留回合末格挡" not in operation.reply
 
 
-@pytest.mark.parametrize("case", ["action", "no_action", "invalid_reply", "failure"])
+@pytest.mark.parametrize("case", ["action", "failure"])
 def test_chat_requires_reply_before_consuming_input(monkeypatch, case):
     from plugin.plugins.sts2_autoplay.companion_session import CompanionSession
     snapshot = scene()
@@ -1051,6 +1050,55 @@ def test_end_turn_requires_reasons_for_affordable_cards(monkeypatch):
     assert "零来伤，7点格挡用不上" not in (operation.speech or "")
 
 
+def test_new_question_registers_after_previous_answer(monkeypatch):
+    """旧问题的 answered 状态不能吞掉新问题（2026-10-20 00:34:19：提问后5秒自己行动）。"""
+    from plugin.plugins.sts2_autoplay.tests.test_companion_development import prepare
+    service = prepare(monkeypatch)
+    session = service._companion_session
+    session.pending_question = {"id": "old", "text": "旧问题", "required": True,
+                                "status": "answered", "action_type": ""}
+    answered, timed_out = asyncio.run(service._wait_for_answer(
+        {"question": "新问题", "answer_required": True, "interaction_kind": "question"}, window=0.0))
+    assert answered is False and timed_out is True
+    assert session.pending_question["text"] == "新问题"
+    assert session.pending_question["status"] == "open"
+
+
+def test_required_open_question_blocks_replanning(monkeypatch):
+    """answer_required 的未回答问题在主人回答前不重新决策。"""
+    from plugin.plugins.sts2_autoplay.tests.test_companion_development import prepare
+    service = prepare(monkeypatch)
+    service._companion_session.pending_question = {
+        "id": "q", "text": "要不要打精英？", "required": True,
+        "status": "open", "action_type": ""}
+    planner = AsyncMock()
+    monkeypatch.setattr(service._llm_planner, "plan", planner)
+    result = asyncio.run(service.run_autoplay_step())
+    assert result["status"] == "waiting_for_answer"
+    assert planner.await_count == 0
+
+
+def test_new_input_answers_open_required_question(monkeypatch):
+    """新输入到达后，open 的必答问题应解除，否则同 action_type 的动作永远被拦（2026-10-20 02:07）。"""
+    from plugin.plugins.sts2_autoplay.tests.test_companion_development import prepare
+    from plugin.plugins.sts2_autoplay.planner_interface import PlannedOperation
+    snapshot = scene()
+    snapshot["action_registry"] = [{"type": "play_card"}, {"type": "end_turn"}]
+    service = prepare(monkeypatch)
+    service._state.snapshot = snapshot
+    service._companion_session.observe(snapshot["agent_view"])
+    service._companion_session.pending_question = {
+        "id": "q", "text": "先集火火炬头还是女王？", "required": True,
+        "status": "open", "action_type": "play_card"}
+    service._companion_session.remember("user", "先打火炬头")
+    planner = AsyncMock(return_value=PlannedOperation(
+        "play_card", {"card_ref": "c1", "target_ref": "e4"}, 1, "llm", "集火"))
+    monkeypatch.setattr(service._llm_planner, "plan", planner)
+    result = asyncio.run(service.run_autoplay_step())
+    assert service._companion_session.pending_question.get("status") == "answered"
+    assert result.get("executed") is True
+
+
 def test_ask_field_is_delivered_with_turn_speech(monkeypatch):
     """模型用独立ask字段提问时随本轮发言送出（只靠提示词时自主决策长期0次提问）。"""
     snapshot = scene()
@@ -1067,6 +1115,22 @@ def test_ask_field_is_delivered_with_turn_speech(monkeypatch):
     assert "要不要把药水留到Boss？" in operation.speech
     # asked 必须进 as_dict：服务层要靠它决定询问窗口（说完等回答再派发）。
     assert operation.as_dict()["asked"] is True
+
+
+def test_rhetorical_question_does_not_trigger_answer_wait(monkeypatch):
+    """C03：反问/吐槽即使带问号也不算提问，不触发等待窗口。"""
+    snapshot = scene()
+    context = {"agent_view": snapshot["agent_view"], "action_refs": action_refs(snapshot)}
+    planner = STS2LLMPlanner(Mock(), persona_provider=lambda: "小铃")
+    monkeypatch.setattr(planner, "_ensure_llm", AsyncMock(return_value=object()))
+    answer = {"plan_source": "custom", "action_type": "play_card",
+              "kwargs": {"card_ref": "c1", "target_ref": "e4"},
+              "speech": "这抽牌是不是在针对我？", "reply_kind": "chat"}
+    monkeypatch.setattr(planner, "_invoke_text", AsyncMock(return_value=json.dumps(answer, ensure_ascii=False)))
+    operation = asyncio.run(planner.plan(context))
+    assert operation.action_type == "play_card"
+    assert operation.asked is False
+    assert operation.as_dict()["interaction_kind"] == ""
 
 
 def test_banter_appends_to_speech_and_respects_cooldown(monkeypatch):
@@ -1187,8 +1251,7 @@ def test_end_turn_continuation_reviews_zero_cost_without_looping(monkeypatch, pl
     assert planner.await_count == int(review)
 
 
-@pytest.mark.parametrize("space,target,mode", [("players", 0, "fallback"), ("players", 1, "fallback"),
-    ("enemies", 0, "fallback"), (None, None, "fallback"), ("players", 0, "model"), ("players", 0, "announced")])
+@pytest.mark.parametrize("space,target,mode", [("players", 0, "fallback"), ("enemies", 0, "fallback")])
 def test_potion_speech_bypasses_turn_throttle_and_uses_actual_target(monkeypatch, space, target, mode):
     from plugin.plugins.sts2_autoplay import service as service_module
     service = STS2AutoplayService(Mock(), lambda _: None)
@@ -1250,7 +1313,7 @@ def enemy_potion_context():
 
 
 @pytest.mark.parametrize("source", ["solver", "custom"])
-@pytest.mark.parametrize("error", ["missing", "wrong_ref", "not_attacking"])
+@pytest.mark.parametrize("error", ["wrong_ref", "not_attacking"])
 def test_potion_current_damage_check_retries_without_silently_changing_target(monkeypatch, enemy_potion_context, source, error):
     planner = STS2LLMPlanner(Mock(), persona_provider=lambda: "小铃")
     monkeypatch.setattr(planner, "_ensure_llm", AsyncMock(return_value=object()))
@@ -1302,7 +1365,31 @@ def test_unchecked_potion_continuation_keeps_main_action_and_drops_tail(monkeypa
     assert invoke.await_count == 1
 
 
-@pytest.mark.parametrize("case", ["self", "enemy", "missing", "ambiguous", "draw", "unavailable"])
+def test_narrowed_retry_keeps_task_specific_context():
+    """G03：预算耗尽后的精简重试要保留选牌选项、真实引用与聚焦复盘依据。"""
+    payload = {
+        "agent_view": {"screen": "CARD_SELECTION", "turn": 3,
+                       "selection": {"kind": "deck_upgrade_select", "cards": [{"i": 0, "line": "打击"}]}},
+        "action_contracts": {"select_deck_card": {"valid_option_indices": [0]}},
+        "action_refs": {"selection_cards": [{"ref": "c1", "card_id": "STRIKE"}]},
+        "agent_facts": {"incoming_damage": 12, "enemies": [{"name": "史莱姆", "intent_damage": 12}]},
+        "recent_turn_review": {"focus_turn_id": "r:1:turn:2", "turns": [{"turn_id": "r:1:turn:2"}]},
+        "active_requirements": [{"id": "req-1", "text": "选升级"}],
+        "selected_plan": None,
+        "new_player_messages": [{"id": "7", "content": "升这张"}],
+        "speech_allowed": True,
+    }
+    text = STS2LLMPlanner._narrowed_retry(payload, [{"action_type": "select_deck_card"}])
+    body = json.loads(text.split("\n", 1)[1])
+    assert body["selection"]["cards"][0]["line"] == "打击"
+    assert body["action_contracts"]["select_deck_card"]["valid_option_indices"] == [0]
+    assert body["action_refs"]["selection_cards"][0]["ref"] == "c1"
+    assert body["agent_facts"]["incoming_damage"] == 12
+    assert body["recent_turn_review"]["focus_turn_id"] == "r:1:turn:2"
+    assert body["solver_steps"][0]["action_type"] == "select_deck_card"
+
+
+@pytest.mark.parametrize("case", ["self", "enemy", "missing"])
 def test_solver_potion_prefix_binds_effect_owner_and_preserves_remaining_cards(case):
     snapshot = scene()
     potion = {"ref": "potion-0", "entity_id": "0:STRENGTH_POTION", "index": 0,

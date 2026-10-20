@@ -101,3 +101,29 @@ def test_result_correction_removes_wrong_defeat_conclusions_and_keeps_evidence()
         assert corrected[field] == previous[field]
 
 
+def test_corrupt_memory_file_is_preserved_until_recover(tmp_path: Path) -> None:
+    path = tmp_path / "catgirl_memory.json"
+    path.write_text("{ not json", encoding="utf-8")
+    store = CatgirlMemoryStore(str(path), logger=_DummyLogger())
+    assert store.load_failed is True
+    assert "经验读取失败" in store.last_error
+    assert store.runs == []
+    assert store.save() is False
+    assert path.read_text(encoding="utf-8") == "{ not json"
+
+
+def test_recover_backs_up_corrupt_file_then_save_succeeds(tmp_path: Path) -> None:
+    path = tmp_path / "catgirl_memory.json"
+    path.write_text("{ not json", encoding="utf-8")
+    store = CatgirlMemoryStore(str(path), logger=_DummyLogger())
+    assert store.load_failed is True
+    assert store.recover() is True
+    backups = list(tmp_path.glob("catgirl_memory.json.corrupt-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "{ not json"
+    store.add_run("r-1", character="DEFECT", outcome="defeat", floor=1, act=1, decision_memory=[])
+    assert store.save() is True
+    assert store.load_failed is False and store.last_error == ""
+    assert path.read_text(encoding="utf-8").startswith("{")
+
+

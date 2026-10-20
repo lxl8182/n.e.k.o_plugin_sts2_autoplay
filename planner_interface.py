@@ -62,6 +62,11 @@ class PlannedOperation:
     # 交流诊断：本轮是否真的问了主人、是否带了情绪吐槽（服务层据此做冷却与话题去重）。
     asked: bool = False
     banter_used: bool = False
+    # C03：由模型显式给出的交流性质，替代按问号猜问题。
+    # banter=情绪吐槽，remark=感叹/玩笑/反问（不等回答），discuss=邀请讨论（可接话不阻塞），question=需要回答。
+    interaction_kind: str = ""
+    question: str = ""
+    answer_required: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -97,6 +102,9 @@ class PlannedOperation:
             "review": dict(self.review),
             "asked": self.asked,
             "banter_used": self.banter_used,
+            "interaction_kind": self.interaction_kind,
+            "question": self.question,
+            "answer_required": self.answer_required,
         }
 
 

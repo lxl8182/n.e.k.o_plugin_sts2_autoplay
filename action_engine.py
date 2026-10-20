@@ -171,19 +171,36 @@ class STS2ActionEngine:
                 "summary": message,
                 "executed": False,
             }
-        result = await client.execute_action(validated["action_type"], **validated["kwargs"])
-        pending = result.get("status") == "pending"
+        action_request_id = str(operation.get("_action_id") or "") if isinstance(operation, dict) else ""
+        result = await client.execute_action(validated["action_type"], action_id=action_request_id,
+                                             **validated["kwargs"])
+        raw_status = str(result.get("status") or "")
+        if raw_status in {"canceled", "cancelled"}:
+            status = "canceled"
+        elif raw_status in {"rejected", "unknown"}:
+            status = raw_status
+        elif raw_status == "pending":
+            status = "pending"
+        else:
+            status = "ok"
         message = self.t("action_engine.executed_action", default="已执行动作: {action_type}", action_type=validated["action_type"])
-        if pending:
+        if status == "pending":
             message = "动作已派发，等待现场确认完成。"
+        elif status == "canceled":
+            message = "动作被游戏取消，按新现场重新判断。"
+        elif status == "rejected":
+            message = "动作被拒绝，按新现场重新判断。"
+        elif status == "unknown":
+            message = "动作结果未知，继续查询现场后判断。"
         return {
-            "status": "pending" if pending else "ok",
+            "status": status,
             "message": message,
             "summary": message,
-            "executed": not pending,
+            "executed": status == "ok",
             "dispatched": True,
             "operation": validated,
             "result": result,
+            "action_id": action_request_id,
         }
 
     def _find_action(self, registry: list[dict[str, Any]], snapshot: dict[str, Any], *, action_type: str, action_id: Any) -> dict[str, Any] | None:

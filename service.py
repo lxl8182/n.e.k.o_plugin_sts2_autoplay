@@ -20,6 +20,7 @@ import httpx
 from .action_engine import STS2ActionEngine
 from .action_registry import STS2ActionRegistry
 from .agent_facts import build_agent_facts, end_turn_danger
+from .keyword_registry import build_keyword_effects
 from .action_identity import action_refs, resolve_action, observation_guard, enemy_intents
 from .catgirl_bridge import STS2CatgirlBridge
 from .catgirl_llm import CatgirlCommentGenerator
@@ -849,7 +850,7 @@ class STS2AutoplayService:
             await self._push_catgirl(text, fetch_avatar=False)
             result = await speak_current_turn(self._main_server_port(), self._catgirl_llm.character_name(),
                                                text, {**(anchor or self._companion_session.anchor()),
-                                                      "speech_kind": "tactical" if wait_audio else speech_kind})
+                                                      "speech_kind": speech_kind})
         else:
             ids = [m.get("request_id") for m in messages if m.get("request_id")]
             result = await self._companion_host_request("output", {"line": text, "wait_audio": wait_audio,
@@ -859,7 +860,7 @@ class STS2AutoplayService:
                 "output_id": output_id or (":".join(ids) + ":" + sha1(text.encode()).hexdigest() if ids else
                     f"failure:{run_id}:" + sha1(text.encode()).hexdigest() if system_notice else f"run_end:{run_id}" if terminal else str(uuid4())),
                 "anchor": {**(anchor or self._companion_session.anchor()),
-                           "speech_kind": "tactical" if wait_audio else speech_kind}})
+                           "speech_kind": speech_kind}})
             if result.get("text_sent") is not True:
                 raise RuntimeError("回复尚未送达聊天框：" + str(result.get("reason") or "text_not_sent"))
             if media_requests and result.get("reason") == "frontend_disconnected":
@@ -1305,6 +1306,12 @@ class STS2AutoplayService:
                           or self._ingress_active and self._state.autoplay_state != "running" and not force)
         if actions_paused and not has_input:
             return {"status": "idle", "executed": False, "message": "已暂停动作，仍可聊天。"}
+        question = self._companion_session.pending_question
+        if (question.get("status") == "open" and question.get("required")
+                and not self._companion_session.pending_messages() and not force):
+            # 明确要求等回答的问题：在主人回答前不重新决策，也不让模型自己“等不及”行动。
+            return {"status": "waiting_for_answer", "executed": False,
+                    "message": "已提问，等待主人回答。"}
         if time() < self._state.retry_at:
             return {"status": "retrying", "executed": False, "message": self._state.decision_error or self._state.last_error,
                     "retry_at": self._state.retry_at}
@@ -1402,6 +1409,11 @@ class STS2AutoplayService:
             plan_generation = (generation, control_generation, guidance_generation)
             dialogue_revision = self._companion_session.dialogue_revision
             new_messages = self._companion_session.pending_messages()
+            if new_messages and self._companion_session.pending_question.get("status") == "open":
+                # 新输入就是对上一问的回应（或已改变话题）：先解除 required 闸门。
+                # 否则问句的 action_type 与后续动作相同，动作会一直被“等待回答”挡住
+                # （2026-10-20 02:07 现场：回答“先打火炬头”后 play_card 仍被拦）。
+                self._companion_session.answer_pending_question(new_messages)
             if (view.get("screen") in {"GAME_OVER", "VICTORY", "DEFEAT"} and not new_messages
                     and self._companion_session.terminal_reply_run_id == view.get("run_id")):
                 self._ingress_callbacks.clear()
@@ -1541,6 +1553,10 @@ class STS2AutoplayService:
                 self._execution_phase = {"state": "deciding", "text": "正在决策", "detail": "结合当前局面与有效要求选择行动"}
                 await self._sync_execution_status()
                 decision_facts = build_agent_facts(snapshot.get("raw_state"))
+                keyword_effects = build_keyword_effects(snapshot.get("raw_state"), view)
+                if keyword_effects:
+                    decision_facts["keyword_effects"] = keyword_effects
+                    self.logger.info("[sts2_keyword_effects] matched=%s", list(keyword_effects))
                 historical_question = any(re.search(r"上(?:一)?局|以前|那局|跨局|历史|经验|记忆|记住|依据|来源|哪来|怎么.*(?:总结|学|记)", m["content"]) for m in new_messages)
                 experience_context = self._catgirl_memory.decision_context(view, decision_facts, include_history=historical_question)
                 strategy_knowledge = self._strategy_repository.decision_knowledge(view, decision_facts)
@@ -1579,14 +1595,13 @@ class STS2AutoplayService:
                     cues = []
                     if len(enemies) >= 2 and not state.get("focus"):
                         cues.append("多敌：先问主人一句先集火谁（用ask），一次只问一个点。")
-                    # 斩杀视野按主人口径：30 血或 30% 最大生命，两者都算；不再硬绑"无来伤/格挡够"。
-                    near = [item for item in enemies
-                            if item["hp"] <= 30
-                            or (isinstance(item.get("max_hp"), (int, float)) and item["max_hp"] > 0
-                                and item["hp"] <= item["max_hp"] * 0.3)]
-                    if near and not state.get("lethal"):
-                        cues.append("有怪进入斩杀视野（30血或30%最大生命）：先算这回合全攻打完能不能击杀；"
-                                    "能击杀就用ask问主人要不要放弃防御全攻斩杀，打不死就正常防御、不全攻。")
+                    # 斩杀判断按全攻差额，不按固定血量门槛：能确定击杀不问，差得远也不问。
+                    if enemies and not state.get("lethal"):
+                        cues.append("斩杀判断：先算这回合全攻的确定伤害D和敌人有效血量H（当前血量+格挡，按牌面修正）；"
+                                    "D≥H是必杀，直接打，不要问；只有0<H-D小到随机/抽牌可能补上时，"
+                                    "才用ask问主人要不要放弃防御全攻赌杀；差得远就正常防御，不必问。"
+                                    "参考差额：第1层约10、第2层约20、第3层约30，实际会上下浮动，自己判断。"
+                                    "无实体期间伤害封1，不按斩杀算；有复活/阶段转换的敌人，击杀不等于结束。")
                     ask_cue = "".join(cues)
                 else:
                     ask_cue = ""
@@ -1656,7 +1671,11 @@ class STS2AutoplayService:
                     journal = self._review_journal(decision.review)
                     self._catgirl_memory.record_exposure(self._learning_available, view.get("run_id"),
                                                         (journal.data.get("latest") or {}).get("id", ""))
-                    self._catgirl_memory.apply_learning(decision.learning_updates, messages=new_messages, journal=journal)
+                    try:
+                        self._catgirl_memory.apply_learning(decision.learning_updates, messages=new_messages, journal=journal)
+                    except RuntimeError as exc:
+                        # G04：记忆读取/保存失败时明确记录，不把“已记住”当成功，也不中断本局决策。
+                        self.logger.warning("[sts2_memory_save_failed] %s", exc)
                     revised = {u["id"] for u in decision.learning_updates if u["op"] in {"replace", "revoke"}}
                     if any(u["id"] in revised for step in self._selected_steps for u in step.get("experience_uses") or []):
                         self._invalidate_companion_plan("采用的经验已修改或撤销，重新判断剩余步骤")
@@ -1708,6 +1727,17 @@ class STS2AutoplayService:
                             and all(kinds.get(m["id"]) in {"guidance", "immediate"} for m in new_messages)):
                         raise RuntimeError("统一会话未回答新消息；保留输入等待重试")
                     self.logger.warning("[sts2_guidance_speech_deferred] 游戏要求已分类并更新动作；发言修正失败不阻塞执行")
+                # C03：reply 与 speech 使用同一套等待规则；只有 question 才等回答。
+                if decision is not None and not getattr(decision, "action_type", ""):
+                    ask_window = self._ask_window_seconds(decision.as_dict())
+                    if ask_window > 0:
+                        answered, _timed_out = await self._wait_for_answer(decision.as_dict(), window=ask_window)
+                        if answered:
+                            return {"status": "waiting_for_input", "executed": False,
+                                    "message": "已问主人，收到回答后重新判断。"}
+                        if getattr(decision, "answer_required", False):
+                            return {"status": "waiting_for_answer", "executed": False,
+                                    "message": "已提问，等待主人回答。"}
                 if decision is not None and not decision.action_type:
                     operation = None
                 if update == "wait" or actions_paused or not combat_ready:
@@ -2562,8 +2592,11 @@ class STS2AutoplayService:
                 anchor = self._companion_session.anchor()
                 if self._wait_for_turn_message and anchor.get("battle_id") and self._current_turn_message() is None:
                     return {"status": "waiting_for_message", "executed": False, "message": "新回合尚未收到你的话。"}
-                if self._unconfirmed_action == (view_signature(self._agent_view(self._state.snapshot)),
-                                               operation["action_type"], public_kwargs(operation.get("kwargs"))):
+                if operation.get("action_type") == "use_potion":
+                    # 药水被游戏侧取消后允许直接重发，避免同一局面永久拦死。
+                    self._unconfirmed_action = None
+                elif self._unconfirmed_action == (view_signature(self._agent_view(self._state.snapshot)),
+                                                 operation["action_type"], public_kwargs(operation.get("kwargs"))):
                     return {"status": "unconfirmed", "executed": False, "message": "同一局面下该动作的上次结果未确认，不重复派发。"}
                 if operation.get("plan_revision") is None:
                     self._companion_session.accept_plan(operation, self._agent_view(self._state.snapshot))
@@ -2648,22 +2681,6 @@ class STS2AutoplayService:
                     self._communicated_turn = anchor
                     self.logger.info("[sts2_turn_speech] completed anchor=%s speech_id=%s revision=%s kind=%s",
                                      anchor, self._speech_state.get("speech_id"), operation["plan_revision"], kind)
-                    # 询问窗口：话已经说出去，先等主人回答再派发动作（战斗10s/选项页25s）。
-                    window = self._ask_window_seconds(operation)
-                    if window > 0:
-                        deadline = time() + window
-                        answered = False
-                        while time() < deadline:
-                            await asyncio.sleep(0.5)
-                            await self._read_companion_dialogue()
-                            if self._companion_session.pending_messages():
-                                answered = True
-                                break
-                        if answered:
-                            self.logger.info("[sts2_ask_window] answered，放弃当前动作重判")
-                            return {"status": "waiting_for_input", "executed": False,
-                                    "message": "已问主人，收到回答后重新判断。"}
-                        self.logger.info("[sts2_ask_window] timeout window=%.0fs，按自己倾向执行", window)
                     # 发言过程中可以暂停、收到新要求或进入另一回合；任何一种都不得派发旧动作。
                     await self.refresh_state(plan_combat=False)
                     await self._read_companion_dialogue()
@@ -2681,6 +2698,16 @@ class STS2AutoplayService:
                         return {"status": "waiting_for_actions", "executed": False, "message": "发言已完成，保留计划等待战斗动作窗口恢复。"}
                 else:
                     operation["speech"] = ""
+                # C03：reply 与 speech 使用同一套等待规则；只有 question 才阻塞动作。
+                window = self._ask_window_seconds(operation)
+                if window > 0:
+                    answered, _timed_out = await self._wait_for_answer(operation, window=window)
+                    if answered:
+                        return {"status": "waiting_for_input", "executed": False,
+                                "message": "已问主人，收到回答后重新判断。"}
+                    if operation.get("answer_required"):
+                        return {"status": "waiting_for_answer", "executed": False,
+                                "message": "已提问，等待主人回答。"}
                 if self._state.discussion_active or self._state.standby or self._state.autoplay_state == "paused":
                     return {"status": "idle", "executed": False, "message": "已暂停动作。"}
                 if self._agent_view(self._state.snapshot).get("screen") == "COMBAT":
@@ -2720,11 +2747,54 @@ class STS2AutoplayService:
             self._action_dispatch_lock.release()
 
     def _ask_window_seconds(self, operation: dict[str, Any]) -> float:
-        """本轮真的问了主人时，派发动作前等待回答的窗口；战斗短、选项页长。"""
-        if not isinstance(operation, dict) or not operation.get("asked"):
+        """本轮真的要等主人回答时才返回等待窗口；感叹/玩笑/反问不阻塞动作。"""
+        if not isinstance(operation, dict):
+            return 0.0
+        kind = str(operation.get("interaction_kind") or ("question" if operation.get("asked") else ""))
+        if kind != "question":
             return 0.0
         screen = self._agent_view(self._state.snapshot).get("screen")
         return self._ask_window_combat if screen == "COMBAT" else self._ask_window_page
+
+    async def _wait_for_answer(self, operation: dict[str, Any], *, window: float) -> tuple[bool, bool]:
+        """等待主人回答本轮提问，返回 (answered, timed_out)。
+
+        问题记进会话：新问题替代旧问题，回答按 request_id 关联原问题；
+        answer_required=true 时超时不自动解除等待（用户明确要求“等我回答”的情况）。
+        """
+        session = self._companion_session
+        question = session.pending_question
+        if question.get("status") == "answered":
+            # 上一问的回答已经处理过：只有本次操作问的仍是同一个问题才直接复用。
+            # 否则清掉旧记录，为本次新问题重新登记；旧实现无条件返回 True，
+            # 新问题没登记就继续决策（2026-10-20 00:34:19 现场：提问后 5 秒自己行动）。
+            if operation.get("question") and question.get("text") == operation.get("question"):
+                session.pending_question = {}
+                return True, False
+            session.pending_question = {}
+        if (question.get("status") != "open" or not question.get("text")
+                or (operation.get("question") and question.get("text") != operation.get("question"))):
+            question = session.ask_question(
+                operation.get("question") or "", required=bool(operation.get("answer_required")),
+                window=window, operation=operation)
+            if not question:
+                return False, True
+        deadline = time() + window
+        while time() < deadline:
+            await asyncio.sleep(0.5)
+            await self._read_companion_dialogue()
+            messages = session.pending_messages()
+            if messages:
+                session.answer_pending_question(messages)
+                self.logger.info("[sts2_ask_window] answered id=%s by=%s",
+                                 question.get("id"), [m.get("id") for m in messages])
+                return True, False
+        if operation.get("answer_required"):
+            self.logger.info("[sts2_ask_window] still waiting required answer id=%s", question.get("id"))
+        else:
+            session.expire_pending_question()
+            self.logger.info("[sts2_ask_window] timeout window=%.0fs，按自己倾向继续", window)
+        return False, True
 
     async def _execute_operation(self, operation: dict[str, Any] | None) -> dict[str, Any]:
         snapshot = self._state.snapshot if isinstance(self._state.snapshot, dict) else {}
@@ -2733,6 +2803,13 @@ class STS2AutoplayService:
             self._invalidate_companion_plan(blocker["reason"])
             return {"status": "waiting_for_condition", "executed": False, "message": blocker["reason"],
                     "requirement_id": blocker.get("requirement_id")}
+        question = self._companion_session.pending_question
+        if (operation and question.get("status") == "open" and question.get("required")
+                and operation.get("action_type")
+                and operation.get("action_type") == question.get("action_type")):
+            # C03：明确要求等回答时，回答前不执行依赖该问题的动作。
+            return {"status": "waiting_for_answer", "executed": False,
+                    "message": "已提问，等待主人回答后再执行该动作。"}
         before_view = self._agent_view(snapshot)
         if operation:
             self._companion_session.bind_requirement_completions(operation)
@@ -2741,19 +2818,43 @@ class STS2AutoplayService:
         before_summary = self._summary_builder.build_snapshot_summary(snapshot) if snapshot else {}
         client = self._companion_client()
         dispatch_started = perf_counter()
+        if isinstance(operation, dict):
+            operation["_action_id"] = uuid4().hex
         result = await self._action_engine.execute(client, snapshot, operation)
         accepted_at = time()
         if hasattr(self, "_step_timing"):
             self._step_timing["dispatch_ms"] = (perf_counter() - dispatch_started) * 1000
-        if result.get("status") == "pending":
+        result_status = str(result.get("status") or "")
+        if result_status in {"canceled", "rejected", "unknown"}:
+            # G02：Mod 明确给出非完成结果时不再当成 pending 死等；记录真实结果并按新现场重判。
             self._remember_plugin_action_marker(operation, snapshot)
-            await self.refresh_state(plan_combat=False)
             self._companion_session.record_action(operation, anchor=action_anchor, before=before_view,
-                after=self._agent_view(self._state.snapshot), result=result)
+                after=before_view, result=result)
+            self._invalidate_companion_plan(f"动作结果：{result_status}")
+            response = result.get("result") if isinstance(result.get("result"), dict) else {}
+            self.logger.info("[sts2_action_result] status=%s action=%s action_id=%s reason=%s",
+                             result_status, operation.get("action_type"), result.get("action_id"),
+                             str(response.get("reason") or "")[:200])
+            return result
+        if result.get("status") == "pending":
+            # G01：Mod 已接收动作，先登记待确认状态再做任何网络等待；刷新失败只丢观察，不丢账。
+            self._remember_plugin_action_marker(operation, snapshot)
+            refreshed = False
+            try:
+                await self.refresh_state(plan_combat=False)
+                refreshed = True
+            except Exception as exc:
+                self.logger.warning("[sts2_pending_refresh_failed] 动作已接收，保留待确认记录：%s", exc)
+            after_view = self._agent_view(self._state.snapshot) if refreshed else before_view
+            self._companion_session.record_action(operation, anchor=action_anchor, before=before_view,
+                after=after_view, result=result)
             self._pending_action = {"operation": deepcopy(operation), "anchor": action_anchor,
                                     "before": deepcopy(snapshot), "record": self._companion_session.actions[-1],
-                                    "submitted_at": time(), "accepted_at": accepted_at}
-            self._resolve_pending_action(self._state.snapshot)
+                                    "submitted_at": time(), "accepted_at": accepted_at,
+                                    "action_id": str(result.get("action_id") or operation.get("_action_id") or ""),
+                                    "response": dict(result)}
+            if refreshed:
+                self._resolve_pending_action(self._state.snapshot)
             self._deliver_host_context(self._state.snapshot)
             return result
         if result.get("status") == "ok":
@@ -3001,7 +3102,8 @@ class STS2AutoplayService:
             potions = (raw.get("run") or {}).get("potions") or []
             if reward.get("reward_type") == "Potion" and potions and all(p.get("occupied") for p in potions):
                 return None, "药水栏已满，不能直接领取；比较新旧药水，先discard_potion再领取，或resolve_rewards离开。"
-        if self._unconfirmed_action == self._action_confirmation_key(snapshot, planned["action_type"], planned.get("kwargs") or {}):
+        if (planned.get("action_type") != "use_potion"
+                and self._unconfirmed_action == self._action_confirmation_key(snapshot, planned["action_type"], planned.get("kwargs") or {})):
             return None, "该动作已派发但结果未确认，局面尚未改变；请选择其他操作或等待。"
         return self._action_engine.validate_with_feedback(snapshot, operation)
 

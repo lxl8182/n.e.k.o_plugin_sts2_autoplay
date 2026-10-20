@@ -302,6 +302,16 @@ def build_agent_facts(raw_state: Any) -> dict[str, Any]:
         orbs_out.append(entry)
     if orbs_out:
         facts["orbs"] = orbs_out
+    # 球位上限：agent_view 只给当前球列表，模型会按 Defect 默认 3 球位猜；
+    # 实际容量可能被遗物/能力改小（如 orb_capacity=2），满位再产球会立即激发最右球。
+    capacity = player_combat.get("orb_capacity")
+    if type(capacity) is int:
+        facts["orb_capacity"] = capacity
+        empty_slots = player_combat.get("empty_orb_slots")
+        facts["empty_orb_slots"] = empty_slots if type(empty_slots) is int else max(0, capacity - len(orbs_out))
+    base_slots = player_combat.get("base_orb_slots")
+    if type(base_slots) is int:
+        facts["base_orb_slots"] = base_slots
 
     # 敌人：意图 + 自身 buff 层数（agent_view 的 enemies 只有 intent=move_id）。
     enemies_out: list[dict[str, Any]] = []

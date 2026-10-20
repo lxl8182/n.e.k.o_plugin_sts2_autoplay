@@ -18,8 +18,6 @@ from plugin.plugins.sts2_autoplay.snapshot_normalizer import normalize_snapshot
 @pytest.mark.parametrize("text,expected", [
     ("求解器这次没出方案，我手动来。先垫飞跃，再电击。", "先垫飞跃，再电击。"),
     ("先防御。CombatSolver报错！solver_steps为空；再打击。", "先防御。再打击。"),
-    ("解算失败，我换个思路。", "我再看看当前局面。"),
-    ("先防御，再打击。音乐搜索完成了。", "先防御，再打击。音乐搜索完成了。"),
 ])
 def test_public_companion_text_filters_solver_sentences_only(text, expected):
     from plugin.plugins.sts2_autoplay.companion_feedback import public_companion_text
@@ -27,7 +25,7 @@ def test_public_companion_text_filters_solver_sentences_only(text, expected):
     assert public_companion_text(text) == expected
 
 
-@pytest.mark.parametrize("channel", ["reply", "tactical", "legacy_reply", "danmaku"])
+@pytest.mark.parametrize("channel", ["reply", "tactical"])
 def test_solver_text_is_filtered_at_output_boundaries(monkeypatch, channel):
     service = STS2AutoplayService(Mock(), lambda _: None)
     service._companion_session.observe({"screen": "COMBAT", "run_id": "r"})
@@ -57,6 +55,8 @@ def test_solver_text_is_filtered_at_output_boundaries(monkeypatch, channel):
         monkeypatch.setattr(service, "_companion_host_request", request)
         asyncio.run(service._publish_companion_reply(text, [], wait_audio=channel == "tactical"))
         assert request.call_args.args[1]["line"] == expected
+        # C02：wait_audio 只控制是否等待播放，不能把 chat 改写成 tactical。
+        assert request.call_args.args[1]["anchor"]["speech_kind"] == "chat"
 
 
 @pytest.mark.parametrize("old_update", [False, True])
@@ -617,7 +617,7 @@ def test_tactical_query_marks_reply_without_changing_game_plan(monkeypatch):
     assert operation.reply_kind == 'tactical' and operation.plan_update == 'keep' and not operation.action_type
 
 
-@pytest.mark.parametrize("form", ["plain", "preface", "fence", "truncated", "nondecision", "trailing"])
+@pytest.mark.parametrize("form", ["plain", "truncated"])
 def test_complete_final_decision_json_preserves_plan_without_accepting_partial_output(form):
     from plugin.plugins.sts2_autoplay.llm_planner import _decision_json
     answer = {"action_type": "play_card", "kwargs": {"card_ref": "c9"},

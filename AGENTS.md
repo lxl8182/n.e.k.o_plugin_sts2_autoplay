@@ -307,9 +307,12 @@ Copy-Item -LiteralPath 'game_mod/nekospire/bin/Release/net9.0/nekospire.dll' -De
 ```
 cmd /c "E:\job\code\projectcodex\temp\nekospire\scripts\start-neko-source-shell.cmd" %command%
 ```
-之后点「开始游戏」= 先起源码后端（未就绪则等健康检查）→ 再开 Steam 桌宠壳（壳自动 attach 复用后端）。
+之后点「开始游戏」= 先起源码后端 → 校验 `/api/sts2-companion/poll` 路由 → 再开 Steam 桌宠壳（壳自动 attach 复用后端）。
 
-**可覆盖环境变量**：`NEKO_SRC`、`NEKO_SHELL`、`NEKO_HEALTH`、`NEKO_WAIT_SECONDS`。
+**加固行为**：源码后端在 `NEKO_WAIT_SECONDS` 内未就绪、启动日志出现 `Startup timeout`/`Startup aborted`，或已有 48911 后端缺少同伴会话路由时，脚本直接报错退出，**不会启动壳**。避免壳回落到 Steam 内置后端（`projectneko_server.exe`）导致 `/api/sts2-companion/*` 404（表现为同伴会话连接异常）。
+常见失败原因：长时间未启动后的冷启动，Main Server import 可能超过 launcher 的 90s 上限（`F:\game\NEKO-src\launcher_core\runtime.py:3328`），可调到 180s。冷启动实测可达 ~94s，热启动约 8s；延迟发生在 `import main_server` 内部，未见网络阻塞，优先怀疑冷文件缓存 + Defender 实时扫描。
+
+**可覆盖环境变量**：`NEKO_SRC`、`NEKO_SHELL`、`NEKO_HEALTH`、`NEKO_WAIT_SECONDS`（默认 180）、`NEKO_COMPANION_PROBE`、`NEKO_COMPANION_ROUTE`。
 直接双击脚本亦可（用默认路径）。
 
 > 注意：必须**先起源码后端再开壳**；壳经 Steam 启动时会带 `%command%`，脚本把它们透传给 exe。

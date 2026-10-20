@@ -25,6 +25,9 @@ class STS2LoopRunner:
     _COMBAT_DANMAKU_EVENTS = frozenset({"combat_started", "available_actions_changed", "combat_turn_changed"})
     # Coalesce a burst of SSE events into at most one /state fetch per this window.
     _EVENT_FETCH_MIN_INTERVAL_SECONDS = 0.5
+    # 单次自动决策的硬上限：宿主/Mod 某个 await 不返回时，取消本轮并释放决策锁，
+    # 避免整局无限停在“正在行动”。正常决策远低于该值。
+    _AUTOPLAY_STEP_TIMEOUT_SECONDS = 90.0
 
     def __init__(self, service: Any) -> None:
         self._service = service
@@ -390,15 +393,26 @@ class STS2LoopRunner:
 
     async def _autoplay_loop(self) -> None:
         while not self._shutdown:
-            await self._service._sync_companion_ingress()
-            await self._service._sync_execution_status()
-            has_input = bool(self._service._companion_session.pending_messages() or self._service._ingress_callbacks
-                             or self._service._decision_failure_notice)
-            if (self._service._state.autoplay_state != "running" or self._service._state.standby) and not has_input:
+            try:
+                await self._service._sync_companion_ingress()
+                await self._service._sync_execution_status()
+                has_input = bool(self._service._companion_session.pending_messages() or self._service._ingress_callbacks
+                                 or self._service._decision_failure_notice)
+                if (self._service._state.autoplay_state != "running" or self._service._state.standby) and not has_input:
+                    await asyncio.sleep(0.25)
+                    continue
+                result = await asyncio.wait_for(
+                    self._service.run_autoplay_step(),
+                    timeout=self._AUTOPLAY_STEP_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                # 卡住时取消本轮等待；_run_autoplay_step 的 finally 会释放决策锁。
+                self._service._mark_loop_error(
+                    RuntimeError(f"自动决策超过 {self._AUTOPLAY_STEP_TIMEOUT_SECONDS:.0f} 秒未返回，已中断本轮等待"),
+                    autoplay=True,
+                )
                 await asyncio.sleep(0.25)
                 continue
-            try:
-                result = await self._service.run_autoplay_step()
             except Exception as exc:
                 # 单次错误退避；连续失败达到上限后暂停并投递原因。
                 self._service._mark_loop_error(exc, autoplay=True)

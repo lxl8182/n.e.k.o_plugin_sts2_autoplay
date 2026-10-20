@@ -107,7 +107,14 @@ internal static class GameActionService
         LastTurnNumber = currentTurn;
     }
 
-    public static Task<ActionResponsePayload> ExecuteAsync(ActionRequest request)
+    public static async Task<ActionResponsePayload> ExecuteAsync(ActionRequest request)
+    {
+        var response = await ExecuteCoreAsync(request);
+        // 统一回显插件生成的 action_id，避免逐个构造点改动。错误路径（ApiException）语义不变。
+        return string.IsNullOrEmpty(request.action_id) ? response : response.WithActionId(request.action_id);
+    }
+
+    private static Task<ActionResponsePayload> ExecuteCoreAsync(ActionRequest request)
     {
         var actionName = request.action?.Trim().ToLowerInvariant();
         if (request.expected_turn is int expectedTurn)
@@ -3928,16 +3935,32 @@ internal static class GameActionService
                 option_index = request.option_index
             });
 
+        var potionIndex = request.option_index.Value;
         var target = ResolvePotionTarget(request, combatState, potion);
         potion.EnqueueManualUse(target);
-        var stable = await WaitForPotionUseTransitionAsync(player, request.option_index.Value, potion, TimeSpan.FromSeconds(10));
+        var stable = await WaitForPotionUseTransitionAsync(player, potionIndex, potion, TimeSpan.FromSeconds(10));
+        var status = stable ? "completed" : ClassifyUnsettledPotionUse(player, potionIndex, potion);
+        var reason = status switch
+        {
+            "canceled" => "potion_use_not_applied",
+            "unknown" => "potion_use_transition_timeout",
+            _ => null,
+        };
+        var message = status switch
+        {
+            "completed" => "Action completed.",
+            "pending" => "Action queued but state is still transitioning.",
+            "canceled" => "Potion use was not applied; the game canceled or ignored it.",
+            _ => "Potion use did not settle within the timeout; result is unknown.",
+        };
 
         return new ActionResponsePayload
         {
             action = "use_potion",
-            status = stable ? "completed" : "pending",
+            status = status,
             stable = stable,
-            message = stable ? "Action completed." : "Action queued but state is still transitioning.",
+            message = message,
+            reason = reason,
             state = GameStateService.BuildStatePayload()
         };
     }
@@ -4946,6 +4969,30 @@ internal static class GameActionService
         return GameStateService.TryGetCombatHandSelection(currentScreen, out _);
     }
 
+    /// <summary>
+    /// WaitForPotionUseTransitionAsync 返回 false 后的三分类。false 既可能是"等玩家选牌"，
+    /// 也可能是游戏取消了手动使用（Q25：药水仍在原槽位、现场无变化），还可能是超时但结果不可观测。
+    /// </summary>
+    private static string ClassifyUnsettledPotionUse(Player player, int potionIndex, PotionModel potion)
+    {
+        if (IsPotionUseAwaitingPlayerInput())
+        {
+            return "pending";
+        }
+
+        // 反向的 HasPotionSlotTransitioned：药水没被移除、原槽位仍是同一个引用 = 使用没有生效。
+        if (!potion.HasBeenRemovedFromState &&
+            potionIndex >= 0 &&
+            potionIndex < player.PotionSlots.Count &&
+            ReferenceEquals(player.PotionSlots[potionIndex], potion))
+        {
+            return "canceled";
+        }
+
+        // 槽位变化了但玩家驱动的动作始终没有 settle，真实结果无法从这里判断。
+        return "unknown";
+    }
+
     private static async Task<ActionResponsePayload> ExecuteModalButtonAsync(
         string actionName,
         Func<IScreenContext?, NButton?> buttonResolver)
@@ -5213,6 +5260,9 @@ internal sealed class ActionRequest
 {
     public string? action { get; init; }
 
+    /// <summary>插件生成的请求标识，Mod 原样回显到响应，供晚到回执/结果查询对齐。</summary>
+    public string? action_id { get; init; }
+
     public int? expected_turn { get; init; }
 
     public string? expected_player_id { get; init; }
@@ -5238,12 +5288,30 @@ internal sealed class ActionResponsePayload
 {
     public string action { get; init; } = string.Empty;
 
+    /// <summary>回显请求里的 action_id；请求未带则为 null。</summary>
+    public string? action_id { get; init; }
+
     public string status { get; init; } = "failed";
 
     public bool stable { get; init; }
 
     public string message { get; init; } = string.Empty;
 
+    /// <summary>status 不是 completed/pending 时的机器可读原因，例如 potion_use_not_applied。</summary>
+    public string? reason { get; init; }
+
     public GameStatePayload state { get; init; } = new();
+
+    /// <summary>ExecuteAsync 外层统一回填 action_id 用；其余字段保持原样。</summary>
+    public ActionResponsePayload WithActionId(string? actionId) => new()
+    {
+        action = action,
+        action_id = actionId ?? action_id,
+        status = status,
+        stable = stable,
+        message = message,
+        reason = reason,
+        state = state,
+    };
 }
 

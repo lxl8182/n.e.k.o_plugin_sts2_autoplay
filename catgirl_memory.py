@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+from datetime import datetime
 from time import time
 from typing import Any
 from copy import deepcopy
@@ -57,6 +59,7 @@ class CatgirlMemoryStore:
         self.learning_events: list[dict] = []
         self.applied_updates: list[str] = []
         self.last_error = ""
+        self.load_failed = False
         self.load()
 
     @property
@@ -68,8 +71,13 @@ class CatgirlMemoryStore:
         return self._runs
 
     def load(self) -> None:
-        """从磁盘读入最近记忆；文件不存在/损坏时空载（不中断）。"""
+        """从磁盘读入最近记忆；文件不存在/损坏时空载（不中断）。
+
+        读取失败时保留原文件并置 ``load_failed``；在显式 ``recover()`` 之前，
+        ``save()`` 不会用这份空状态覆盖原文件。
+        """
         self._runs = []
+        self.load_failed = False
         if not self._path or not os.path.exists(self._path):
             return
         try:
@@ -85,11 +93,24 @@ class CatgirlMemoryStore:
                 self._runs = self._runs[-_RUN_CAP:]
         except (OSError, ValueError):
             self._runs = []
+            self.experiences = []
+            self.learning_events = []
+            self.applied_updates = []
+            self.load_failed = True
+            self.last_error = f"经验读取失败：{self._path}"
+            self._log(f"catgirl_memory load failed: {self._path}")
 
-    def save(self) -> None:
-        """把当前记忆写回磁盘（幂等；path 为 None 时静默跳过）。"""
+    def save(self) -> bool:
+        """把当前记忆写回磁盘（幂等；path 为 None 时静默跳过）。
+
+        读取失败且尚未 ``recover()`` 时拒绝覆盖原文件。返回是否真正落盘成功。
+        """
         if not self._path:
-            return
+            return False
+        if self.load_failed:
+            self.last_error = f"经验读取失败，已阻止覆盖：{self._path}"
+            self._log("catgirl_memory save blocked after failed load")
+            return False
         try:
             os.makedirs(os.path.dirname(self._path), exist_ok=True)
             payload = {"runs": self._runs[-_RUN_CAP:], "updated_at": time(),
@@ -100,9 +121,33 @@ class CatgirlMemoryStore:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self._path)
             self.last_error = ""
-        except OSError:
+            return True
+        except (OSError, TypeError, ValueError):
             self.last_error = f"经验保存失败：{self._path}"
             self._log(f"catgirl_memory save failed: {self._path}")
+            return False
+
+    def recover(self) -> bool:
+        """备份读取失败的原文件并清除 ``load_failed``，之后 ``save()`` 恢复正常。
+
+        备份文件名为 ``<path>.corrupt-<yyyyMMdd-HHmmss>``，原文件保留。
+        没有读取失败时直接返回 True。
+        """
+        if not self.load_failed:
+            return True
+        if self._path:
+            try:
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                backup = f"{self._path}.corrupt-{stamp}"
+                if os.path.exists(self._path):
+                    shutil.copy2(self._path, backup)
+            except OSError:
+                self.last_error = f"经验备份失败：{self._path}"
+                self._log(f"catgirl_memory recover backup failed: {self._path}")
+                return False
+        self.load_failed = False
+        self.last_error = ""
+        return True
 
     def add_run(self, run_id: str, *, character: str, outcome: str, floor: int, act: int,
                 decision_memory: list[dict[str, Any]], llm: Any = None,

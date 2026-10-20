@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "keywords": [
+    {
+      "id": "BOUND",
+      "names": ["魂缚", "BOUND", "Soulbound"],
+      "scenes": ["combat"],
+      "sources": ["hand"],
+      "text": "每回合只能打出1张魂缚牌；回合结束时卡牌失去魂缚。",
+      "hint": "手牌有多张魂缚时，先挑本回合收益最高的一张。",
+      "source": "BOUND.description"
+    }
+  ]
+}
